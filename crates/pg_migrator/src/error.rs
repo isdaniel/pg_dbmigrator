@@ -1,0 +1,123 @@
+//! Error types used throughout the migrator.
+
+use std::io;
+
+use thiserror::Error;
+
+/// Result alias used by all fallible APIs in this crate.
+pub type Result<T> = std::result::Result<T, MigrationError>;
+
+/// All the error categories produced by the migration pipeline.
+///
+/// Each variant maps to a specific failure surface so that callers (CLI,
+/// orchestrator, tests) can pattern match on the kind of failure they want
+/// to react to.
+#[derive(Debug, Error)]
+pub enum MigrationError {
+    /// Returned when the user-supplied configuration is rejected before any
+    /// work is started.
+    #[error("invalid configuration: {0}")]
+    Config(String),
+
+    /// A connection string could not be parsed.
+    #[error("invalid connection string: {0}")]
+    InvalidConnectionString(String),
+
+    /// `pg_dump` / `pg_restore` / `psql` could not be spawned, or returned a
+    /// non-zero exit code.
+    #[error("external command `{command}` failed: {message}")]
+    ExternalCommand {
+        /// Name of the external program (e.g. `pg_dump`).
+        command: String,
+        /// Human readable description of what went wrong.
+        message: String,
+    },
+
+    /// A required external tool (e.g. `pg_dump`, `pg_restore`) is not
+    /// installed or not on `$PATH`. Surfaced by the pre-flight check at the
+    /// start of `Migrator::run`, before any work is done.
+    #[error(
+        "required tool `{tool}` is not installed or not on $PATH: {reason}\n\
+         hint: install the matching PostgreSQL client tools (e.g. on Ubuntu \
+         `apt install postgresql-client-NN` where NN matches your source \
+         server's major version) and ensure they are on $PATH"
+    )]
+    MissingTool {
+        /// Name of the missing tool (e.g. `pg_dump`).
+        tool: String,
+        /// What the lookup actually returned (e.g. "not found in $PATH").
+        reason: String,
+    },
+
+    /// Generic I/O failure from spawning a child process or reading a file.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    /// Wrapper for any error returned by [`tokio_postgres`].
+    #[error("postgres error: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+
+    /// Wrapper for any error coming out of [`pg_walstream`].
+    #[error("replication error: {0}")]
+    Replication(#[from] pg_walstream::ReplicationError),
+
+    /// The replication apply path encountered an event it cannot handle.
+    #[error("apply error: {0}")]
+    Apply(String),
+
+    /// The pipeline was cancelled by the caller via the cancellation token.
+    #[error("operation cancelled")]
+    Cancelled,
+}
+
+impl MigrationError {
+    /// Convenience constructor for [`MigrationError::Config`].
+    pub fn config(msg: impl Into<String>) -> Self {
+        Self::Config(msg.into())
+    }
+
+    /// Convenience constructor for [`MigrationError::ExternalCommand`].
+    pub fn external(command: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::ExternalCommand {
+            command: command.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Convenience constructor for [`MigrationError::Apply`].
+    pub fn apply(msg: impl Into<String>) -> Self {
+        Self::Apply(msg.into())
+    }
+
+    /// Convenience constructor for [`MigrationError::MissingTool`].
+    pub fn missing_tool(tool: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::MissingTool {
+            tool: tool.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_helper_constructs_variant() {
+        let err = MigrationError::config("bad");
+        assert!(matches!(err, MigrationError::Config(ref m) if m == "bad"));
+        assert_eq!(err.to_string(), "invalid configuration: bad");
+    }
+
+    #[test]
+    fn external_helper_formats_message() {
+        let err = MigrationError::external("pg_dump", "exit 1");
+        assert_eq!(err.to_string(), "external command `pg_dump` failed: exit 1");
+    }
+
+    #[test]
+    fn apply_helper_constructs_variant() {
+        let err = MigrationError::apply("oops");
+        assert!(matches!(err, MigrationError::Apply(ref m) if m == "oops"));
+    }
+}

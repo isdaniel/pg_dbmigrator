@@ -1,0 +1,35 @@
+[package]
+name = "pg_migrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Library for migrating PostgreSQL databases (offline dump/restore + online logical replication)"
+repository.workspace = true
+
+[lib]
+name = "pg_migrator"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-postgres = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+pg_walstream = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

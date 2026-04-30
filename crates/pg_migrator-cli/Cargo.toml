@@ -1,0 +1,20 @@
+[package]
+name = "pg_migrator-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI for the pg_migrator PostgreSQL migration library"
+
+[[bin]]
+name = "pg_migrator"
+path = "src/main.rs"
+
+[dependencies]
+pg_migrator = { path = "../pg_migrator" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
