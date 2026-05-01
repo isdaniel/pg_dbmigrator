@@ -282,25 +282,25 @@ impl Default for ReplicationApplyConfig {
 
 /// Cutover policy.
 ///
-/// Online migrations stream WAL until the target catches up with the source.
-/// Once the lag (in bytes between `last_applied_lsn` and the source's current
-/// WAL flush position) drops below `lag_threshold_bytes`, the orchestrator
-/// emits a [`crate::progress::MigrationStage::CaughtUp`] event. Cutover then
-/// happens either:
-///
-/// * automatically (if `auto_cutover` is `true`), or
-/// * when the operator calls [`crate::cutover::CutoverHandle::request`].
+/// Online migrations stream WAL until the operator decides to cut over.
+/// Once the lag (in bytes between `last_applied_lsn` and the source's
+/// current WAL flush position) first drops at or below
+/// `lag_threshold_bytes`, the orchestrator emits an advisory
+/// [`crate::progress::MigrationStage::CaughtUp`] event so the operator
+/// knows it is the cheapest moment to switch. Cutover itself only happens
+/// when the operator calls
+/// [`crate::cutover::CutoverHandle::request`] (the CLI wires this to
+/// SIGINT / Ctrl+C).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CutoverConfig {
     /// How often to query the source's current WAL LSN.
     #[serde(with = "humantime_serde_workaround")]
     pub poll_interval: Duration,
-    /// Lag (in WAL bytes) at or below which the target is considered caught up.
+    /// Advisory lag threshold (in WAL bytes). When the lag first drops at
+    /// or below this value the orchestrator emits a one-shot `CaughtUp`
+    /// ("ready for cutover") event. The threshold never triggers cutover
+    /// on its own — that is always operator-driven.
     pub lag_threshold_bytes: u64,
-    /// If `true`, cutover is performed automatically once caught up. If
-    /// `false`, the operator must trigger
-    /// [`crate::cutover::CutoverHandle::request`].
-    pub auto_cutover: bool,
 }
 
 impl Default for CutoverConfig {
@@ -309,7 +309,6 @@ impl Default for CutoverConfig {
             poll_interval: Duration::from_secs(5),
             // 8 KiB — one WAL page; "ready" threshold for short-lived idle gaps.
             lag_threshold_bytes: 8 * 1024,
-            auto_cutover: false,
         }
     }
 }
@@ -430,7 +429,6 @@ mod tests {
     fn cutover_config_default_is_valid() {
         let c = CutoverConfig::default();
         assert!(c.validate().is_ok());
-        assert!(!c.auto_cutover);
         assert_eq!(c.lag_threshold_bytes, 8 * 1024);
     }
 

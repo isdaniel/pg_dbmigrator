@@ -7,10 +7,10 @@
 //! considered "caught up" and the operator is notified via a
 //! [`crate::progress::MigrationStage::CaughtUp`] event.
 //!
-//! Cutover itself is then triggered either automatically (when
-//! `auto_cutover` is `true`) or explicitly by the operator calling
-//! [`CutoverHandle::request`]. In both cases the apply loop terminates
-//! cleanly after flushing the last LSN feedback to the source.
+//! Cutover itself is operator-driven: the apply loop only exits when
+//! [`CutoverHandle::request`] is called (the CLI wires this to SIGINT /
+//! Ctrl+C). The loop then flushes the last LSN feedback to the source
+//! before returning.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

@@ -62,8 +62,13 @@ pub struct Cli {
     #[arg(long)]
     pub max_runtime_seconds: Option<u64>,
 
-    /// Lag (in WAL bytes) at or below which the target is considered caught
-    /// up and a `CaughtUp` event is emitted. Online mode only.
+    /// Advisory threshold (WAL bytes). When `lag_bytes` first drops at or
+    /// below this value the apply loop emits a one-shot `CaughtUp`
+    /// ("ready for cutover") event — purely informational so the operator
+    /// knows the cheapest moment to cut over. The bytes-behind `Lag`
+    /// heartbeat is still printed every `--cutover-poll-secs` regardless.
+    /// Cutover itself is always operator-driven via Ctrl+C. Online mode
+    /// only.
     #[arg(long, default_value_t = 8 * 1024)]
     pub lag_threshold_bytes: u64,
 
@@ -71,12 +76,6 @@ pub struct Cli {
     /// mode only.
     #[arg(long, default_value_t = 5)]
     pub cutover_poll_secs: u64,
-
-    /// Automatically cut over once the target catches up. When `false`
-    /// (default), cutover is operator-driven: type `cutover` on stdin (or
-    /// programmatically call `Migrator::cutover_handle().request()`).
-    #[arg(long)]
-    pub auto_cutover: bool,
 
     /// Pin the dump archive output path. By default a unique path inside
     /// `$TMPDIR` is used.
@@ -162,7 +161,6 @@ impl Cli {
             cutover: CutoverConfig {
                 poll_interval: std::time::Duration::from_secs(self.cutover_poll_secs),
                 lag_threshold_bytes: self.lag_threshold_bytes,
-                auto_cutover: self.auto_cutover,
             },
         };
 

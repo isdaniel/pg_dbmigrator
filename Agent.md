@@ -79,8 +79,10 @@ DMS "Cut over" button:
 5. A second SIGINT cancels via the `CancellationToken` (escape hatch). See
    `classify_sigint` in `crates/pg_migrator-cli/src/main.rs`.
 
-`CutoverConfig::auto_cutover = true` collapses steps 3–4 into automatic
-cutover on the first `CaughtUp`, for unattended runs.
+Cutover is **always operator-driven**: the apply loop never exits on
+`CaughtUp` alone. The `lag_threshold_bytes` knob is purely advisory —
+it controls when the one-shot `CaughtUp` event fires, never whether the
+loop terminates.
 
 ---
 

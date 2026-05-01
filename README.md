@@ -84,9 +84,7 @@ cargo pg_migrator \
 
 ## Cutover (online mode)
 
-Cutover is driven by `SIGINT` (Ctrl+C). The CLI prints a periodic `Lag`
-heartbeat after the dump completes, so the operator has a continuous
-bytes-behind read-out:
+Cutover is driven by `SIGINT` (Ctrl+C). The CLI prints a periodic `Lag` heartbeat after the dump completes, so the operator has a continuous bytes-behind read-out:
 
 ```
 INFO stage=Lag replication lag 4096 bytes (source LSN …, received LSN …, applied LSN …)
@@ -106,8 +104,7 @@ When the customer is satisfied with the lag, they press **Ctrl+C** once:
 * A second Ctrl+C is treated as an abort (escape hatch — only use it if
   the graceful path is stuck).
 
-For fully unattended migrations, pass `--auto-cutover` to let the apply
-loop exit on the first `CaughtUp` event automatically.
+Cutover is always operator-driven; `--lag-threshold-bytes` is purely advisory and only controls when the one-shot `CaughtUp` "ready for cutover" event fires.
 
 ## Library use
 
@@ -133,11 +130,7 @@ async fn main() -> pg_migrator::Result<()> {
 }
 ```
 
-For online migrations, hold on to `migrator.cutover_handle()` and call
-`request()` from your own signal handler / RPC endpoint when the
-operator is ready to cut over. See
-[`examples/online_migration`](examples/online_migration) for a complete
-program that wires Ctrl+C to the cutover handle.
+For online migrations, hold on to `migrator.cutover_handle()` and call `request()` from your own signal handler / RPC endpoint when the operator is ready to cut over. See [`examples/online_migration`](examples/online_migration) for a complete program that wires Ctrl+C to the cutover handle.
 
 ## Known limitations
 
@@ -150,16 +143,3 @@ program that wires Ctrl+C to the cutover handle.
   `pg_restore` to exit with code 1. Pass `--allow-restore-errors` to
   treat that as a non-fatal warning when user data was restored
   successfully.
-
-## Workspace layout
-
-```
-Cargo.toml                          # workspace root, pinned versions
-.cargo/config.toml                  # `cargo pg_migrator` alias
-crates/
-  pg_migrator/                      # library crate (package: pg_migrator)
-  pg_migrator-cli/                  # CLI crate (package: pg_migrator-cli, bin: pg_migrator)
-examples/
-  offline_migration/                # runnable offline example
-  online_migration/                 # runnable online example w/ SIGINT cutover
-```

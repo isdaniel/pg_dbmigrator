@@ -10,6 +10,19 @@
 //!    flushes the last LSN feedback to the source, stops, and exits.
 //!    A second Ctrl+C aborts immediately as an escape hatch.
 //!
+//! ## `lag_threshold_bytes` semantics
+//!
+//! `CutoverConfig::lag_threshold_bytes` is **advisory only**. When
+//! `lag_bytes` first drops at or below it, the library emits a one-shot
+//! `CaughtUp` ("ready for cutover") event so the operator knows it is the
+//! cheapest moment to switch traffic. The bytes-behind `Lag` heartbeat is
+//! still printed every `poll_interval` regardless of this threshold — that
+//! is the continuous read-out the customer watches.
+//!
+//! Cutover is **always client-driven** — send SIGINT (Ctrl+C) when you are
+//! ready to switch traffic. The threshold never causes the program to cut
+//! over on its own.
+//!
 //! ## SIGINT timing note
 //!
 //! `CutoverHandle::request()` is only consumed once `StreamApply` is
@@ -59,19 +72,24 @@ async fn main() -> Result<()> {
     let target = env::var("PG_MIGRATOR_TARGET").context("PG_MIGRATOR_TARGET must be set")?;
 
     let online = OnlineOptions {
-        slot_name: "pg_migrator_slot".into(),
-        publication: "pg_migrator_pub".into(),
+        slot_name: env::var("PG_MIGRATOR_SLOT_NAME").unwrap_or_else(|_| "pg_migrator_slot".into()),
+        publication: env::var("PG_MIGRATOR_PUBLICATION")
+            .unwrap_or_else(|_| "pg_migrator_pub".into()),
         protocol_version: 2,
         apply: ReplicationApplyConfig {
-            feedback_interval: Duration::from_secs(5),
+            feedback_interval: Duration::from_secs(env_secs("PG_MIGRATOR_FEEDBACK_SECS", 5)),
             connection_timeout: Duration::from_secs(15),
             health_check_interval: Duration::from_secs(30),
-            max_runtime_seconds: None,
+            max_runtime_seconds: env::var("PG_MIGRATOR_MAX_RUNTIME_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok()),
         },
         cutover: CutoverConfig {
-            poll_interval: Duration::from_secs(5),
-            lag_threshold_bytes: 8 * 1024,
-            auto_cutover: false,
+            poll_interval: Duration::from_secs(env_secs("PG_MIGRATOR_POLL_SECS", 5)),
+            lag_threshold_bytes: env::var("PG_MIGRATOR_LAG_THRESHOLD_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(8 * 1024),
         },
     };
 
@@ -124,4 +142,15 @@ async fn main() -> Result<()> {
         "migration done"
     );
     Ok(())
+}
+
+/// Read an integer-seconds env var, falling back to `default` if absent or
+/// unparseable. Lets integration tests dial poll/feedback intervals down to
+/// values that produce observable lag transitions in seconds rather than
+/// minutes.
+fn env_secs(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
 }

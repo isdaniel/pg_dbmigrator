@@ -97,8 +97,9 @@ impl<'a> std::fmt::Debug for ApplyDeps<'a> {
 
 /// Run the streaming apply phase: pump events out of the source replication
 /// stream and apply them to `target_client` until cancelled, until
-/// `apply_cfg.max_runtime_seconds` is reached, or until cutover is requested
-/// by the operator (or auto-cutover fires once caught up).
+/// `apply_cfg.max_runtime_seconds` is reached, or until the operator
+/// triggers cutover via [`crate::cutover::CutoverHandle::request`] (the CLI
+/// wires this to SIGINT / Ctrl+C).
 pub async fn run_streaming_apply(
     mut stream: LogicalReplicationStream,
     target_client: &Client,
@@ -161,7 +162,7 @@ pub async fn run_streaming_apply(
                             stats.last_received_lsn,
                         )
                         .await;
-                        if should_cutover(transition, &deps) {
+                        if should_cutover(&deps) {
                             stats.cutover_triggered = true;
                             deps.reporter
                                 .report(ProgressEvent::new(
@@ -247,16 +248,11 @@ pub async fn run_streaming_apply(
     Ok(stats)
 }
 
-/// Decide whether the loop should break this iteration based on the latest
-/// transition + cutover policy.
-fn should_cutover(transition: Transition, deps: &ApplyDeps<'_>) -> bool {
-    if deps.cutover_handle.is_requested() {
-        return true;
-    }
-    if deps.cutover_cfg.auto_cutover && transition.just_caught_up() {
-        return true;
-    }
-    false
+/// Decide whether the loop should break this iteration. Cutover is purely
+/// operator-driven — the loop exits the moment
+/// [`CutoverHandle::request`] is called.
+fn should_cutover(deps: &ApplyDeps<'_>) -> bool {
+    deps.cutover_handle.is_requested()
 }
 
 /// Emit a [`MigrationStage::Lag`] heartbeat. Fired every
@@ -482,16 +478,12 @@ mod tests {
             lsn_provider: None,
             reporter: &reporter,
         };
-        // Even StillBehind should trigger cutover when handle is requested.
-        assert!(should_cutover(Transition::StillBehind { lag: 9999 }, &deps));
+        assert!(should_cutover(&deps));
     }
 
     #[test]
-    fn should_cutover_on_auto_when_just_caught_up() {
-        let cfg = CutoverConfig {
-            auto_cutover: true,
-            ..CutoverConfig::default()
-        };
+    fn should_cutover_off_until_handle_requested() {
+        let cfg = CutoverConfig::default();
         let apply = ReplicationApplyConfig::default();
         let reporter = CollectingReporter::new();
         let deps = ApplyDeps {
@@ -501,28 +493,10 @@ mod tests {
             lsn_provider: None,
             reporter: &reporter,
         };
-        assert!(should_cutover(Transition::JustCaughtUp { lag: 0 }, &deps));
-        // Still-caught-up should NOT re-trigger cutover (we only fire once).
-        assert!(!should_cutover(Transition::StillCaughtUp { lag: 0 }, &deps));
-    }
-
-    #[test]
-    fn should_cutover_off_when_neither_condition_met() {
-        let cfg = CutoverConfig::default(); // auto_cutover = false
-        let apply = ReplicationApplyConfig::default();
-        let reporter = CollectingReporter::new();
-        let deps = ApplyDeps {
-            apply_cfg: &apply,
-            cutover_cfg: &cfg,
-            cutover_handle: CutoverHandle::new(),
-            lsn_provider: None,
-            reporter: &reporter,
-        };
-        assert!(!should_cutover(Transition::JustCaughtUp { lag: 0 }, &deps));
-        assert!(!should_cutover(
-            Transition::StillBehind { lag: 1000 },
-            &deps
-        ));
+        // Caught-up alone never triggers cutover — operator must request it.
+        assert!(!should_cutover(&deps));
+        deps.cutover_handle.request();
+        assert!(should_cutover(&deps));
     }
 
     #[tokio::test]
