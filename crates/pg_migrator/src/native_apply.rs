@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use pg_walstream::{format_lsn, parse_lsn};
-use tokio_postgres::Client;
+use tokio_postgres::{Client, Statement};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -55,8 +55,7 @@ pub struct ApplyStats {
 /// Thin wrapper over [`pg_walstream::parse_lsn`] that maps the upstream
 /// error into our [`MigrationError`] enum so call sites stay terse.
 pub fn parse_pg_lsn(s: &str) -> Result<u64> {
-    parse_lsn(s)
-        .map_err(|_| MigrationError::apply(format!("could not parse pg_lsn: {s:?}")))
+    parse_lsn(s).map_err(|_| MigrationError::apply(format!("could not parse pg_lsn: {s:?}")))
 }
 
 /// Source-side LSN sampler abstracted so tests can inject deterministic values.
@@ -76,19 +75,33 @@ pub trait SubscriptionLagProvider: Send + Sync {
 
 /// Real-source implementation of [`SubscriptionLagProvider`] backed by
 /// `tokio_postgres`.
+///
+/// The lag-sample SQL is `prepare()`d once at construction and reused for
+/// every poll, so each heartbeat round-trip is a single bind+execute rather
+/// than a parse+plan+bind+execute.
 #[derive(Debug)]
 pub struct PgSubscriptionLagProvider {
     client: Client,
     slot_name: String,
+    sample_stmt: Statement,
 }
 
 impl PgSubscriptionLagProvider {
     /// Open a (non-replication) connection to the source for lag polling.
     pub async fn connect(connection_string: &str, slot_name: impl Into<String>) -> Result<Self> {
         let client = connect_with_sslmode(connection_string).await?;
+        let sample_stmt = client
+            .prepare(
+                "SELECT pg_current_wal_flush_lsn()::text, \
+                        confirmed_flush_lsn::text \
+                 FROM pg_replication_slots \
+                 WHERE slot_name = $1",
+            )
+            .await?;
         Ok(Self {
             client,
             slot_name: slot_name.into(),
+            sample_stmt,
         })
     }
 }
@@ -98,13 +111,7 @@ impl SubscriptionLagProvider for PgSubscriptionLagProvider {
     async fn sample(&self) -> Result<(u64, u64)> {
         let row = self
             .client
-            .query_one(
-                "SELECT pg_current_wal_flush_lsn()::text, \
-                        confirmed_flush_lsn::text \
-                 FROM pg_replication_slots \
-                 WHERE slot_name = $1",
-                &[&self.slot_name],
-            )
+            .query_one(&self.sample_stmt, &[&self.slot_name])
             .await?;
         let source_raw: String = row.get(0);
         let confirmed_raw: String = row.get(1);
@@ -185,6 +192,72 @@ pub fn build_detach_slot_sql(name: &str) -> String {
 /// Build the `DROP SUBSCRIPTION` statement.
 pub fn build_drop_subscription_sql(name: &str) -> String {
     format!("DROP SUBSCRIPTION {}", quote_ident(name))
+}
+
+/// Best-effort cleanup of any leftover subscription on the target and any
+/// leftover replication slot on the source from a previous (crashed) run.
+///
+/// Idempotent: every step is `IF EXISTS` / wrapped in a `DO` block that
+/// checks `pg_subscription` / `pg_replication_slots`. Errors are logged
+/// but do not propagate — the goal is to unblock the next `CREATE
+/// SUBSCRIPTION` / slot creation, not to be a fully-featured admin tool.
+///
+/// Called from the orchestrator only when `OnlineOptions::force_clean` is
+/// `true` (CLI: `--force-clean`).
+pub async fn force_clean_stale_state(
+    source_conn: &str,
+    target_conn: &str,
+    online: &OnlineOptions,
+) -> Result<()> {
+    info!(
+        subscription = %online.subscription_name,
+        slot = %online.slot_name,
+        "force-clean: removing any stale subscription/slot from a previous run"
+    );
+
+    // Target: detach + drop subscription (if any). DROP SUBSCRIPTION refuses
+    // to run if the subscription owns a remote slot the server can't reach,
+    // so we always SET (slot_name=NONE) first.
+    let target = connect_with_sslmode(target_conn).await?;
+    let sub = quote_ident(&online.subscription_name);
+    let cleanup_sub_sql = format!(
+        "DO $$\n\
+         BEGIN\n\
+            IF EXISTS (SELECT 1 FROM pg_subscription WHERE subname = {sub_lit}) THEN\n\
+                EXECUTE 'ALTER SUBSCRIPTION {sub} DISABLE';\n\
+                EXECUTE 'ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)';\n\
+                EXECUTE 'DROP SUBSCRIPTION {sub}';\n\
+            END IF;\n\
+         END $$;",
+        sub = sub,
+        sub_lit = quote_literal(&online.subscription_name),
+    );
+    if let Err(e) = target.batch_execute(&cleanup_sub_sql).await {
+        warn!(error = %e, "force-clean: target subscription cleanup failed (continuing)");
+    } else {
+        info!("force-clean: target subscription cleanup ok");
+    }
+
+    // Source: drop replication slot if it exists. We use the connection
+    // string the migrator already validated; pg_drop_replication_slot
+    // requires a non-replication connection.
+    let source = connect_with_sslmode(source_conn).await?;
+    let cleanup_slot_sql = format!(
+        "DO $$\n\
+         BEGIN\n\
+            IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = {slot_lit}) THEN\n\
+                PERFORM pg_drop_replication_slot({slot_lit});\n\
+            END IF;\n\
+         END $$;",
+        slot_lit = quote_literal(&online.slot_name),
+    );
+    if let Err(e) = source.batch_execute(&cleanup_slot_sql).await {
+        warn!(error = %e, "force-clean: source slot cleanup failed (continuing)");
+    } else {
+        info!("force-clean: source slot cleanup ok");
+    }
+
+    Ok(())
 }
 
 /// Run the native apply phase: create a subscription on the target, poll the

@@ -1,9 +1,14 @@
 mod args;
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use args::Cli;
 use clap::Parser;
-use pg_migrator::{CutoverHandle, MigrationMode, Migrator};
+use pg_migrator::{
+    progress::{JsonReporter, ProgressReporter, TracingReporter},
+    CutoverHandle, MigrationMode, Migrator,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -13,11 +18,18 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
+    let json_progress = cli.json;
     let config = cli
         .into_config()
         .context("failed to translate CLI args into MigrationConfig")?;
     let mode = config.mode;
-    let migrator = Migrator::new(config);
+
+    let reporter: Arc<dyn ProgressReporter> = if json_progress {
+        Arc::new(JsonReporter::default())
+    } else {
+        Arc::new(TracingReporter)
+    };
+    let migrator = Migrator::new(config).with_reporter(reporter);
 
     let cancel = CancellationToken::new();
     spawn_signal_handler(mode, migrator.cutover_handle(), cancel.clone());

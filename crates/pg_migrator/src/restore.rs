@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::config::EndpointConfig;
@@ -79,11 +80,12 @@ pub fn build_pg_restore_args(req: &RestoreRequest) -> Vec<String> {
 pub async fn run_pg_restore<R: CommandRunner + ?Sized>(
     runner: &R,
     req: &RestoreRequest,
+    cancel: &CancellationToken,
 ) -> Result<()> {
     info!(target = %req.target.redacted(), "running pg_restore");
     let args = build_pg_restore_args(req);
     let env = pgpassword_env(&req.target);
-    match runner.run("pg_restore", &args, &env).await {
+    match runner.run("pg_restore", &args, &env, cancel).await {
         Ok(()) => Ok(()),
         Err(e) if req.tolerate_errors && is_restore_partial_failure(&e) => {
             tracing::warn!(
@@ -115,6 +117,7 @@ pub async fn run_psql_file<R: CommandRunner + ?Sized>(
     runner: &R,
     target: &EndpointConfig,
     sql_path: &std::path::Path,
+    cancel: &CancellationToken,
 ) -> Result<()> {
     let args: Vec<String> = vec![
         "--no-password".into(),
@@ -133,7 +136,9 @@ pub async fn run_psql_file<R: CommandRunner + ?Sized>(
         sql_path.to_string_lossy().into_owned(),
     ];
 
-    runner.run("psql", &args, &pgpassword_env(target)).await
+    runner
+        .run("psql", &args, &pgpassword_env(target), cancel)
+        .await
 }
 
 #[cfg(test)]
@@ -222,6 +227,7 @@ mod tests {
             program: &str,
             _args: &[String],
             _env: &[(String, String)],
+            _cancel: &CancellationToken,
         ) -> Result<()> {
             Err(MigrationError::external(
                 self.program_to_fail.clone(),
@@ -237,7 +243,7 @@ mod tests {
         };
         let mut req = sample_request();
         req.tolerate_errors = true;
-        run_pg_restore(&runner, &req)
+        run_pg_restore(&runner, &req, &CancellationToken::new())
             .await
             .expect("tolerate_errors=true should swallow pg_restore exit 1");
     }
@@ -248,7 +254,9 @@ mod tests {
             program_to_fail: "pg_restore".into(),
         };
         let req = sample_request(); // tolerate_errors = false
-        let err = run_pg_restore(&runner, &req).await.unwrap_err();
+        let err = run_pg_restore(&runner, &req, &CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, MigrationError::ExternalCommand { .. }));
     }
 }

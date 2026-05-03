@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncWrite, AsyncWriteExt, Stdout};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 /// PostgreSQL phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +84,65 @@ pub struct TracingReporter;
 #[async_trait::async_trait]
 impl ProgressReporter for TracingReporter {
     async fn report(&self, event: ProgressEvent) {
-        info!(stage = ?event.stage, "{}", event.message);
+        info!(stage = ?event.stage, detail = ?event.detail, "{}", event.message);
+    }
+}
+
+/// [`ProgressReporter`] that emits one NDJSON record per event to an async
+/// writer (defaulting to `stdout`).
+///
+/// Each line is a single JSON object matching [`ProgressEvent`]'s
+/// serde representation, terminated by `\n`. This is the interchange
+/// format external tooling (CI dashboards, k8s operators, the Azure DMS
+/// status page) should consume.
+///
+/// Errors writing to the underlying sink are demoted to a `warn!` so a
+/// broken pipe on stdout never aborts the migration mid-way.
+#[allow(missing_debug_implementations)]
+pub struct JsonReporter<W: AsyncWrite + Send + Unpin = Stdout> {
+    writer: Arc<Mutex<W>>,
+}
+
+impl<W: AsyncWrite + Send + Unpin> std::fmt::Debug for JsonReporter<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonReporter").finish_non_exhaustive()
+    }
+}
+
+impl Default for JsonReporter<Stdout> {
+    fn default() -> Self {
+        Self::new(tokio::io::stdout())
+    }
+}
+
+impl<W: AsyncWrite + Send + Unpin> JsonReporter<W> {
+    /// Construct a reporter writing NDJSON records to `writer`.
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<W: AsyncWrite + Send + Unpin + 'static> ProgressReporter for JsonReporter<W> {
+    async fn report(&self, event: ProgressEvent) {
+        let mut line = match serde_json::to_string(&event) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "JsonReporter: failed to serialise event");
+                return;
+            }
+        };
+        line.push('\n');
+        let mut w = self.writer.lock().await;
+        if let Err(e) = w.write_all(line.as_bytes()).await {
+            warn!(error = %e, "JsonReporter: failed to write event");
+            return;
+        }
+        if let Err(e) = w.flush().await {
+            warn!(error = %e, "JsonReporter: failed to flush event");
+        }
     }
 }
 
@@ -150,5 +209,27 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("Complete"));
         assert!(json.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn json_reporter_writes_one_ndjson_record_per_event() {
+        let buf = Vec::<u8>::new();
+        let r = JsonReporter::new(buf);
+        r.report(ProgressEvent::new(MigrationStage::Validate, "ok"))
+            .await;
+        r.report(
+            ProgressEvent::new(MigrationStage::Lag, "lag")
+                .with_detail(serde_json::json!({"lag_bytes": 42})),
+        )
+        .await;
+        let writer = Arc::try_unwrap(r.writer).unwrap().into_inner();
+        let out = String::from_utf8(writer).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v0["stage"], "Validate");
+        assert_eq!(v0["message"], "ok");
+        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v1["detail"]["lag_bytes"], 42);
     }
 }

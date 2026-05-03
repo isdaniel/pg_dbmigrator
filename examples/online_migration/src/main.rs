@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         // host loopback). Defaults to `PG_MIGRATOR_SOURCE`.
         subscription_source_conn: env::var("PG_MIGRATOR_SUBSCRIPTION_SOURCE").ok(),
         drop_subscription_on_cutover: !env_flag("PG_MIGRATOR_KEEP_SUBSCRIPTION"),
+        force_clean: env_flag("PG_MIGRATOR_FORCE_CLEAN"),
         apply: ReplicationApplyConfig {
             feedback_interval: Duration::from_secs(env_secs("PG_MIGRATOR_FEEDBACK_SECS", 5)),
             connection_timeout: Duration::from_secs(15),

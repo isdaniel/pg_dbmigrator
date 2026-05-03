@@ -57,4 +57,4 @@ pub use config::{
 pub use cutover::{CutoverHandle, LagSampler, Transition};
 pub use error::{MigrationError, Result};
 pub use orchestrator::Migrator;
-pub use progress::{MigrationStage, ProgressEvent, ProgressReporter};
+pub use progress::{JsonReporter, MigrationStage, ProgressEvent, ProgressReporter};

@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 use crate::config::{DumpScope, EndpointConfig};
 use crate::error::{MigrationError, Result};
@@ -126,20 +127,46 @@ pub fn build_pg_dump_args(req: &DumpRequest) -> Vec<String> {
 
 /// Trait abstracting an external command execution. The default
 /// implementation is [`TokioCommandRunner`].
+///
+/// Implementations must honour `cancel`: if the token fires while the child
+/// is running, the child should be killed and the call should return
+/// [`MigrationError::Cancelled`]. Without this, a multi-hour `pg_dump`
+/// would ignore Ctrl+C until completion.
 #[async_trait]
 pub trait CommandRunner: Send + Sync + std::fmt::Debug {
     /// Run `program` with `args` and the given environment additions. Should
-    /// fail if the process exits with a non-zero status.
-    async fn run(&self, program: &str, args: &[String], env: &[(String, String)]) -> Result<()>;
+    /// fail if the process exits with a non-zero status, or return
+    /// [`MigrationError::Cancelled`] if `cancel` fires before the child
+    /// exits.
+    async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cancel: &CancellationToken,
+    ) -> Result<()>;
 }
 
 /// Default [`CommandRunner`] that uses [`tokio::process::Command`].
+///
+/// Sets `kill_on_drop` so an aborted future does not leak a child. When
+/// `cancel` fires mid-run, the child is sent SIGKILL (Tokio's only
+/// portable kill primitive) and we return [`MigrationError::Cancelled`].
+/// `pg_dump`'s on-disk artefact is left for the next run / `--force-clean`
+/// to mop up — this is the same contract `pg_dump --jobs` has when its
+/// shell is killed.
 #[derive(Debug, Default, Clone)]
 pub struct TokioCommandRunner;
 
 #[async_trait]
 impl CommandRunner for TokioCommandRunner {
-    async fn run(&self, program: &str, args: &[String], env: &[(String, String)]) -> Result<()> {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cancel: &CancellationToken,
+    ) -> Result<()> {
         debug!(program, ?args, "spawning external command");
 
         let mut cmd = tokio::process::Command::new(program);
@@ -150,11 +177,27 @@ impl CommandRunner for TokioCommandRunner {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
+        cmd.kill_on_drop(true);
 
-        let status = cmd
-            .status()
-            .await
+        let mut child = cmd
+            .spawn()
             .map_err(|e| MigrationError::external(program, format!("failed to spawn: {e}")))?;
+
+        let status = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                warn!(program, "cancellation requested — killing child");
+                if let Err(e) = child.start_kill() {
+                    warn!(program, error = %e, "child kill failed");
+                }
+                // Reap so we don't leak a zombie.
+                let _ = child.wait().await;
+                return Err(MigrationError::Cancelled);
+            }
+            res = child.wait() => res.map_err(|e| {
+                MigrationError::external(program, format!("wait failed: {e}"))
+            })?,
+        };
 
         if !status.success() {
             return Err(MigrationError::external(
@@ -169,10 +212,14 @@ impl CommandRunner for TokioCommandRunner {
 }
 
 /// Run `pg_dump` according to `req` using the supplied [`CommandRunner`].
-pub async fn run_pg_dump<R: CommandRunner + ?Sized>(runner: &R, req: &DumpRequest) -> Result<()> {
+pub async fn run_pg_dump<R: CommandRunner + ?Sized>(
+    runner: &R,
+    req: &DumpRequest,
+    cancel: &CancellationToken,
+) -> Result<()> {
     let args = build_pg_dump_args(req);
     let env = pgpassword_env(&req.source);
-    runner.run("pg_dump", &args, &env).await
+    runner.run("pg_dump", &args, &env, cancel).await
 }
 
 /// Build the `PGPASSWORD` env override for the given endpoint, if any.
@@ -314,6 +361,7 @@ mod tests {
             program: &str,
             args: &[String],
             env: &[(String, String)],
+            _cancel: &CancellationToken,
         ) -> Result<()> {
             self.calls
                 .lock()
@@ -326,7 +374,9 @@ mod tests {
     #[tokio::test]
     async fn run_pg_dump_invokes_runner_with_pgpassword() {
         let runner = RecordingRunner::default();
-        run_pg_dump(&runner, &base_request()).await.unwrap();
+        run_pg_dump(&runner, &base_request(), &CancellationToken::new())
+            .await
+            .unwrap();
         let calls = runner.calls().await;
         assert_eq!(calls.len(), 1);
         let (program, _args, env) = &calls[0];
@@ -339,8 +389,27 @@ mod tests {
         let runner = RecordingRunner::default();
         let mut req = base_request();
         req.source = EndpointConfig::parse("postgresql://u@h/db").unwrap();
-        run_pg_dump(&runner, &req).await.unwrap();
+        run_pg_dump(&runner, &req, &CancellationToken::new())
+            .await
+            .unwrap();
         let calls = runner.calls().await;
         assert!(calls[0].2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tokio_runner_returns_cancelled_when_token_fires_mid_run() {
+        // `sleep 30` is plenty of time for the cancel to land first.
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel2.cancel();
+        });
+        let runner = TokioCommandRunner;
+        let err = runner
+            .run("sleep", &["30".into()], &[], &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MigrationError::Cancelled));
     }
 }

@@ -12,7 +12,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::error::{MigrationError, Result};
+use crate::error::Result;
 
 /// Subset of libpq's `sslmode` we recognise.
 ///
@@ -171,9 +171,6 @@ pub async fn connect_with_sslmode(connection_string: &str) -> Result<tokio_postg
         }
     }
 }
-
-// Quiet unused-import warning for the failure path of `make_tls_connector`.
-fn _ensure_error_used(_: MigrationError) {}
 
 #[cfg(test)]
 mod tests {

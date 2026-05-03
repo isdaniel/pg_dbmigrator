@@ -14,7 +14,9 @@ use crate::config::{MigrationConfig, MigrationMode};
 use crate::cutover::CutoverHandle;
 use crate::dump::{run_pg_dump, CommandRunner, DumpFormat, DumpRequest, TokioCommandRunner};
 use crate::error::{MigrationError, Result};
-use crate::native_apply::{run_native_apply, ApplyStats, PgSubscriptionLagProvider};
+use crate::native_apply::{
+    force_clean_stale_state, run_native_apply, ApplyStats, PgSubscriptionLagProvider,
+};
 use crate::preflight::verify_pg_tools_installed;
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
 use crate::restore::{run_pg_restore, RestoreRequest};
@@ -101,14 +103,24 @@ impl Migrator {
         let dump_path = self.dump_path_or_default("dump_offline");
 
         self.report(MigrationStage::Dump, "starting pg_dump").await;
-        run_pg_dump(self.runner.as_ref(), &self.dump_request(&dump_path, None)).await?;
+        run_pg_dump(
+            self.runner.as_ref(),
+            &self.dump_request(&dump_path, None),
+            &cancel,
+        )
+        .await?;
         if cancel.is_cancelled() {
             return Err(MigrationError::Cancelled);
         }
 
         self.report(MigrationStage::Restore, "starting pg_restore")
             .await;
-        run_pg_restore(self.runner.as_ref(), &self.restore_request(&dump_path)).await?;
+        run_pg_restore(
+            self.runner.as_ref(),
+            &self.restore_request(&dump_path),
+            &cancel,
+        )
+        .await?;
 
         self.report(MigrationStage::Complete, "offline migration finished")
             .await;
@@ -121,6 +133,21 @@ impl Migrator {
     /// Online path: slot + snapshot → snapshot-aligned dump → restore →
     /// streaming apply.
     async fn run_online(&self, cancel: CancellationToken) -> Result<MigrationOutcome> {
+        // 0. Optional best-effort cleanup of leftovers from a previous run.
+        if self.config.online.force_clean {
+            self.report(
+                MigrationStage::Validate,
+                "force-clean: dropping any stale subscription/slot",
+            )
+            .await;
+            force_clean_stale_state(
+                &self.config.source.connection_string,
+                &self.config.target.connection_string,
+                &self.config.online,
+            )
+            .await?;
+        }
+
         // 1. Prepare slot + snapshot (must happen *before* pg_dump runs).
         self.report(MigrationStage::PrepareSnapshot, "creating replication slot")
             .await;
@@ -142,6 +169,7 @@ impl Migrator {
         run_pg_dump(
             self.runner.as_ref(),
             &self.dump_request(&dump_path, snapshot_name.clone()),
+            &cancel,
         )
         .await?;
         if cancel.is_cancelled() {
@@ -151,7 +179,12 @@ impl Migrator {
         // 3. Restore.
         self.report(MigrationStage::Restore, "starting pg_restore")
             .await;
-        run_pg_restore(self.runner.as_ref(), &self.restore_request(&dump_path)).await?;
+        run_pg_restore(
+            self.runner.as_ref(),
+            &self.restore_request(&dump_path),
+            &cancel,
+        )
+        .await?;
         if cancel.is_cancelled() {
             return Err(MigrationError::Cancelled);
         }
@@ -311,6 +344,7 @@ mod tests {
             program: &str,
             args: &[String],
             _env: &[(String, String)],
+            _cancel: &CancellationToken,
         ) -> Result<()> {
             self.calls
                 .lock()

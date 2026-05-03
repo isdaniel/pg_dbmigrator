@@ -238,6 +238,16 @@ pub struct OnlineOptions {
     /// operator can inspect it. Default `true`.
     #[serde(default = "default_true")]
     pub drop_subscription_on_cutover: bool,
+    /// If `true`, run a best-effort cleanup before creating the slot &
+    /// subscription: any leftover subscription with the same name on the
+    /// target is disabled / detached / dropped, and any leftover replication
+    /// slot with the same name on the source is dropped. Use this when a
+    /// previous run died after `CREATE SUBSCRIPTION` and the next run would
+    /// otherwise fail with "subscription already exists" / "slot already
+    /// exists". Default `false` so operators opt in explicitly. CLI:
+    /// `--force-clean`.
+    #[serde(default)]
+    pub force_clean: bool,
     /// Configuration for the WAL apply worker.
     pub apply: ReplicationApplyConfig,
     /// Cutover knobs — when to declare the target "caught up" and how the
@@ -258,6 +268,7 @@ impl Default for OnlineOptions {
             subscription_name: default_subscription_name(),
             subscription_source_conn: None,
             drop_subscription_on_cutover: true,
+            force_clean: false,
             apply: ReplicationApplyConfig::default(),
             cutover: CutoverConfig::default(),
         }

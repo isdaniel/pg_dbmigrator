@@ -71,6 +71,15 @@ pub struct Cli {
     #[arg(long)]
     pub keep_subscription: bool,
 
+    /// Best-effort cleanup of any leftover subscription on the target and
+    /// replication slot on the source from a previous (crashed) run before
+    /// starting. Use this when a previous run died after `CREATE
+    /// SUBSCRIPTION` and the next run would otherwise fail with
+    /// "subscription already exists" / "slot already exists". Online mode
+    /// only.
+    #[arg(long)]
+    pub force_clean: bool,
+
     /// pgoutput protocol version.
     #[arg(long, default_value_t = 2)]
     pub protocol_version: u32,
@@ -123,6 +132,13 @@ pub struct Cli {
     /// Verbose logging.
     #[arg(long)]
     pub verbose: bool,
+
+    /// Emit machine-readable NDJSON progress events to stdout (one
+    /// [`pg_migrator::ProgressEvent`] per line). Human-readable tracing
+    /// logs continue to go to stderr. Pair with
+    /// `RUST_LOG=warn,pg_migrator=warn` to silence stderr for clean piping.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// CLI-friendly mirror of [`MigrationMode`].
@@ -177,6 +193,7 @@ impl Cli {
             subscription_name: self.subscription_name,
             subscription_source_conn: self.subscription_source,
             drop_subscription_on_cutover: !self.keep_subscription,
+            force_clean: self.force_clean,
             apply,
             cutover: CutoverConfig {
                 poll_interval: std::time::Duration::from_secs(self.cutover_poll_secs),
