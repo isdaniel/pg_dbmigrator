@@ -15,11 +15,13 @@ use crate::cutover::CutoverHandle;
 use crate::dump::{run_pg_dump, CommandRunner, DumpFormat, DumpRequest, TokioCommandRunner};
 use crate::error::{MigrationError, Result};
 use crate::native_apply::{
-    force_clean_stale_state, run_native_apply, ApplyStats, PgSubscriptionLagProvider,
+    cleanup_target_subscription, force_clean_stale_state, run_native_apply, ApplyStats,
+    PgSubscriptionLagProvider,
 };
 use crate::preflight::verify_pg_tools_installed;
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
-use crate::restore::{run_pg_restore, RestoreRequest};
+use crate::restore::{run_pg_restore, run_pg_restore_in_sections, RestoreRequest};
+use crate::resume::{default_resume_path, CompletedStage, ResumeToken};
 use crate::snapshot::prepare_replication_slot;
 use crate::tls::connect_with_sslmode;
 
@@ -101,26 +103,42 @@ impl Migrator {
     /// Offline path: `pg_dump` → `pg_restore`.
     async fn run_offline(&self, cancel: CancellationToken) -> Result<MigrationOutcome> {
         let dump_path = self.dump_path_or_default("dump_offline");
+        let mut token = self.load_or_init_resume(&dump_path).await?;
 
-        self.report(MigrationStage::Dump, "starting pg_dump").await;
-        run_pg_dump(
-            self.runner.as_ref(),
-            &self.dump_request(&dump_path, None),
-            &cancel,
-        )
-        .await?;
-        if cancel.is_cancelled() {
-            return Err(MigrationError::Cancelled);
+        if !token.has(CompletedStage::Dump) {
+            self.report(MigrationStage::Dump, "starting pg_dump").await;
+            run_pg_dump(
+                self.runner.as_ref(),
+                &self.dump_request(&dump_path, None),
+                &cancel,
+            )
+            .await?;
+            if cancel.is_cancelled() {
+                return Err(MigrationError::Cancelled);
+            }
+            token.mark(CompletedStage::Dump);
+            self.save_resume(&token, &dump_path).await;
+        } else {
+            self.report(
+                MigrationStage::Dump,
+                "skipped (resume): pg_dump already complete",
+            )
+            .await;
         }
 
-        self.report(MigrationStage::Restore, "starting pg_restore")
+        if !token.has(CompletedStage::Restore) {
+            self.report(MigrationStage::Restore, "starting pg_restore")
+                .await;
+            self.restore(&dump_path, &cancel).await?;
+            token.mark(CompletedStage::Restore);
+            self.save_resume(&token, &dump_path).await;
+        } else {
+            self.report(
+                MigrationStage::Restore,
+                "skipped (resume): pg_restore already complete",
+            )
             .await;
-        run_pg_restore(
-            self.runner.as_ref(),
-            &self.restore_request(&dump_path),
-            &cancel,
-        )
-        .await?;
+        }
 
         self.report(MigrationStage::Complete, "offline migration finished")
             .await;
@@ -148,45 +166,83 @@ impl Migrator {
             .await?;
         }
 
-        // 1. Prepare slot + snapshot (must happen *before* pg_dump runs).
-        self.report(MigrationStage::PrepareSnapshot, "creating replication slot")
+        let dump_path = self.dump_path_or_default("dump_online");
+        let mut token = self.load_or_init_resume(&dump_path).await?;
+
+        // When resuming past Dump, the slot was created in a previous run
+        // and the exported snapshot is already gone — there is no live
+        // stream to keep. We only call `prepare_replication_slot` (and
+        // hold a stream) when we still need to run pg_dump.
+        let mut prepared_stream = None;
+        let snapshot_name = if !token.has(CompletedStage::Dump) {
+            // 1. Prepare slot + snapshot (must happen *before* pg_dump runs).
+            self.report(MigrationStage::PrepareSnapshot, "creating replication slot")
+                .await;
+            let prepared = prepare_replication_slot(
+                &self.config.source.connection_string,
+                &self.config.online,
+            )
+            .await?;
+            let snap = prepared.snapshot_name.clone();
+            prepared_stream = Some(prepared.stream);
+            token.mark(CompletedStage::PrepareSnapshot);
+            token.snapshot_name = snap.clone();
+            self.save_resume(&token, &dump_path).await;
+            snap
+        } else {
+            self.report(
+                MigrationStage::PrepareSnapshot,
+                "skipped (resume): slot/snapshot already prepared in previous run",
+            )
             .await;
-        let prepared =
-            prepare_replication_slot(&self.config.source.connection_string, &self.config.online)
-                .await?;
-        let snapshot_name = prepared.snapshot_name.clone();
+            token.snapshot_name.clone()
+        };
 
         // 2. Snapshot-aligned dump.
-        let dump_path = self.dump_path_or_default("dump_online");
-        self.report(
-            MigrationStage::Dump,
-            format!(
-                "starting pg_dump with snapshot {}",
-                snapshot_name.as_deref().unwrap_or("<unknown>")
-            ),
-        )
-        .await;
-        run_pg_dump(
-            self.runner.as_ref(),
-            &self.dump_request(&dump_path, snapshot_name.clone()),
-            &cancel,
-        )
-        .await?;
-        if cancel.is_cancelled() {
-            return Err(MigrationError::Cancelled);
+        if !token.has(CompletedStage::Dump) {
+            self.report(
+                MigrationStage::Dump,
+                format!(
+                    "starting pg_dump with snapshot {}",
+                    snapshot_name.as_deref().unwrap_or("<unknown>")
+                ),
+            )
+            .await;
+            run_pg_dump(
+                self.runner.as_ref(),
+                &self.dump_request(&dump_path, snapshot_name.clone()),
+                &cancel,
+            )
+            .await?;
+            if cancel.is_cancelled() {
+                return Err(MigrationError::Cancelled);
+            }
+            token.mark(CompletedStage::Dump);
+            self.save_resume(&token, &dump_path).await;
+        } else {
+            self.report(
+                MigrationStage::Dump,
+                "skipped (resume): pg_dump already complete",
+            )
+            .await;
         }
 
         // 3. Restore.
-        self.report(MigrationStage::Restore, "starting pg_restore")
+        if !token.has(CompletedStage::Restore) {
+            self.report(MigrationStage::Restore, "starting pg_restore")
+                .await;
+            self.restore(&dump_path, &cancel).await?;
+            if cancel.is_cancelled() {
+                return Err(MigrationError::Cancelled);
+            }
+            token.mark(CompletedStage::Restore);
+            self.save_resume(&token, &dump_path).await;
+        } else {
+            self.report(
+                MigrationStage::Restore,
+                "skipped (resume): pg_restore already complete",
+            )
             .await;
-        run_pg_restore(
-            self.runner.as_ref(),
-            &self.restore_request(&dump_path),
-            &cancel,
-        )
-        .await?;
-        if cancel.is_cancelled() {
-            return Err(MigrationError::Cancelled);
         }
 
         // 4. Streaming apply via `CREATE SUBSCRIPTION` on the target. The
@@ -194,8 +250,19 @@ impl Migrator {
         // alive across pg_dump; the slot itself persists on the source
         // independently of the stream connection, so we drop the stream
         // before handing the slot to the native apply worker.
-        drop(prepared.stream);
+        drop(prepared_stream);
+
+        // When resuming into the apply phase a previous (crashed) run may
+        // already have created the subscription. Drop just the
+        // subscription (the slot stays — it's where we'll resume from).
+        if self.config.resume {
+            cleanup_target_subscription(&self.config.target.connection_string, &self.config.online)
+                .await?;
+        }
+
         let stats = self.run_native_engine(cancel).await?;
+        token.last_applied_lsn = Some(stats.last_applied_lsn);
+        self.save_resume(&token, &dump_path).await;
 
         self.report(MigrationStage::Complete, "online migration finished")
             .await;
@@ -275,6 +342,19 @@ impl Migrator {
             no_owner: true,
             no_acl: true,
             tolerate_errors: self.config.allow_restore_errors,
+            section: None,
+        }
+    }
+
+    /// Issue `pg_restore` either as a single all-in-one call or, when
+    /// `split_sections` is enabled, as three section-restricted calls
+    /// (pre-data → data → post-data).
+    async fn restore(&self, dump_path: &Path, cancel: &CancellationToken) -> Result<()> {
+        let req = self.restore_request(dump_path);
+        if self.config.split_sections {
+            run_pg_restore_in_sections(self.runner.as_ref(), &req, cancel).await
+        } else {
+            run_pg_restore(self.runner.as_ref(), &req, cancel).await
         }
     }
 
@@ -282,9 +362,60 @@ impl Migrator {
         if let Some(p) = &self.dump_path {
             return p.clone();
         }
+        if let Some(p) = &self.config.dump_path {
+            return p.clone();
+        }
         let mut p = std::env::temp_dir();
         p.push(format!("{prefix}-{}", std::process::id()));
         p
+    }
+
+    fn resume_path(&self, dump_path: &Path) -> PathBuf {
+        self.config
+            .resume_file
+            .clone()
+            .unwrap_or_else(|| default_resume_path(dump_path))
+    }
+
+    /// Load (or freshly create) the resume token used to skip already-
+    /// completed stages. When `--resume` is off, returns a brand-new
+    /// in-memory token that is also persisted on every successful stage
+    /// so a future run *can* resume even if the operator forgot to opt
+    /// in this time. The path is honoured strictly only when
+    /// `config.resume == true`.
+    async fn load_or_init_resume(&self, dump_path: &Path) -> Result<ResumeToken> {
+        let path = self.resume_path(dump_path);
+        if self.config.resume {
+            match ResumeToken::load(&path).await? {
+                Some(token) => {
+                    token.check_compatible(&self.config)?;
+                    info!(
+                        path = %path.display(),
+                        completed = ?token.completed,
+                        "resume token loaded — skipping completed stages"
+                    );
+                    Ok(token)
+                }
+                None => {
+                    info!(
+                        path = %path.display(),
+                        "--resume set but no token on disk; running from scratch"
+                    );
+                    Ok(ResumeToken::new(&self.config, dump_path.to_path_buf()))
+                }
+            }
+        } else {
+            Ok(ResumeToken::new(&self.config, dump_path.to_path_buf()))
+        }
+    }
+
+    async fn save_resume(&self, token: &ResumeToken, dump_path: &Path) {
+        let path = self.resume_path(dump_path);
+        if let Err(e) = token.save(&path).await {
+            // Resume is a best-effort accelerator — never abort the
+            // real migration because we couldn't write the token.
+            tracing::warn!(error = %e, path = %path.display(), "failed to save resume token");
+        }
     }
 
     async fn connect_target(&self) -> Result<Client> {
@@ -394,6 +525,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_run_with_split_sections_invokes_pg_restore_three_times() {
+        let runner = Arc::new(RecordingRunner::default());
+        let reporter = Arc::new(CollectingReporter::new());
+        let cfg = MigrationConfig {
+            split_sections: true,
+            ..baseline_config()
+        };
+        let migrator = Migrator::new(cfg)
+            .with_runner(runner.clone())
+            .with_reporter(reporter)
+            .with_dump_path(PathBuf::from("/tmp/pg_migrator_split_dump"));
+
+        migrator
+            .run(CancellationToken::new())
+            .await
+            .expect("split-section restore should succeed");
+
+        let calls = runner.snapshot();
+        assert_eq!(calls.len(), 4, "1 dump + 3 restore expected");
+        assert_eq!(calls[0].0, "pg_dump");
+        let sections: Vec<_> = calls[1..]
+            .iter()
+            .map(|(prog, args)| {
+                assert_eq!(prog, "pg_restore");
+                args.iter()
+                    .find(|a| a.starts_with("--section="))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            sections,
+            vec![
+                "--section=pre-data".to_string(),
+                "--section=data".to_string(),
+                "--section=post-data".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn validation_failure_short_circuits() {
         let cfg = MigrationConfig {
             jobs: 0,
@@ -401,6 +573,47 @@ mod tests {
         };
         let migrator = Migrator::new(cfg);
         let err = migrator.run(CancellationToken::new()).await.unwrap_err();
+        assert!(matches!(err, MigrationError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn offline_run_skips_dump_when_resume_token_says_dump_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        let resume = dir.path().join("dump.resume.json");
+
+        let cfg = MigrationConfig {
+            resume: true,
+            dump_path: Some(dump.clone()),
+            resume_file: Some(resume.clone()),
+            ..baseline_config()
+        };
+
+        // Pre-seed the token: Dump already complete, Restore not yet.
+        let mut t = crate::resume::ResumeToken::new(&cfg, dump.clone());
+        t.mark(crate::resume::CompletedStage::Dump);
+        t.save(&resume).await.unwrap();
+
+        let runner = Arc::new(RecordingRunner::default());
+        let migrator = Migrator::new(cfg)
+            .with_runner(runner.clone())
+            .with_reporter(Arc::new(CollectingReporter::new()));
+
+        migrator.run(CancellationToken::new()).await.unwrap();
+
+        let calls = runner.snapshot();
+        assert_eq!(calls.len(), 1, "expected 1 call (restore only)");
+        assert_eq!(calls[0].0, "pg_restore");
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_resume_without_dump_path() {
+        let cfg = MigrationConfig {
+            resume: true,
+            dump_path: None,
+            ..baseline_config()
+        };
+        let err = cfg.validate().unwrap_err();
         assert!(matches!(err, MigrationError::Config(_)));
     }
 

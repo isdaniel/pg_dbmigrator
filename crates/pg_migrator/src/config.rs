@@ -1,5 +1,6 @@
 //! Configuration types used to drive a migration.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,36 @@ pub struct MigrationConfig {
     /// upstream.
     #[serde(default = "default_true")]
     pub no_subscriptions: bool,
+    /// If `true`, restore in three phases — `pre-data`, `data`, then
+    /// `post-data` — instead of one all-in-one `pg_restore` call. Splitting
+    /// lets the bulk `COPY` (data) phase run without index maintenance and
+    /// then rebuilds every index in parallel against fully-loaded tables.
+    /// On schemas with many secondary indexes this is typically 30–60 %
+    /// faster than the default. Requires a directory- or custom-format
+    /// dump (i.e. not [`crate::dump::DumpFormat::Plain`]). Default
+    /// `false` so the legacy single-call behaviour is preserved.
+    #[serde(default)]
+    pub split_sections: bool,
+    /// If `true`, attempt to resume a previous run by reading the
+    /// resume token at [`Self::resume_file`] (default
+    /// `<dump_path>.resume.json`). Stages already marked complete in the
+    /// token are skipped. Requires a stable [`Self::dump_path`] override
+    /// so the orchestrator knows where the on-disk dump archive lives;
+    /// validation rejects `resume=true` without an explicit dump path.
+    /// Default `false`.
+    #[serde(default)]
+    pub resume: bool,
+    /// Override for the resume token file path. When `None`, the
+    /// orchestrator uses
+    /// [`crate::resume::default_resume_path`]`(dump_path)`.
+    #[serde(default)]
+    pub resume_file: Option<PathBuf>,
+    /// Pinned `pg_dump` archive path. Required when [`Self::resume`] is
+    /// `true` so subsequent runs target the same archive. When `None`,
+    /// the orchestrator generates a per-pid path under
+    /// `std::env::temp_dir()`.
+    #[serde(default)]
+    pub dump_path: Option<PathBuf>,
     /// Verbose logging.
     pub verbose: bool,
 }
@@ -70,6 +101,10 @@ impl Default for MigrationConfig {
             allow_restore_errors: false,
             no_publications: true,
             no_subscriptions: true,
+            split_sections: false,
+            resume: false,
+            resume_file: None,
+            dump_path: None,
             verbose: false,
         }
     }
@@ -88,6 +123,11 @@ impl MigrationConfig {
         }
         if self.jobs == 0 {
             return Err(MigrationError::config("jobs must be >= 1"));
+        }
+        if self.resume && self.dump_path.is_none() {
+            return Err(MigrationError::config(
+                "--resume requires --dump-path so subsequent runs target the same archive",
+            ));
         }
         if self.mode == MigrationMode::Online {
             self.online.validate()?;
@@ -338,9 +378,19 @@ impl Default for ReplicationApplyConfig {
 /// SIGINT / Ctrl+C).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CutoverConfig {
-    /// How often to query the source's current WAL LSN.
+    /// How often to query the source's current WAL LSN while the lag is
+    /// still high. The default is intentionally coarse so we don't spam
+    /// the source with cheap-but-not-free `pg_current_wal_flush_lsn()`
+    /// queries during a multi-hour catch-up.
     #[serde(with = "humantime_serde_workaround")]
     pub poll_interval: Duration,
+    /// Tighter cadence used once the lag drops at or below
+    /// `lag_threshold_bytes` (i.e. the operator might cut over at any
+    /// moment). Defaults to 500 ms — the goal is that the operator's
+    /// SIGINT lands on the apply loop within sub-second instead of
+    /// being capped by `poll_interval`.
+    #[serde(with = "humantime_serde_workaround", default = "default_fast_poll")]
+    pub fast_poll_interval: Duration,
     /// Advisory lag threshold (in WAL bytes). When the lag first drops at
     /// or below this value the orchestrator emits a one-shot `CaughtUp`
     /// ("ready for cutover") event. The threshold never triggers cutover
@@ -348,10 +398,15 @@ pub struct CutoverConfig {
     pub lag_threshold_bytes: u64,
 }
 
+fn default_fast_poll() -> Duration {
+    Duration::from_millis(500)
+}
+
 impl Default for CutoverConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(5),
+            fast_poll_interval: default_fast_poll(),
             // 8 KiB — one WAL page; "ready" threshold for short-lived idle gaps.
             lag_threshold_bytes: 8 * 1024,
         }
@@ -363,6 +418,11 @@ impl CutoverConfig {
     pub fn validate(&self) -> Result<()> {
         if self.poll_interval.is_zero() {
             return Err(MigrationError::config("cutover.poll_interval must be > 0"));
+        }
+        if self.fast_poll_interval.is_zero() {
+            return Err(MigrationError::config(
+                "cutover.fast_poll_interval must be > 0",
+            ));
         }
         Ok(())
     }

@@ -97,6 +97,12 @@ async fn main() -> Result<()> {
         },
         cutover: CutoverConfig {
             poll_interval: Duration::from_secs(env_secs("PG_MIGRATOR_POLL_SECS", 5)),
+            fast_poll_interval: Duration::from_millis(
+                env::var("PG_MIGRATOR_FAST_POLL_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(500),
+            ),
             lag_threshold_bytes: env::var("PG_MIGRATOR_LAG_THRESHOLD_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())

@@ -174,3 +174,143 @@ jobs:
       - name: Tear down docker-compose stack
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
+
+  integration-offline-split-sections:
+    name: Integration test (offline, pre-data → data → post-data section orchestration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL 17 client tools (pg_dump / pg_restore / psql)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Start docker-compose stack
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run offline split-sections e2e
+        run: bash tests/integration/run_offline_split_sections.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down docker-compose stack
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  integration-offline-resume:
+    name: Integration test (offline, resume token skips dump+restore on second run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL 17 client tools (pg_dump / pg_restore / psql)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Start docker-compose stack
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run offline resume e2e
+        run: bash tests/integration/run_offline_resume.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down docker-compose stack
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  integration-offline-sigint-cancel:
+    name: Integration test (offline, SIGINT mid-pg_dump → fast cancellation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL 17 client tools (pg_dump / pg_restore / psql)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Start docker-compose stack
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run offline SIGINT cancel e2e
+        run: bash tests/integration/run_offline_sigint_cancel.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down docker-compose stack
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  integration-online-lag-cadence:
+    name: Integration test (online, adaptive lag-poll cadence near catch-up)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL 17 client tools (pg_dump / pg_restore / psql)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Start docker-compose stack
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run online lag cadence e2e
+        run: bash tests/integration/run_online_lag_cadence.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down docker-compose stack
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

@@ -149,12 +149,14 @@ pub trait CommandRunner: Send + Sync + std::fmt::Debug {
 
 /// Default [`CommandRunner`] that uses [`tokio::process::Command`].
 ///
-/// Sets `kill_on_drop` so an aborted future does not leak a child. When
-/// `cancel` fires mid-run, the child is sent SIGKILL (Tokio's only
-/// portable kill primitive) and we return [`MigrationError::Cancelled`].
-/// `pg_dump`'s on-disk artefact is left for the next run / `--force-clean`
-/// to mop up — this is the same contract `pg_dump --jobs` has when its
-/// shell is killed.
+/// On Unix the child is launched in its own process group via
+/// `setpgid(0, 0)`. `pg_dump --jobs N` forks worker processes that share
+/// the leader's pgid, so on cancellation we deliver SIGTERM to the
+/// **whole group** (`kill(-pgid, SIGTERM)`) and escalate to SIGKILL
+/// after a short grace window. Without this, killing only the leader
+/// leaves the workers re-parented to PID 1 and still pumping bytes from
+/// the source. `kill_on_drop` is also set so a cancelled future never
+/// leaks even if the explicit kill path takes the slow road.
 #[derive(Debug, Default, Clone)]
 pub struct TokioCommandRunner;
 
@@ -178,20 +180,31 @@ impl CommandRunner for TokioCommandRunner {
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
         cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd
             .spawn()
             .map_err(|e| MigrationError::external(program, format!("failed to spawn: {e}")))?;
+        let child_pid = child.id();
 
         let status = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                warn!(program, "cancellation requested — killing child");
-                if let Err(e) = child.start_kill() {
-                    warn!(program, error = %e, "child kill failed");
+                warn!(program, "cancellation requested — terminating child group");
+                kill_child_group(child_pid, /* sigkill = */ false);
+                // Give pg_dump's worker pool ~2 s to flush & close socket
+                // connections, then escalate to SIGKILL.
+                let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+                tokio::pin!(timeout);
+                tokio::select! {
+                    res = child.wait() => { let _ = res; }
+                    _ = &mut timeout => {
+                        kill_child_group(child_pid, /* sigkill = */ true);
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                    }
                 }
-                // Reap so we don't leak a zombie.
-                let _ = child.wait().await;
                 return Err(MigrationError::Cancelled);
             }
             res = child.wait() => res.map_err(|e| {
@@ -210,6 +223,32 @@ impl CommandRunner for TokioCommandRunner {
         Ok(())
     }
 }
+
+/// Send SIGTERM (or SIGKILL when `sigkill = true`) to the process group
+/// led by `pid`. No-op on non-Unix platforms; `kill_on_drop(true)` plus
+/// the parent's normal exit handle the cleanup there.
+#[cfg(unix)]
+fn kill_child_group(pid: Option<u32>, sigkill: bool) {
+    if let Some(pid) = pid {
+        let pgid = pid as libc::pid_t;
+        let sig = if sigkill {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        // SAFETY: kill() is async-signal-safe and only takes integers;
+        // the negative PID dispatches to the entire process group. A
+        // failure (e.g. group already gone) is logged but not actionable.
+        let rc = unsafe { libc::kill(-pgid, sig) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(pgid, sig, error = %err, "failed to signal process group");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_child_group(_pid: Option<u32>, _sigkill: bool) {}
 
 /// Run `pg_dump` according to `req` using the supplied [`CommandRunner`].
 pub async fn run_pg_dump<R: CommandRunner + ?Sized>(

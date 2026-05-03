@@ -45,6 +45,9 @@ tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
 rustls-native-certs = "0.8.3"
 
+# Unix signal helpers (process-group SIGTERM/SIGKILL on cancel).
+libc = "0.2"
+
 # Test utilities
 tempfile = "3.27"
 

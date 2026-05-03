@@ -29,6 +29,9 @@ tokio-postgres-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }

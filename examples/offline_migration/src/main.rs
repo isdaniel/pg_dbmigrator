@@ -11,12 +11,20 @@
 //! ```
 
 use std::env;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use pg_migrator::{config::DumpScope, EndpointConfig, MigrationConfig, MigrationMode, Migrator};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,6 +46,10 @@ async fn main() -> Result<()> {
         dump_scope: DumpScope::All,
         drop_target_first: true,
         jobs: 4,
+        split_sections: env_flag("PG_MIGRATOR_SPLIT_SECTIONS"),
+        resume: env_flag("PG_MIGRATOR_RESUME"),
+        resume_file: env::var("PG_MIGRATOR_RESUME_FILE").ok().map(PathBuf::from),
+        dump_path: env::var("PG_MIGRATOR_DUMP_PATH").ok().map(PathBuf::from),
         ..MigrationConfig::default()
     };
 

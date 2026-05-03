@@ -103,10 +103,30 @@ pub struct Cli {
     #[arg(long, default_value_t = 5)]
     pub cutover_poll_secs: u64,
 
+    /// Tighter poll cadence (milliseconds) used once `lag_bytes <=
+    /// --lag-threshold-bytes`. Default 500 ms — keeps SIGINT response
+    /// time sub-second once the operator has the green light to cut
+    /// over. Online mode only.
+    #[arg(long, default_value_t = 500)]
+    pub cutover_fast_poll_ms: u64,
+
     /// Pin the dump archive output path. By default a unique path inside
-    /// `$TMPDIR` is used.
+    /// `$TMPDIR` is used. Required when `--resume` is set.
     #[arg(long)]
     pub dump_path: Option<PathBuf>,
+
+    /// Resume a previous run. The orchestrator reads
+    /// `<dump_path>.resume.json` (or `--resume-file`), validates the
+    /// surrounding config still matches, and skips every stage already
+    /// marked complete. Requires `--dump-path` so successive runs target
+    /// the same archive.
+    #[arg(long)]
+    pub resume: bool,
+
+    /// Override path for the resume token file. Defaults to
+    /// `<dump_path>.resume.json`.
+    #[arg(long)]
+    pub resume_file: Option<PathBuf>,
 
     /// Treat `pg_restore` exit 1 (`errors ignored on restore: N`) as a
     /// non-fatal warning. Use for cross-server migrations where the source
@@ -128,6 +148,15 @@ pub struct Cli {
     /// subscriptions that point at the previous upstream.
     #[arg(long)]
     pub keep_subscriptions: bool,
+
+    /// Restore in three phases — `pre-data` → `data` → `post-data` —
+    /// instead of one all-in-one `pg_restore` call. Skips index
+    /// maintenance during the bulk `COPY` phase and rebuilds every index
+    /// in parallel against fully-loaded tables. Typically 30–60 % faster
+    /// on schemas with many secondary indexes; requires a directory- or
+    /// custom-format dump.
+    #[arg(long)]
+    pub split_sections: bool,
 
     /// Verbose logging.
     #[arg(long)]
@@ -197,6 +226,7 @@ impl Cli {
             apply,
             cutover: CutoverConfig {
                 poll_interval: std::time::Duration::from_secs(self.cutover_poll_secs),
+                fast_poll_interval: std::time::Duration::from_millis(self.cutover_fast_poll_ms),
                 lag_threshold_bytes: self.lag_threshold_bytes,
             },
         };
@@ -214,6 +244,10 @@ impl Cli {
             allow_restore_errors: self.allow_restore_errors,
             no_publications: !self.keep_publications,
             no_subscriptions: !self.keep_subscriptions,
+            split_sections: self.split_sections,
+            resume: self.resume,
+            resume_file: self.resume_file,
+            dump_path: self.dump_path,
             verbose: self.verbose,
         })
     }

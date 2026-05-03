@@ -47,6 +47,7 @@ pub mod orchestrator;
 pub mod preflight;
 pub mod progress;
 pub mod restore;
+pub mod resume;
 pub mod snapshot;
 pub mod tls;
 
@@ -58,3 +59,4 @@ pub use cutover::{CutoverHandle, LagSampler, Transition};
 pub use error::{MigrationError, Result};
 pub use orchestrator::Migrator;
 pub use progress::{JsonReporter, MigrationStage, ProgressEvent, ProgressReporter};
+pub use resume::{CompletedStage, ResumeToken, RESUME_SCHEMA_VERSION};

@@ -2,12 +2,42 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::config::EndpointConfig;
 use crate::dump::{is_directory_dump, pgpassword_env, CommandRunner};
 use crate::error::{MigrationError, Result};
+
+/// Restore phase, mapped to `pg_restore --section=<value>`.
+///
+/// The standard pgcopydb / pg_dump-best-practice ordering is
+/// `PreData` (CREATE TABLE / TYPE / FUNCTION DDL with no indexes) →
+/// `Data` (COPY of every table) → `PostData` (PRIMARY KEY, CHECK,
+/// FOREIGN KEY, INDEX, TRIGGER). Splitting the restore lets the bulk
+/// `Data` phase run without index maintenance, and lets the `PostData`
+/// phase rebuild every index in parallel against fully-loaded tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreSection {
+    /// Schema DDL only (no indexes, no constraints, no triggers).
+    PreData,
+    /// `COPY` of every table's contents.
+    Data,
+    /// Indexes, primary / foreign keys, check constraints, triggers.
+    PostData,
+}
+
+impl RestoreSection {
+    /// Returns the value to pass to `--section=<value>`.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::PreData => "pre-data",
+            Self::Data => "data",
+            Self::PostData => "post-data",
+        }
+    }
+}
 
 /// Description of a restore invocation.
 #[derive(Debug, Clone)]
@@ -40,6 +70,12 @@ pub struct RestoreRequest {
     /// Default `false` (fail-fast). Enable explicitly via the CLI's
     /// `--allow-restore-errors` flag.
     pub tolerate_errors: bool,
+    /// If `Some`, restrict this restore to a single section
+    /// (`--section=<flag>`). The split-section orchestration in
+    /// [`run_pg_restore_in_sections`] sets this to PreData, then Data,
+    /// then PostData on three consecutive calls. Leave `None` for a
+    /// single all-in-one restore (the legacy behaviour).
+    pub section: Option<RestoreSection>,
 }
 
 /// Build the argv vector for `pg_restore` based on the given request.
@@ -61,7 +97,10 @@ pub fn build_pg_restore_args(req: &RestoreRequest) -> Vec<String> {
         args.push("--jobs".into());
         args.push(req.jobs.to_string());
     }
-    if req.clean {
+    // `--clean --if-exists` issues DROPs that only belong in pre-data; on
+    // a section-restricted Data/PostData call they would happily drop the
+    // freshly-loaded data. Limit the flag to "no section" or "pre-data".
+    if req.clean && matches!(req.section, None | Some(RestoreSection::PreData)) {
         args.push("--clean".into());
         args.push("--if-exists".into());
     }
@@ -70,6 +109,9 @@ pub fn build_pg_restore_args(req: &RestoreRequest) -> Vec<String> {
     }
     if req.no_acl {
         args.push("--no-acl".into());
+    }
+    if let Some(section) = req.section {
+        args.push(format!("--section={}", section.flag()));
     }
 
     args.push(req.input_path.to_string_lossy().into_owned());
@@ -109,6 +151,39 @@ fn is_restore_partial_failure(err: &MigrationError) -> bool {
         err,
         MigrationError::ExternalCommand { command, .. } if command == "pg_restore"
     )
+}
+
+/// Run `pg_restore` three times — `--section=pre-data`, then `data`, then
+/// `post-data`.
+///
+/// Why split: the data section (`COPY` of every table) is by far the
+/// hottest phase. Restoring without indexes / FK constraints lets `COPY`
+/// run at raw I/O speed; the post-data section then rebuilds every index
+/// in parallel (`--jobs N`) on already-warm tables. On schemas with many
+/// secondary indexes this is typically 30–60 % faster than the
+/// all-in-one restore.
+///
+/// Only the pre-data call honours `req.clean`; the Data and PostData
+/// calls reuse the same archive but never re-issue DROPs.
+pub async fn run_pg_restore_in_sections<R: CommandRunner + ?Sized>(
+    runner: &R,
+    base_req: &RestoreRequest,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    for section in [
+        RestoreSection::PreData,
+        RestoreSection::Data,
+        RestoreSection::PostData,
+    ] {
+        if cancel.is_cancelled() {
+            return Err(MigrationError::Cancelled);
+        }
+        info!(?section, "running pg_restore section");
+        let mut req = base_req.clone();
+        req.section = Some(section);
+        run_pg_restore(runner, &req, cancel).await?;
+    }
+    Ok(())
 }
 
 /// Convenience helper: run a plain SQL file through `psql` (used when the
@@ -156,7 +231,47 @@ mod tests {
             no_owner: true,
             no_acl: true,
             tolerate_errors: false,
+            section: None,
         }
+    }
+
+    #[test]
+    fn section_flag_mapping() {
+        assert_eq!(RestoreSection::PreData.flag(), "pre-data");
+        assert_eq!(RestoreSection::Data.flag(), "data");
+        assert_eq!(RestoreSection::PostData.flag(), "post-data");
+    }
+
+    #[test]
+    fn build_args_includes_section_flag_when_set() {
+        let mut req = sample_request();
+        req.section = Some(RestoreSection::PostData);
+        let args = build_pg_restore_args(&req);
+        assert!(args.iter().any(|a| a == "--section=post-data"));
+    }
+
+    #[test]
+    fn build_args_omits_clean_for_data_and_postdata_sections() {
+        let mut req = sample_request(); // clean=true
+        req.section = Some(RestoreSection::Data);
+        let args = build_pg_restore_args(&req);
+        assert!(
+            !args.iter().any(|a| a == "--clean"),
+            "data section must not re-issue DROPs"
+        );
+
+        req.section = Some(RestoreSection::PostData);
+        let args = build_pg_restore_args(&req);
+        assert!(!args.iter().any(|a| a == "--clean"));
+    }
+
+    #[test]
+    fn build_args_keeps_clean_for_predata_section() {
+        let mut req = sample_request();
+        req.section = Some(RestoreSection::PreData);
+        let args = build_pg_restore_args(&req);
+        assert!(args.iter().any(|a| a == "--clean"));
+        assert!(args.iter().any(|a| a == "--if-exists"));
     }
 
     #[test]
@@ -258,5 +373,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MigrationError::ExternalCommand { .. }));
+    }
+
+    /// Records every spawned command and the `--section=` flag observed.
+    #[derive(Debug, Default)]
+    struct SectionRecordingRunner {
+        sections: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for SectionRecordingRunner {
+        async fn run(
+            &self,
+            _program: &str,
+            args: &[String],
+            _env: &[(String, String)],
+            _cancel: &CancellationToken,
+        ) -> Result<()> {
+            let section = args
+                .iter()
+                .find(|a| a.starts_with("--section="))
+                .cloned()
+                .unwrap_or_else(|| "<none>".into());
+            self.sections.lock().unwrap().push(section);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_pg_restore_in_sections_calls_pre_data_then_data_then_post_data() {
+        let runner = SectionRecordingRunner::default();
+        run_pg_restore_in_sections(&runner, &sample_request(), &CancellationToken::new())
+            .await
+            .expect("section restore should succeed");
+        let observed = runner.sections.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![
+                "--section=pre-data".to_string(),
+                "--section=data".to_string(),
+                "--section=post-data".to_string(),
+            ]
+        );
     }
 }
