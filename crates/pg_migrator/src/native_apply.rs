@@ -24,6 +24,7 @@
 use std::time::Instant;
 
 use async_trait::async_trait;
+use pg_walstream::{format_lsn, parse_lsn};
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -50,11 +51,12 @@ pub struct ApplyStats {
 
 /// Parse PostgreSQL's textual `pg_lsn` representation (`"H/L"` where H and L
 /// are hex) into a `u64`.
-pub fn parse_pg_lsn(s: &str) -> Option<u64> {
-    let (hi, lo) = s.split_once('/')?;
-    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
-    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
-    Some((hi << 32) | lo)
+///
+/// Thin wrapper over [`pg_walstream::parse_lsn`] that maps the upstream
+/// error into our [`MigrationError`] enum so call sites stay terse.
+pub fn parse_pg_lsn(s: &str) -> Result<u64> {
+    parse_lsn(s)
+        .map_err(|_| MigrationError::apply(format!("could not parse pg_lsn: {s:?}")))
 }
 
 /// Source-side LSN sampler abstracted so tests can inject deterministic values.
@@ -106,12 +108,8 @@ impl SubscriptionLagProvider for PgSubscriptionLagProvider {
             .await?;
         let source_raw: String = row.get(0);
         let confirmed_raw: String = row.get(1);
-        let source_lsn = parse_pg_lsn(&source_raw).ok_or_else(|| {
-            MigrationError::apply(format!("could not parse pg_lsn: {source_raw:?}"))
-        })?;
-        let confirmed_lsn = parse_pg_lsn(&confirmed_raw).ok_or_else(|| {
-            MigrationError::apply(format!("could not parse pg_lsn: {confirmed_raw:?}"))
-        })?;
+        let source_lsn = parse_pg_lsn(&source_raw)?;
+        let confirmed_lsn = parse_pg_lsn(&confirmed_raw)?;
         Ok((source_lsn, confirmed_lsn))
     }
 }
@@ -319,15 +317,21 @@ async fn report_lag_heartbeat(
                 // collapse to the slot's `confirmed_flush_lsn`.
                 format!(
                     "replication lag {lag_bytes} bytes \
-                     (source LSN {source_lsn}, received LSN {confirmed_lsn}, \
-                     applied LSN {confirmed_lsn})"
+                     (source LSN {source_lsn} [{src_text}], \
+                     received LSN {confirmed_lsn} [{conf_text}], \
+                     applied LSN {confirmed_lsn} [{conf_text}])",
+                    src_text = format_lsn(source_lsn),
+                    conf_text = format_lsn(confirmed_lsn),
                 ),
             )
             .with_detail(serde_json::json!({
                 "lag_bytes": lag_bytes,
                 "source_lsn": source_lsn,
+                "source_lsn_text": format_lsn(source_lsn),
                 "received_lsn": confirmed_lsn,
+                "received_lsn_text": format_lsn(confirmed_lsn),
                 "applied_lsn": confirmed_lsn,
+                "applied_lsn_text": format_lsn(confirmed_lsn),
                 "engine": "native",
             })),
         )
@@ -493,17 +497,23 @@ mod tests {
 
     #[test]
     fn parse_pg_lsn_basic() {
-        assert_eq!(parse_pg_lsn("0/0"), Some(0));
-        assert_eq!(parse_pg_lsn("0/16B0378"), Some(0x16B0378));
-        assert_eq!(parse_pg_lsn("1/0"), Some(1u64 << 32));
+        assert_eq!(parse_pg_lsn("0/0").unwrap(), 0);
+        assert_eq!(parse_pg_lsn("0/16B0378").unwrap(), 0x16B0378);
+        assert_eq!(parse_pg_lsn("1/0").unwrap(), 1u64 << 32);
     }
 
     #[test]
     fn parse_pg_lsn_rejects_garbage() {
-        assert_eq!(parse_pg_lsn(""), None);
-        assert_eq!(parse_pg_lsn("nope"), None);
-        assert_eq!(parse_pg_lsn("0-0"), None);
-        assert_eq!(parse_pg_lsn("xxx/yyy"), None);
+        assert!(parse_pg_lsn("").is_err());
+        assert!(parse_pg_lsn("nope").is_err());
+        assert!(parse_pg_lsn("0-0").is_err());
+        assert!(parse_pg_lsn("xxx/yyy").is_err());
+    }
+
+    #[test]
+    fn parse_pg_lsn_error_kind_is_apply() {
+        let err = parse_pg_lsn("nope").unwrap_err();
+        assert!(matches!(err, MigrationError::Apply(_)));
     }
 
     #[test]

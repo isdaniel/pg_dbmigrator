@@ -120,3 +120,77 @@ content_hash() {
         FROM app.widgets" \
         | tr -d '[:space:]'
 }
+
+# start_mutations SOURCE_URL TICK_FILE
+# — kick off a background loop that produces a mix of UPDATE / DELETE / INSERT
+#   on app.widgets, exercising every replication path (not just INSERT).
+#
+#   * INSERT: ids 10000..   (fresh inserts, monotonic)
+#   * UPDATE: rotating across the original 1..500 rows (changes name+qty)
+#   * DELETE: rotating across the original 451..500 rows
+#
+#   The loop bumps a counter file (TICK_FILE) once per iteration so callers
+#   can tell forward progress is being made. Stop the loop with
+#   `stop_mutations` (matches by recorded PID).
+#
+# Sets the global MUTATION_LOOP_PID.
+start_mutations() {
+    local url="$1"
+    local tick_file="$2"
+    : > "$tick_file"
+    (
+        local i=0
+        while :; do
+            local ins_id=$((10000 + i))
+            local upd_id=$((1 + (i % 500)))
+            local del_id=$((451 + (i % 50)))
+            PGPASSWORD=migrator psql -v ON_ERROR_STOP=0 -X -A -t "$url" -c "
+                INSERT INTO app.widgets (id, name, qty)
+                    VALUES ('$ins_id', 'ins-$ins_id', '$((i * 7))')
+                    ON CONFLICT (id) DO NOTHING;
+                UPDATE app.widgets SET name = 'upd-$i', qty = '$((i * 11))'
+                    WHERE id = '$upd_id';
+                DELETE FROM app.widgets WHERE id = '$del_id';
+            " >/dev/null 2>&1 || true
+            i=$((i + 1))
+            echo "$i" > "$tick_file"
+            sleep 0.05
+        done
+    ) &
+    MUTATION_LOOP_PID=$!
+}
+
+# stop_mutations — terminate the background mutation loop started by
+# `start_mutations`. Idempotent.
+stop_mutations() {
+    if [[ -n "${MUTATION_LOOP_PID:-}" ]] && kill -0 "$MUTATION_LOOP_PID" 2>/dev/null; then
+        kill -TERM "$MUTATION_LOOP_PID" 2>/dev/null || true
+        wait "$MUTATION_LOOP_PID" 2>/dev/null || true
+    fi
+    MUTATION_LOOP_PID=""
+}
+
+# wait_for_content_match SOURCE_URL TARGET_URL TIMEOUT_SECS
+# — poll content_hash on both sides until they match (and are non-empty),
+#   or fail after TIMEOUT_SECS. Emits the matching hash on success.
+#
+#   This is the strict pre-cutover gate for "source and target are
+#   byte-for-byte identical right now".
+wait_for_content_match() {
+    local src="$1"
+    local tgt="$2"
+    local timeout_secs="$3"
+    local deadline=$(( $(date +%s) + timeout_secs ))
+    local last_src="" last_tgt=""
+    while (( $(date +%s) < deadline )); do
+        last_src=$(content_hash "$src")
+        last_tgt=$(content_hash "$tgt")
+        if [[ -n "$last_src" && "$last_src" == "$last_tgt" ]]; then
+            echo "$last_src"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "timeout waiting for content_hash equality (source=$last_src target=$last_tgt)" >&2
+    return 1
+}

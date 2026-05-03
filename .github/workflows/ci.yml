@@ -102,3 +102,75 @@ jobs:
       - name: Tear down docker-compose stack
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
+
+  integration-online-updates:
+    name: Integration test (online, UPDATE/DELETE/INSERT during dump+restore)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL 17 client tools (pg_dump / pg_restore / psql)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Start docker-compose stack
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run online updates e2e (mutations during dump+restore window)
+        run: bash tests/integration/run_online_updates.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down docker-compose stack
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  integration-online-sustained:
+    name: Integration test (online, 60s sustained mutations + pre-cutover equality)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL 17 client tools (pg_dump / pg_restore / psql)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Start docker-compose stack
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run online sustained e2e (60s mutations, pre-cutover equality gate)
+        env:
+          SUSTAIN_SECS: "60"
+        run: bash tests/integration/run_online_sustained.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down docker-compose stack
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
