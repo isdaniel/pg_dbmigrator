@@ -6,9 +6,9 @@
 //!   `psql`) against the target. Equivalent to a one-shot dump-and-load.
 //! * **Online** — first creates a logical replication slot on the source with
 //!   `EXPORT_SNAPSHOT`, runs a snapshot-consistent `pg_dump` / `pg_restore`,
-//!   and then continues by streaming WAL changes through
-//!   [`pg_walstream`](https://crates.io/crates/pg_walstream) and applying them
-//!   to the target.
+//!   and then issues `CREATE SUBSCRIPTION` on the target so PostgreSQL's
+//!   built-in apply worker streams WAL changes from the slot until the
+//!   operator triggers cutover.
 //!
 //! The crate is split into small, single-purpose modules so that it can be
 //! consumed both as a library and from the bundled CLI binary.
@@ -38,15 +38,14 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
 
-pub mod apply;
 pub mod config;
 pub mod cutover;
 pub mod dump;
 pub mod error;
+pub mod native_apply;
 pub mod orchestrator;
 pub mod preflight;
 pub mod progress;
-pub mod replicate;
 pub mod restore;
 pub mod snapshot;
 pub mod tls;

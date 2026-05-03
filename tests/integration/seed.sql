@@ -1,8 +1,8 @@
 -- Test fixture: schema + initial 500 rows on the source.
 --
--- Columns are TEXT-typed because the library's streaming-apply path binds
--- replicated values as text (see crates/pg_migrator/src/apply.rs::TextParam).
--- The end-to-end flow is exercised regardless; binary type coercion is out
+-- Columns are TEXT-typed because pg_dump/pg_restore + native logical
+-- replication apply both handle text losslessly without coercion concerns;
+-- the end-to-end flow is exercised regardless. Binary type fidelity is out
 -- of scope for this integration suite.
 DROP SCHEMA IF EXISTS app CASCADE;
 CREATE SCHEMA app;

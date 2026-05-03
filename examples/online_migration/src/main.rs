@@ -3,12 +3,15 @@
 //! 1. Create a logical replication slot on the source with `EXPORT_SNAPSHOT`.
 //! 2. Run `pg_dump --snapshot=<id>` for a consistent baseline.
 //! 3. `pg_restore` into the target.
-//! 4. Stream WAL changes from the slot to the target. The library emits a
-//!    periodic `Lag` heartbeat (lag_bytes, source/received/applied LSN) so
-//!    the operator can decide when to cut over.
+//! 4. Issue `CREATE SUBSCRIPTION ... WITH (create_slot=false,
+//!    slot_name='<existing>', enabled=true, copy_data=false)` on the target
+//!    so PostgreSQL's built-in apply worker streams WAL from the slot. The
+//!    library emits a periodic `Lag` heartbeat (lag_bytes, source/confirmed
+//!    LSN) so the operator can decide when to cut over.
 //! 5. On SIGINT (Ctrl+C) the apply loop performs a graceful cutover —
-//!    flushes the last LSN feedback to the source, stops, and exits.
-//!    A second Ctrl+C aborts immediately as an escape hatch.
+//!    `ALTER SUBSCRIPTION ... DISABLE` and (unless
+//!    `PG_MIGRATOR_KEEP_SUBSCRIPTION=1`) `DROP SUBSCRIPTION`. A second
+//!    Ctrl+C aborts immediately as an escape hatch.
 //!
 //! ## `lag_threshold_bytes` semantics
 //!
@@ -76,6 +79,13 @@ async fn main() -> Result<()> {
         publication: env::var("PG_MIGRATOR_PUBLICATION")
             .unwrap_or_else(|_| "pg_migrator_pub".into()),
         protocol_version: 2,
+        subscription_name: env::var("PG_MIGRATOR_SUBSCRIPTION_NAME")
+            .unwrap_or_else(|_| "pg_migrator_sub".into()),
+        // Set this when the target's apply worker reaches the source via a
+        // different address than the migrator (e.g. Docker service name vs.
+        // host loopback). Defaults to `PG_MIGRATOR_SOURCE`.
+        subscription_source_conn: env::var("PG_MIGRATOR_SUBSCRIPTION_SOURCE").ok(),
+        drop_subscription_on_cutover: !env_flag("PG_MIGRATOR_KEEP_SUBSCRIPTION"),
         apply: ReplicationApplyConfig {
             feedback_interval: Duration::from_secs(env_secs("PG_MIGRATOR_FEEDBACK_SECS", 5)),
             connection_timeout: Duration::from_secs(15),
@@ -153,4 +163,12 @@ fn env_secs(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+/// Parse a boolean-ish env var (`1`, `true`, `yes`).
+fn env_flag(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }

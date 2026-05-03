@@ -103,10 +103,10 @@ pub async fn run_pg_restore<R: CommandRunner + ?Sized>(
 /// caller has explicitly opted in via `tolerate_errors`. Any other failure
 /// kind (spawn error, signal kill, etc.) still aborts.
 fn is_restore_partial_failure(err: &MigrationError) -> bool {
-    match err {
-        MigrationError::ExternalCommand { command, .. } if command == "pg_restore" => true,
-        _ => false,
-    }
+    matches!(
+        err,
+        MigrationError::ExternalCommand { command, .. } if command == "pg_restore"
+    )
 }
 
 /// Convenience helper: run a plain SQL file through `psql` (used when the

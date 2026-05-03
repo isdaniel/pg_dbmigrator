@@ -22,6 +22,10 @@ cd "$ROOT"
 
 export SOURCE_URL="postgres://migrator:migrator@127.0.0.1:55432/appdb"
 export TARGET_URL="postgres://migrator:migrator@127.0.0.1:55433/appdb"
+# The CONNECTION clause inside CREATE SUBSCRIPTION is dialed by the target
+# container's apply worker, not by us — `127.0.0.1:55432` would resolve to
+# the target container's own loopback. Use the docker-compose service name.
+export SUBSCRIPTION_SOURCE_URL="postgres://migrator:migrator@pg_migrator_source:5432/appdb"
 
 source "$ROOT/tests/integration/lib.sh"
 
@@ -70,6 +74,7 @@ BIN="$ROOT/target/debug/online_migration_example"
 echo "==> launching migrator in background"
 PG_MIGRATOR_SOURCE="$SOURCE_URL" \
 PG_MIGRATOR_TARGET="$TARGET_URL" \
+PG_MIGRATOR_SUBSCRIPTION_SOURCE="$SUBSCRIPTION_SOURCE_URL" \
 PG_MIGRATOR_LAG_THRESHOLD_BYTES=64 \
 PG_MIGRATOR_POLL_SECS=1 \
 PG_MIGRATOR_FEEDBACK_SECS=1 \
@@ -103,20 +108,38 @@ echo "==> waiting for SECOND 'ready for cutover' (must be strictly after line $F
 SECOND_LINE=$(wait_for_log_match "$LOG_FILE" "ready for cutover" "$FIRST_LINE" 600)
 echo "==> got second 'ready for cutover' on line $SECOND_LINE"
 
-# ── Phase 4: snapshot source_lsn at second-CaughtUp moment, then wait for
-#             applied_lsn >= that value (strict zero-data-loss gate). ────
+# ── Phase 4: gate cutover on target actually holding all rows ───────────
+# We log the snapshotted (source_lsn, applied_lsn) at the moment of the
+# second CaughtUp for forensics, but use the target row count as the
+# *primary* zero-data-loss gate.
+#
+# Why not just wait for `applied_lsn >= source_lsn` from the heartbeat?
+# pgoutput batches one transaction per Commit message: every INSERT inside
+# our 100 000-row transaction streams with the *begin* LSN, so
+# `stats.last_applied_lsn` only jumps to the commit LSN on the final Commit
+# event — even though target rows are landing the whole time. Polling the
+# target's actual row count is both cheaper and a more direct proof of
+# "every change landed".
 SNAP=$(lag_heartbeat_at_or_before "$LOG_FILE" "$SECOND_LINE")
 TARGET_SOURCE_LSN=$(awk '{print $1}' <<<"$SNAP")
 INITIAL_APPLIED_LSN=$(awk '{print $2}' <<<"$SNAP")
-if [[ -z "$TARGET_SOURCE_LSN" ]]; then
-    echo "FAIL: could not snapshot source_lsn from heartbeat near line $SECOND_LINE" >&2
-    tail -n 40 "$LOG_FILE" >&2
-    exit 1
-fi
 echo "==> snapshot at second 'ready for cutover': source_lsn=$TARGET_SOURCE_LSN applied_lsn=$INITIAL_APPLIED_LSN"
-echo "==> waiting until applied_lsn >= $TARGET_SOURCE_LSN (strict zero-data-loss precondition)"
-WAIT_RESULT=$(wait_for_applied_lsn "$LOG_FILE" "$SECOND_LINE" "$TARGET_SOURCE_LSN" 600)
-echo "==> apply caught up: $WAIT_RESULT"
+
+echo "==> waiting for target row count to reach $EXPECTED_TOTAL (strict zero-data-loss gate)"
+GATE_DEADLINE=$(( $(date +%s) + 900 ))
+while :; do
+    cur=$(query_count "$TARGET_URL")
+    if [[ "$cur" == "$EXPECTED_TOTAL" ]]; then
+        echo "==> target reached $EXPECTED_TOTAL rows — apply is complete"
+        break
+    fi
+    if (( $(date +%s) > GATE_DEADLINE )); then
+        echo "FAIL: target did not reach $EXPECTED_TOTAL rows within 15min (last=$cur)" >&2
+        tail -n 80 "$LOG_FILE" >&2
+        exit 1
+    fi
+    sleep 2
+done
 
 # ── Phase 5: operator-driven cutover via SIGINT. ─────────────────────────
 echo "==> sending SIGINT to trigger cutover"

@@ -54,6 +54,23 @@ pub struct Cli {
     #[arg(long, default_value = "pg_migrator_pub")]
     pub publication: String,
 
+    /// Subscription name created on the target. Online mode only.
+    #[arg(long, default_value = "pg_migrator_sub")]
+    pub subscription_name: String,
+
+    /// Override for the source URI written into
+    /// `CREATE SUBSCRIPTION ... CONNECTION '<…>'`. Set this when the
+    /// target's apply worker reaches the source via a different address than
+    /// the migrator (e.g. Docker service name vs. host loopback). Defaults
+    /// to `--source` when unset. Online mode only.
+    #[arg(long)]
+    pub subscription_source: Option<String>,
+
+    /// Keep the subscription on the target after cutover (default: drop it).
+    /// Online mode only.
+    #[arg(long)]
+    pub keep_subscription: bool,
+
     /// pgoutput protocol version.
     #[arg(long, default_value_t = 2)]
     pub protocol_version: u32,
@@ -157,6 +174,9 @@ impl Cli {
             slot_name: self.slot_name,
             publication: self.publication,
             protocol_version: self.protocol_version,
+            subscription_name: self.subscription_name,
+            subscription_source_conn: self.subscription_source,
+            drop_subscription_on_cutover: !self.keep_subscription,
             apply,
             cutover: CutoverConfig {
                 poll_interval: std::time::Duration::from_secs(self.cutover_poll_secs),

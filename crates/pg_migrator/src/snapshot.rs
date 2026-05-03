@@ -137,8 +137,7 @@ mod tests {
             slot_name: "slot".into(),
             publication: "pub".into(),
             protocol_version: 2,
-            apply: Default::default(),
-            cutover: Default::default(),
+            ..OnlineOptions::default()
         };
         let cfg = build_stream_config(&opts);
         assert_eq!(cfg.slot_name, "slot");

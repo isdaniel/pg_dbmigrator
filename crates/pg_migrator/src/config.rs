@@ -216,11 +216,37 @@ pub struct OnlineOptions {
     pub publication: String,
     /// pgoutput protocol version (2 enables streaming).
     pub protocol_version: u32,
+    /// Subscription name created on the target. The library issues
+    /// `CREATE SUBSCRIPTION ... WITH (create_slot=false, slot_name='<existing>',
+    /// enabled=true, copy_data=false)` so PostgreSQL's built-in apply worker
+    /// streams from the slot prepared during `PrepareSnapshot`.
+    #[serde(default = "default_subscription_name")]
+    pub subscription_name: String,
+    /// Override for the source connection string written into
+    /// `CREATE SUBSCRIPTION ... CONNECTION '<…>'`.
+    ///
+    /// `None` means the same URI used by the migrator (`source.connection_string`)
+    /// is reused. Set this when the migrator and the target's apply worker
+    /// see the source from different network locations (e.g. operator runs
+    /// from outside a Docker network while the target connects via the
+    /// in-network service name). Always validated by the target — the apply
+    /// worker, not the migrator, dials this URI.
+    #[serde(default)]
+    pub subscription_source_conn: Option<String>,
+    /// If `true`, drop the subscription after a successful cutover. If
+    /// `false`, the subscription is left disabled but in place so the
+    /// operator can inspect it. Default `true`.
+    #[serde(default = "default_true")]
+    pub drop_subscription_on_cutover: bool,
     /// Configuration for the WAL apply worker.
     pub apply: ReplicationApplyConfig,
     /// Cutover knobs — when to declare the target "caught up" and how the
     /// operator triggers cutover.
     pub cutover: CutoverConfig,
+}
+
+fn default_subscription_name() -> String {
+    "pg_migrator_sub".to_string()
 }
 
 impl Default for OnlineOptions {
@@ -229,6 +255,9 @@ impl Default for OnlineOptions {
             slot_name: "pg_migrator_slot".to_string(),
             publication: "pg_migrator_pub".to_string(),
             protocol_version: 2,
+            subscription_name: default_subscription_name(),
+            subscription_source_conn: None,
+            drop_subscription_on_cutover: true,
             apply: ReplicationApplyConfig::default(),
             cutover: CutoverConfig::default(),
         }
@@ -246,6 +275,11 @@ impl OnlineOptions {
         }
         if self.protocol_version == 0 || self.protocol_version > 4 {
             return Err(MigrationError::config("protocol_version must be in 1..=4"));
+        }
+        if self.subscription_name.is_empty() {
+            return Err(MigrationError::config(
+                "subscription_name must not be empty",
+            ));
         }
         self.cutover.validate()?;
         Ok(())
@@ -449,6 +483,22 @@ mod tests {
                 poll_interval: Duration::from_secs(0),
                 ..CutoverConfig::default()
             },
+            ..OnlineOptions::default()
+        };
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn online_options_default_subscription_name() {
+        let opts = OnlineOptions::default();
+        assert_eq!(opts.subscription_name, "pg_migrator_sub");
+        assert!(opts.drop_subscription_on_cutover);
+    }
+
+    #[test]
+    fn online_options_reject_empty_subscription_name() {
+        let opts = OnlineOptions {
+            subscription_name: String::new(),
             ..OnlineOptions::default()
         };
         assert!(opts.validate().is_err());

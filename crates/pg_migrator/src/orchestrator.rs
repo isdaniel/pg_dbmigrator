@@ -8,17 +8,15 @@ use std::sync::Arc;
 
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::{MigrationConfig, MigrationMode};
 use crate::cutover::CutoverHandle;
 use crate::dump::{run_pg_dump, CommandRunner, DumpFormat, DumpRequest, TokioCommandRunner};
 use crate::error::{MigrationError, Result};
+use crate::native_apply::{run_native_apply, ApplyStats, PgSubscriptionLagProvider};
 use crate::preflight::verify_pg_tools_installed;
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
-use crate::replicate::{
-    run_streaming_apply, ApplyDeps, ApplyStats, PostgresLsnProvider, SourceLsnProvider,
-};
 use crate::restore::{run_pg_restore, RestoreRequest};
 use crate::snapshot::prepare_replication_slot;
 use crate::tls::connect_with_sslmode;
@@ -158,33 +156,13 @@ impl Migrator {
             return Err(MigrationError::Cancelled);
         }
 
-        // 4. Streaming apply.
-        let target_client = self.connect_target().await?;
-        self.report(MigrationStage::StreamApply, "starting WAL streaming apply")
-            .await;
-
-        // Open a *non-replication* connection to the source for LSN polling.
-        // We swallow errors here because lag detection is best-effort: the
-        // apply loop is still useful (just without "caught up" reporting) if
-        // the LSN poller fails to connect.
-        let lsn_provider: Option<Arc<dyn SourceLsnProvider>> =
-            match PostgresLsnProvider::connect(&self.config.source.connection_string).await {
-                Ok(p) => Some(Arc::new(p)),
-                Err(e) => {
-                    warn!(error = %e, "could not open LSN polling connection — \
-                          lag detection disabled");
-                    None
-                }
-            };
-
-        let deps = ApplyDeps {
-            apply_cfg: &self.config.online.apply,
-            cutover_cfg: &self.config.online.cutover,
-            cutover_handle: self.cutover_handle.clone(),
-            lsn_provider: lsn_provider.as_ref().map(|p| p.as_ref()),
-            reporter: self.reporter.as_ref(),
-        };
-        let stats = run_streaming_apply(prepared.stream, &target_client, deps, cancel).await?;
+        // 4. Streaming apply via `CREATE SUBSCRIPTION` on the target. The
+        // pg_walstream stream's only job was to keep the exported snapshot
+        // alive across pg_dump; the slot itself persists on the source
+        // independently of the stream connection, so we drop the stream
+        // before handing the slot to the native apply worker.
+        drop(prepared.stream);
+        let stats = self.run_native_engine(cancel).await?;
 
         self.report(MigrationStage::Complete, "online migration finished")
             .await;
@@ -192,6 +170,44 @@ impl Migrator {
             stats: Some(stats),
             dump_path,
         })
+    }
+
+    /// Native PostgreSQL logical-replication apply path
+    /// (`CREATE SUBSCRIPTION` on target).
+    async fn run_native_engine(&self, cancel: CancellationToken) -> Result<ApplyStats> {
+        let target_client = self.connect_target().await?;
+        self.report(
+            MigrationStage::StreamApply,
+            "starting native logical-replication apply (CREATE SUBSCRIPTION)",
+        )
+        .await;
+
+        let lag_provider = PgSubscriptionLagProvider::connect(
+            &self.config.source.connection_string,
+            &self.config.online.slot_name,
+        )
+        .await?;
+
+        // The CONNECTION clause inside CREATE SUBSCRIPTION is dialed by the
+        // target's apply worker, not by us — its network view of the source
+        // may not match ours (e.g. operator on host vs. target in container).
+        let subscription_source = self
+            .config
+            .online
+            .subscription_source_conn
+            .as_deref()
+            .unwrap_or(&self.config.source.connection_string);
+
+        run_native_apply(
+            &target_client,
+            &lag_provider,
+            &self.config.online,
+            subscription_source,
+            self.cutover_handle.clone(),
+            self.reporter.as_ref(),
+            cancel,
+        )
+        .await
     }
 
     fn dump_request(&self, dump_path: &Path, snapshot: Option<String>) -> DumpRequest {

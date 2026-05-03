@@ -13,7 +13,22 @@
 | Mode      | Behaviour                                                                                                                                                                |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `Offline` | `pg_dump` → `pg_restore`. One-shot copy.                                                                                                                                 |
-| `Online`  | Create a logical replication slot with `EXPORT_SNAPSHOT` → snapshot-consistent dump → restore → continuous WAL apply via [`pg_walstream`].                               |
+| `Online`  | Create a logical replication slot with `EXPORT_SNAPSHOT` → snapshot-consistent dump → restore → `CREATE SUBSCRIPTION` on target so PostgreSQL's apply worker streams WAL. |
+
+### Apply path
+
+After `pg_dump` / `pg_restore` the orchestrator drops the
+[`pg_walstream`] stream connection (whose only job was to keep the exported
+snapshot alive across the dump) and issues
+`CREATE SUBSCRIPTION ... WITH (create_slot=false, slot_name='<existing>',
+enabled=true, copy_data=false)` on the target. The pre-existing slot is
+re-used — `create_slot=false` is the critical bit — and the built-in apply
+worker streams WAL from the source's `confirmed_flush_lsn`.
+
+`pg_walstream` is now used **only** as a slot-creation helper inside
+[snapshot.rs](crates/pg_migrator/src/snapshot.rs). There is no longer an
+in-process apply path; the previous `OnlineApplyEngine` enum and
+`--apply-engine` CLI flag have been removed.
 
 [`pg_walstream`]: https://github.com/isdaniel/pg-walstream
 
@@ -45,8 +60,7 @@ examples/online_migration/
 | [crates/pg_migrator/src/dump.rs](crates/pg_migrator/src/dump.rs)                 | `pg_dump` wrapper, `CommandRunner` trait, pure argv builder                 |
 | [crates/pg_migrator/src/restore.rs](crates/pg_migrator/src/restore.rs)           | `pg_restore` / `psql` wrapper                                               |
 | [crates/pg_migrator/src/snapshot.rs](crates/pg_migrator/src/snapshot.rs)         | Replication slot creation + exported snapshot retrieval                     |
-| [crates/pg_migrator/src/replicate.rs](crates/pg_migrator/src/replicate.rs)       | Streaming apply loop, `ApplyStats`                                          |
-| [crates/pg_migrator/src/apply.rs](crates/pg_migrator/src/apply.rs)               | `ChangeEvent` → parameterised SQL translation                               |
+| [crates/pg_migrator/src/native_apply.rs](crates/pg_migrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn` |
 | [crates/pg_migrator/src/orchestrator.rs](crates/pg_migrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
 | [crates/pg_migrator/src/progress.rs](crates/pg_migrator/src/progress.rs)         | `ProgressReporter` trait + Tracing/Collecting implementations               |
 
@@ -63,8 +77,10 @@ examples/online_migration/
 The customer drives cutover with **SIGINT (Ctrl+C)**, mirroring the Azure
 DMS "Cut over" button:
 
-1. After `Restore`, `replicate::run_streaming_apply` enters the apply loop
-   and polls `pg_current_wal_flush_lsn()` every
+1. After `Restore`, `native_apply::run_native_apply` issues
+   `CREATE SUBSCRIPTION` on the target and polls
+   `pg_replication_slots.confirmed_flush_lsn` against
+   `pg_current_wal_flush_lsn()` on the source every
    `CutoverConfig::poll_interval`.
 2. Each poll emits a `Lag` heartbeat (`lag_bytes`, `source_lsn`,
    `received_lsn`, `applied_lsn` in `detail`) — the operator's
@@ -73,7 +89,8 @@ DMS "Cut over" button:
    one-shot `CaughtUp` event is emitted.
 4. The CLI (`crates/pg_migrator-cli/src/main.rs`) installs a SIGINT handler that
    calls `CutoverHandle::request()` on the first Ctrl+C. The apply loop
-   sees the request on its next poll, flushes LSN feedback, emits
+   sees the request on its next poll, runs `ALTER SUBSCRIPTION ... DISABLE`
+   and (unless `--keep-subscription` is set) `DROP SUBSCRIPTION`, emits
    `Cutover`, and `Migrator::run` returns with
    `MigrationOutcome::cutover_triggered() == true`.
 5. A second SIGINT cancels via the `CancellationToken` (escape hatch). See

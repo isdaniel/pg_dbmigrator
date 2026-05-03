@@ -1,11 +1,12 @@
 # pg_migrator
 
 A Rust library and CLI for migrating PostgreSQL databases between two
-endpoints, a one-shot dump/restore for cold moves, and an online path that keeps a
-logical replication stream applied to the target so the operator can cut
-over with near-zero downtime.
+endpoints, a one-shot dump/restore for cold moves, and an online path that
+keeps PostgreSQL's built-in logical replication apply worker pulling from
+the source so the operator can cut over with near-zero downtime.
 
-The streaming apply phase is built on [`pg_walstream`](https://github.com/isdaniel/pg-walstream), and the overall orchestration model is inspired by
+The online path issues `CREATE SUBSCRIPTION` on the target attached to a
+slot we created with `EXPORT_SNAPSHOT` before `pg_dump` ran. 
 
 ## Modes
 
@@ -77,10 +78,16 @@ cargo pg_migrator \
     --target 'postgres://user:pw@dst/db' \
     --slot-name pg_migrator_slot \
     --publication pg_migrator_pub \
+    --subscription-name pg_migrator_sub \
     --jobs 4 \
     --lag-threshold-bytes 8192 \
     --cutover-poll-secs 5
 ```
+
+The library creates a subscription called `--subscription-name` (default
+`pg_migrator_sub`) on the target attached to the existing slot. On cutover
+the subscription is disabled and, unless `--keep-subscription` is set,
+dropped.
 
 ## Cutover (online mode)
 
