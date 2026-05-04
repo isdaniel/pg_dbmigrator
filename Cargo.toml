@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["danielshih"]
-repository = "https://example.com/pg_migrator"
+repository = "https://github.com/isdaniel/pg_migrator"
 description = "PostgreSQL migration tool (offline dump/restore + online logical replication)"
 
 [workspace.dependencies]
