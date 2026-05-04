@@ -1,6 +1,6 @@
 //! Cutover handle + lag detection helpers for online migrations.
 //!
-//! The streaming apply loop in [`crate::replicate`] periodically samples the
+//! The streaming apply loop in [`crate::native_apply`] periodically samples the
 //! source's current WAL flush position and compares it against the target's
 //! `last_applied_lsn`. When the lag drops at or below
 //! [`crate::config::CutoverConfig::lag_threshold_bytes`] the migration is

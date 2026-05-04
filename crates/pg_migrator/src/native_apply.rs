@@ -1,25 +1,21 @@
 //! Native PostgreSQL logical-replication apply engine.
 //!
-//! This is the [`OnlineApplyEngine::Native`] path: instead of decoding
-//! pgoutput in-process (the [`crate::replicate`] module), we let
-//! PostgreSQL's own apply worker do the work. The orchestrator has already
-//! created the slot on the source via
-//! [`crate::snapshot::prepare_replication_slot`] and finished `pg_dump` /
-//! `pg_restore`; this module then:
+//! Instead of decoding pgoutput in-process, we let PostgreSQL's own apply
+//! worker do the work. The orchestrator has already created the slot on
+//! the source via [`crate::snapshot::prepare_replication_slot`] and
+//! finished `pg_dump` / `pg_restore`; this module then:
 //!
 //! 1. issues `CREATE SUBSCRIPTION ... WITH (create_slot=false,
 //!    slot_name='<existing>', enabled=true, copy_data=false)` on the target
 //!    so the built-in apply worker attaches to the pre-existing slot,
 //! 2. polls `pg_replication_slots.confirmed_flush_lsn` against
 //!    `pg_current_wal_flush_lsn()` on the source every
-//!    `CutoverConfig::poll_interval`, emitting `Lag` / `CaughtUp` progress
-//!    events identical to the [`OnlineApplyEngine::WalStream`] path,
-//! 3. on cutover (`CutoverHandle::request`, typically wired to SIGINT)
-//!    runs `ALTER SUBSCRIPTION ... DISABLE` and — unless the operator
-//!    chose `--keep-subscription` — `DROP SUBSCRIPTION` for a clean exit.
-//!
-//! [`OnlineApplyEngine::Native`]: crate::config::OnlineApplyEngine::Native
-//! [`OnlineApplyEngine::WalStream`]: crate::config::OnlineApplyEngine::WalStream
+//!    [`crate::config::CutoverConfig::poll_interval`], emitting `Lag` /
+//!    `CaughtUp` progress events,
+//! 3. on cutover ([`crate::cutover::CutoverHandle::request`], typically
+//!    wired to SIGINT) runs `ALTER SUBSCRIPTION ... DISABLE` and —
+//!    unless the operator chose `--keep-subscription` —
+//!    `DROP SUBSCRIPTION` for a clean exit.
 
 use std::time::Instant;
 

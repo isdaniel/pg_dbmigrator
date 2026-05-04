@@ -8,9 +8,10 @@
 //! 3. expose the resulting snapshot id (so that `pg_dump --snapshot=...` can
 //!    obtain a consistent view of the database at the slot's start LSN).
 //!
-//! The actual `START_REPLICATION` is deferred to the [`crate::replicate`]
-//! module — we never want to issue it before `pg_dump` has finished, because
-//! `START_REPLICATION` invalidates the exported snapshot.
+//! The actual `START_REPLICATION` is deferred — the orchestrator hands
+//! the slot to [`crate::native_apply`] only **after** `pg_dump` has
+//! finished, because issuing `START_REPLICATION` invalidates the
+//! exported snapshot.
 
 use std::time::Duration;
 
@@ -26,9 +27,10 @@ use crate::error::Result;
 /// [`Debug`], so this struct cannot derive `Debug` either.
 #[allow(missing_debug_implementations)]
 pub struct PreparedSlot {
-    /// The replication stream with the slot already created. Hand this to
-    /// [`crate::replicate::run_streaming_apply`] **after** the dump/restore
-    /// step has completed.
+    /// The replication stream with the slot already created. The
+    /// orchestrator holds it across the `pg_dump` step (so the exported
+    /// snapshot stays alive) and drops it before handing the slot to
+    /// [`crate::native_apply::run_native_apply`].
     pub stream: LogicalReplicationStream,
     /// The exported snapshot id, if PostgreSQL returned one. Use this with
     /// `pg_dump --snapshot=<id>` to obtain a consistent dump aligned with the

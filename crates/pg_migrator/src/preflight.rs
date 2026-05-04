@@ -7,6 +7,7 @@ use std::io;
 use std::process::ExitStatus;
 
 use crate::error::{MigrationError, Result};
+use crate::tls::connect_with_sslmode;
 
 /// External tools that must be available on `$PATH` for the migrator to
 /// function. `pg_dump` is required for both modes; `pg_restore` is required
@@ -64,6 +65,33 @@ pub(crate) fn classify_version_check(
             format!("failed to spawn `{tool} --version`: {e}"),
         )),
     }
+}
+
+/// Confirm that a logical-replication publication with the given name exists
+/// on the source. Run *before* `prepare_replication_slot` so the operator
+/// gets an actionable error in seconds instead of waiting until the apply
+/// worker dies on `CREATE SUBSCRIPTION`.
+///
+/// Returns [`MigrationError::Config`] when the publication is missing — the
+/// operator must `CREATE PUBLICATION <name> FOR ALL TABLES` (or a more
+/// targeted `FOR TABLE ...`) on the source before retrying.
+pub async fn verify_publication_exists(source_conn: &str, publication: &str) -> Result<()> {
+    let client = connect_with_sslmode(source_conn).await?;
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
+            &[&publication],
+        )
+        .await?;
+    let exists: bool = row.get(0);
+    if !exists {
+        return Err(MigrationError::config(format!(
+            "publication `{publication}` does not exist on the source. \
+             Run `CREATE PUBLICATION {publication} FOR ALL TABLES;` \
+             (or a more targeted `FOR TABLE ...`) before retrying."
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

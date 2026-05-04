@@ -58,6 +58,23 @@ pub struct MigrationConfig {
     /// `false` so the legacy single-call behaviour is preserved.
     #[serde(default)]
     pub split_sections: bool,
+    /// Optional `--compress=<spec>` value forwarded to `pg_dump`. PG 16+
+    /// accepts `gzip:N`, `lz4:N`, `zstd:N`, or `none`; older versions
+    /// accept `0..=9`. Trades a small amount of source-side CPU for a 3–10×
+    /// reduction in archive size — a clear win whenever the source ↔
+    /// migrator hop crosses a region or VPN boundary. `None` leaves
+    /// `pg_dump`'s built-in default in place. Default `None` to keep
+    /// behaviour predictable across heterogeneous-PG-version sources.
+    #[serde(default)]
+    pub dump_compress: Option<String>,
+    /// Pass `--no-sync` to `pg_dump`. Default `true`. The dump archive
+    /// is a transient artefact — fsyncing every output file is pure I/O
+    /// overhead. Disable only if you intend to reuse the dump archive
+    /// long after the migrator process has exited *and* you cannot
+    /// afford to lose its tail to a crash. (No corresponding flag
+    /// exists for `pg_restore`.)
+    #[serde(default = "default_true")]
+    pub no_sync: bool,
     /// If `true`, attempt to resume a previous run by reading the
     /// resume token at [`Self::resume_file`] (default
     /// `<dump_path>.resume.json`). Stages already marked complete in the
@@ -86,6 +103,21 @@ fn default_true() -> bool {
     true
 }
 
+/// Pick a sensible default for `pg_dump --jobs` / `pg_restore --jobs`.
+///
+/// We use the host's logical CPU count (typically a good proxy for the
+/// number of independent I/O streams the dump archive can absorb) but
+/// clamp to `[1, 8]`. Above 8 the marginal gain falls off fast — the
+/// shared catalog locks on the source and the contended buffer-pool
+/// pages on the target start to matter. On hosts that can't report
+/// parallelism, we fall back to 4 (the previous static default).
+pub fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4)
+        .clamp(1, 8)
+}
+
 impl Default for MigrationConfig {
     fn default() -> Self {
         Self {
@@ -94,7 +126,7 @@ impl Default for MigrationConfig {
             target: EndpointConfig::default(),
             dump_scope: DumpScope::All,
             drop_target_first: false,
-            jobs: 4,
+            jobs: default_jobs(),
             schemas: Vec::new(),
             tables: Vec::new(),
             online: OnlineOptions::default(),
@@ -102,6 +134,8 @@ impl Default for MigrationConfig {
             no_publications: true,
             no_subscriptions: true,
             split_sections: false,
+            dump_compress: None,
+            no_sync: true,
             resume: false,
             resume_file: None,
             dump_path: None,

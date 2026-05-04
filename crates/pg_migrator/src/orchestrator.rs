@@ -18,7 +18,7 @@ use crate::native_apply::{
     cleanup_target_subscription, force_clean_stale_state, run_native_apply, ApplyStats,
     PgSubscriptionLagProvider,
 };
-use crate::preflight::verify_pg_tools_installed;
+use crate::preflight::{verify_pg_tools_installed, verify_publication_exists};
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
 use crate::restore::{run_pg_restore, run_pg_restore_in_sections, RestoreRequest};
 use crate::resume::{default_resume_path, CompletedStage, ResumeToken};
@@ -175,6 +175,23 @@ impl Migrator {
         // hold a stream) when we still need to run pg_dump.
         let mut prepared_stream = None;
         let snapshot_name = if !token.has(CompletedStage::Dump) {
+            // Fail fast if the publication is missing. Without this check
+            // the apply worker would only error out 10+ minutes later
+            // (after dump+restore) from inside `CREATE SUBSCRIPTION`.
+            self.report(
+                MigrationStage::Validate,
+                format!(
+                    "verifying publication `{}` exists on source",
+                    self.config.online.publication
+                ),
+            )
+            .await;
+            verify_publication_exists(
+                &self.config.source.connection_string,
+                &self.config.online.publication,
+            )
+            .await?;
+
             // 1. Prepare slot + snapshot (must happen *before* pg_dump runs).
             self.report(MigrationStage::PrepareSnapshot, "creating replication slot")
                 .await;
@@ -330,6 +347,8 @@ impl Migrator {
             format,
             no_publications: self.config.no_publications,
             no_subscriptions: self.config.no_subscriptions,
+            compress: self.config.dump_compress.clone(),
+            no_sync: self.config.no_sync,
         }
     }
 
@@ -637,6 +656,19 @@ mod tests {
         let m = Migrator::new(cfg);
         let req = m.dump_request(Path::new("/tmp/dump"), None);
         assert_eq!(req.format, DumpFormat::Custom);
+    }
+
+    #[test]
+    fn dump_request_propagates_perf_flags() {
+        let cfg = MigrationConfig {
+            dump_compress: Some("zstd:3".into()),
+            no_sync: true,
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        assert_eq!(req.compress.as_deref(), Some("zstd:3"));
+        assert!(req.no_sync);
     }
 
     #[test]

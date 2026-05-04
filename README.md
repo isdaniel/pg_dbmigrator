@@ -113,8 +113,6 @@ When the customer is satisfied with the lag, they press **Ctrl+C** once:
 
 Cutover is always operator-driven; `--lag-threshold-bytes` is purely advisory and only controls when the one-shot `CaughtUp` "ready for cutover" event fires.
 
-## Library use
-
 ```rust
 use pg_migrator::{
     EndpointConfig, MigrationConfig, MigrationMode, Migrator,

@@ -48,6 +48,18 @@ pub struct DumpRequest {
     /// as `no_publications` — a fresh target should not inherit subscription
     /// definitions that point at the *previous* upstream.
     pub no_subscriptions: bool,
+    /// Optional `--compress=<spec>` value to forward to `pg_dump` (PG 16+
+    /// accepts `gzip:N`, `lz4:N`, `zstd:N`, or `none`; older versions accept
+    /// integer levels `0..=9`). Compressing the archive trades CPU for
+    /// network/disk: `lz4:1` and `zstd:3` are typically a 3–10× size win on
+    /// schema-heavy data with negligible dump-time overhead. `None` means
+    /// "do not pass `--compress` at all" — `pg_dump` then uses the format's
+    /// default (gzip level 6 for `Custom` / `Directory`).
+    pub compress: Option<String>,
+    /// Pass `--no-sync` to `pg_dump`. Default `true`. The dump archive is a
+    /// transient artefact consumed by `pg_restore` immediately afterwards —
+    /// fsyncing every output file on close is pure I/O overhead.
+    pub no_sync: bool,
 }
 
 /// `pg_dump` archive format.
@@ -120,6 +132,14 @@ pub fn build_pg_dump_args(req: &DumpRequest) -> Vec<String> {
     }
     if req.no_subscriptions {
         args.push("--no-subscriptions".into());
+    }
+    if let Some(spec) = &req.compress {
+        // PG 16+ accepts `gzip:N`, `lz4:N`, `zstd:N`, `none`; older
+        // versions accept a bare digit `0..=9`. Pass through verbatim.
+        args.push(format!("--compress={spec}"));
+    }
+    if req.no_sync {
+        args.push("--no-sync".into());
     }
 
     args
@@ -298,6 +318,8 @@ mod tests {
             format: DumpFormat::Custom,
             no_publications: true,
             no_subscriptions: true,
+            compress: None,
+            no_sync: true,
         }
     }
 
@@ -376,6 +398,37 @@ mod tests {
         let args = build_pg_dump_args(&req);
         assert!(!args.iter().any(|a| a == "--no-publications"));
         assert!(!args.iter().any(|a| a == "--no-subscriptions"));
+    }
+
+    #[test]
+    fn build_args_includes_no_sync_by_default() {
+        let args = build_pg_dump_args(&base_request());
+        assert!(
+            args.iter().any(|a| a == "--no-sync"),
+            "dump archive is transient — fsync is pure overhead"
+        );
+    }
+
+    #[test]
+    fn build_args_omits_no_sync_when_disabled() {
+        let mut req = base_request();
+        req.no_sync = false;
+        let args = build_pg_dump_args(&req);
+        assert!(!args.iter().any(|a| a == "--no-sync"));
+    }
+
+    #[test]
+    fn build_args_passes_compress_spec_when_set() {
+        let mut req = base_request();
+        req.compress = Some("lz4:1".into());
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--compress=lz4:1"));
+    }
+
+    #[test]
+    fn build_args_omits_compress_when_unset() {
+        let args = build_pg_dump_args(&base_request());
+        assert!(!args.iter().any(|a| a.starts_with("--compress=")));
     }
 
     /// Simple [`CommandRunner`] used in tests to assert on the command line

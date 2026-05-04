@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
-use pg_migrator::config::DumpScope;
+use pg_migrator::config::{default_jobs, DumpScope};
 use pg_migrator::{
     CutoverConfig, EndpointConfig, MigrationConfig, MigrationMode, OnlineOptions,
     ReplicationApplyConfig,
@@ -34,8 +34,8 @@ pub struct Cli {
     #[arg(long)]
     pub drop_target_first: bool,
 
-    /// Number of parallel dump/restore jobs.
-    #[arg(long, default_value_t = 4)]
+    /// Number of parallel dump/restore jobs. Defaults to the host's logical CPU count, clamped to the range [1, 8].
+    #[arg(long, default_value_t = default_jobs())]
     pub jobs: usize,
 
     /// Repeatable: schemas to migrate (default: all).
@@ -158,6 +158,23 @@ pub struct Cli {
     #[arg(long)]
     pub split_sections: bool,
 
+    /// `pg_dump` compression spec passed to `--compress`. Examples:
+    /// `gzip:6`, `zstd:3`, `lz4`, `none`. When unset, `pg_dump` picks its
+    /// own default (typically `gzip`). Use `zstd:3` for the best CPU/ratio
+    /// trade-off on modern hardware. Ignored when the directory format is
+    /// not used (parallel dump implies directory).
+    #[arg(long)]
+    pub dump_compress: Option<String>,
+
+    /// Disable the `--no-sync` perf flag passed to `pg_dump`. By default
+    /// `pg_dump` is invoked with `--no-sync`, which skips the final
+    /// `fsync(2)` over every output file. The dump archive is transient
+    /// scratch state — losing it on a host crash just means re-running.
+    /// Pass `--keep-sync` to restore the safer (and slower) default.
+    /// (Note: `pg_restore` has no equivalent flag.)
+    #[arg(long)]
+    pub keep_sync: bool,
+
     /// Verbose logging.
     #[arg(long)]
     pub verbose: bool,
@@ -249,6 +266,8 @@ impl Cli {
             resume_file: self.resume_file,
             dump_path: self.dump_path,
             verbose: self.verbose,
+            dump_compress: self.dump_compress,
+            no_sync: !self.keep_sync,
         })
     }
 }
