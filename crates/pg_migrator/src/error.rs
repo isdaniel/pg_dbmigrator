@@ -54,7 +54,12 @@ pub enum MigrationError {
     Io(#[from] io::Error),
 
     /// Wrapper for any error returned by [`tokio_postgres`].
-    #[error("postgres error: {0}")]
+    ///
+    /// Note: `tokio_postgres::Error`'s `Display` for database errors is just
+    /// `"db error"` — the actual severity/message/detail/hint live inside the
+    /// `DbError` accessible only via `as_db_error()`. We format them
+    /// explicitly so the operator sees the real PostgreSQL message.
+    #[error("{}", format_pg_error(.0))]
     Postgres(#[from] tokio_postgres::Error),
 
     /// Wrapper for any error coming out of [`pg_walstream`].
@@ -68,6 +73,29 @@ pub enum MigrationError {
     /// The pipeline was cancelled by the caller via the cancellation token.
     #[error("operation cancelled")]
     Cancelled,
+}
+
+/// Format a `tokio_postgres::Error` with the full database error detail.
+///
+/// `tokio_postgres::Error::Display` for `Kind::Db` emits only `"db error"`;
+/// the severity, message, detail, and hint are inside the `DbError` struct
+/// accessible via `as_db_error()`. This function extracts them so log lines
+/// and error reports carry the real PostgreSQL diagnostic.
+fn format_pg_error(err: &tokio_postgres::Error) -> String {
+    if let Some(db) = err.as_db_error() {
+        let mut msg = format!("postgres error: {}: {}", db.severity(), db.message());
+        if let Some(detail) = db.detail() {
+            msg.push_str("\nDETAIL: ");
+            msg.push_str(detail);
+        }
+        if let Some(hint) = db.hint() {
+            msg.push_str("\nHINT: ");
+            msg.push_str(hint);
+        }
+        msg
+    } else {
+        format!("postgres error: {err}")
+    }
 }
 
 impl MigrationError {

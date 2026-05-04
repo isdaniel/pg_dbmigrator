@@ -84,7 +84,7 @@ pub struct TracingReporter;
 #[async_trait::async_trait]
 impl ProgressReporter for TracingReporter {
     async fn report(&self, event: ProgressEvent) {
-        info!(stage = ?event.stage, detail = ?event.detail, "{}", event.message);
+        info!(stage = ?event.stage, "{}", event.message);
     }
 }
 

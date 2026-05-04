@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::{DumpScope, EndpointConfig};
 use crate::error::{MigrationError, Result};
+use crate::restore::{ingest_pg_restore_stderr_line, RestoreErrorSummary};
 
 /// Description of a `pg_dump` invocation.
 #[derive(Debug, Clone)]
@@ -191,6 +193,12 @@ impl CommandRunner for TokioCommandRunner {
     ) -> Result<()> {
         debug!(program, ?args, "spawning external command");
 
+        // For `pg_restore` we capture stderr (while still teeing it
+        // live to our own stderr) so we can build a categorized error
+        // summary on exit-1. Other commands keep the simpler inherit
+        // path — they have less verbose / more deterministic output.
+        let capture_stderr = program == "pg_restore";
+
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args);
         for (k, v) in env {
@@ -198,7 +206,11 @@ impl CommandRunner for TokioCommandRunner {
         }
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::inherit());
-        cmd.stderr(Stdio::inherit());
+        if capture_stderr {
+            cmd.stderr(Stdio::piped());
+        } else {
+            cmd.stderr(Stdio::inherit());
+        }
         cmd.kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
@@ -207,6 +219,38 @@ impl CommandRunner for TokioCommandRunner {
             .spawn()
             .map_err(|e| MigrationError::external(program, format!("failed to spawn: {e}")))?;
         let child_pid = child.id();
+
+        // If we asked for `Stdio::piped()`, spawn a reader task that
+        // drains stderr concurrently with `child.wait()`. The reader
+        // (a) tees every line straight to our own stderr so the
+        // operator still sees live progress, and (b) accumulates a
+        // bounded structured summary of error/warning lines.
+        let stderr_task = if capture_stderr {
+            child.stderr.take().map(|pipe| {
+                tokio::spawn(async move {
+                    let mut summary = RestoreErrorSummary::default();
+                    let mut reader = BufReader::new(pipe).lines();
+                    let mut sink = tokio::io::stderr();
+                    loop {
+                        match reader.next_line().await {
+                            Ok(Some(line)) => {
+                                // Tee live so existing operator UX is
+                                // preserved.
+                                let _ = sink.write_all(line.as_bytes()).await;
+                                let _ = sink.write_all(b"\n").await;
+                                let _ = sink.flush().await;
+                                ingest_pg_restore_stderr_line(&line, &mut summary);
+                            }
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                    summary
+                })
+            })
+        } else {
+            None
+        };
 
         let status = tokio::select! {
             biased;
@@ -225,6 +269,10 @@ impl CommandRunner for TokioCommandRunner {
                         let _ = child.wait().await;
                     }
                 }
+                // Best-effort: drain the stderr task before we leave.
+                if let Some(t) = stderr_task {
+                    let _ = t.await;
+                }
                 return Err(MigrationError::Cancelled);
             }
             res = child.wait() => res.map_err(|e| {
@@ -232,11 +280,27 @@ impl CommandRunner for TokioCommandRunner {
             })?,
         };
 
+        // Wait for the stderr drainer to flush the rest of the buffer.
+        let summary = if let Some(t) = stderr_task {
+            t.await.ok()
+        } else {
+            None
+        };
+
         if !status.success() {
-            return Err(MigrationError::external(
-                program,
-                format!("exited with status {status}"),
-            ));
+            // Embed the categorized summary into the error message so
+            // callers (and the warn log) get an actionable report
+            // without any extra plumbing.
+            let detail = match summary {
+                Some(s) if !s.is_empty() || s.errors_ignored_reported.is_some() => {
+                    format!(
+                        "exited with status {status}\n\n{report}",
+                        report = s.render_report()
+                    )
+                }
+                _ => format!("exited with status {status}"),
+            };
+            return Err(MigrationError::external(program, detail));
         }
 
         info!(program, "external command finished successfully");

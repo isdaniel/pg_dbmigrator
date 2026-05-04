@@ -104,10 +104,8 @@ pub struct Cli {
     pub cutover_poll_secs: u64,
 
     /// Tighter poll cadence (milliseconds) used once `lag_bytes <=
-    /// --lag-threshold-bytes`. Default 500 ms — keeps SIGINT response
-    /// time sub-second once the operator has the green light to cut
-    /// over. Online mode only.
-    #[arg(long, default_value_t = 500)]
+    /// --lag-threshold-bytes`. Default 1000 ms. Online mode only.
+    #[arg(long, default_value_t = 1000)]
     pub cutover_fast_poll_ms: u64,
 
     /// Pin the dump archive output path. By default a unique path inside

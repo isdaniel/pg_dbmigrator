@@ -280,12 +280,41 @@ pub async fn run_native_apply(
         "native engine: creating subscription"
     );
 
+    // Drop any stale subscription left over from a previous (crashed) run.
+    // This is idempotent — if the subscription does not exist the DO block is a no-op.
+    let sub = quote_ident(&online.subscription_name);
+    let cleanup_sql = format!(
+        "DO $$\n\
+         BEGIN\n\
+            IF EXISTS (SELECT 1 FROM pg_subscription WHERE subname = {sub_lit}) THEN\n\
+                EXECUTE 'ALTER SUBSCRIPTION {sub} DISABLE';\n\
+                EXECUTE 'ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)';\n\
+                EXECUTE 'DROP SUBSCRIPTION {sub}';\n\
+            END IF;\n\
+         END $$;",
+        sub = sub,
+        sub_lit = quote_literal(&online.subscription_name),
+    );
+    if let Err(e) = target_client.batch_execute(&cleanup_sql).await {
+        warn!(error = %e, "failed to clean up stale subscription (continuing)");
+    }
+
     let create_sql = build_create_subscription_sql(online, source_conn);
     target_client.batch_execute(&create_sql).await?;
+
+    let health_stmt = target_client
+        .prepare(
+            "SELECT pid, received_lsn::text, latest_end_lsn::text \
+             FROM pg_stat_subscription \
+             WHERE subname = $1 AND relid IS NULL",
+        )
+        .await?;
 
     let cutover_cfg: &CutoverConfig = &online.cutover;
     let mut sampler = LagSampler::new(cutover_cfg.lag_threshold_bytes);
     let mut stats = ApplyStats::default();
+    let mut stale_count: u32 = 0;
+    let mut prev_confirmed: Option<u64> = None;
     // Start aggressive: first iteration shouldn't wait `poll_interval`
     // before the very first sample. After each sample we recompute the
     // wait based on observed lag.
@@ -312,9 +341,6 @@ pub async fn run_native_apply(
                 stats.last_received_lsn = confirmed_lsn;
                 stats.last_applied_lsn = confirmed_lsn;
                 stats.last_lag_bytes = transition.lag();
-                // Adaptive cadence: tighten the loop once we're at or
-                // below the operator's "ready for cutover" threshold so
-                // a SIGINT lands within sub-second.
                 current_interval = if transition.lag() <= cutover_cfg.lag_threshold_bytes {
                     cutover_cfg.fast_poll_interval
                 } else {
@@ -322,6 +348,29 @@ pub async fn run_native_apply(
                 };
                 report_lag_heartbeat(reporter, transition.lag(), source_lsn, confirmed_lsn).await;
                 report_transition(reporter, transition, source_lsn, confirmed_lsn).await;
+
+                // Track whether confirmed_lsn is making progress.
+                if prev_confirmed == Some(confirmed_lsn) && transition.lag() > 0 {
+                    stale_count += 1;
+                } else {
+                    stale_count = 0;
+                }
+                prev_confirmed = Some(confirmed_lsn);
+
+                // After several stale polls, check the apply worker.
+                if stale_count >= 3 {
+                    stale_count = 0;
+                    if let Err(e) = check_apply_worker_health(
+                        target_client,
+                        &health_stmt,
+                        &online.subscription_name,
+                        reporter,
+                    )
+                    .await
+                    {
+                        break Err(e);
+                    }
+                }
             }
             Err(e) => {
                 warn!(error = %e, "lag poll failed");
@@ -346,6 +395,71 @@ pub async fn run_native_apply(
     }
 
     result.map(|_| stats)
+}
+
+/// Check whether the apply worker for a subscription is still running.
+///
+/// Queries `pg_stat_subscription` on the target. If the main apply worker
+/// (the row with `relid IS NULL`) has no `pid`, the worker has crashed —
+/// usually because it hit an error on a table that doesn't exist on the
+/// target. Returns an actionable error so the operator knows to check the
+/// target's PostgreSQL logs.
+async fn check_apply_worker_health(
+    target_client: &Client,
+    stmt: &Statement,
+    subscription_name: &str,
+    reporter: &dyn ProgressReporter,
+) -> Result<()> {
+    let rows = target_client.query(stmt, &[&subscription_name]).await?;
+
+    if rows.is_empty() {
+        reporter
+            .report(ProgressEvent::new(
+                MigrationStage::StreamApply,
+                format!(
+                    "apply worker for subscription `{subscription_name}` not found \
+                     in pg_stat_subscription — the worker may have crashed"
+                ),
+            ))
+            .await;
+        return Err(MigrationError::apply(format!(
+            "apply worker for subscription `{subscription_name}` is not running. \
+             The worker likely crashed because a replicated table does not exist \
+             on the target (check the pg_restore error summary above). \
+             Inspect the target server's PostgreSQL log for the exact error, then \
+             either create the missing tables on the target or narrow the source \
+             publication to only tables that exist on both sides."
+        )));
+    }
+
+    let row = &rows[0];
+    let pid: Option<i32> = row.get(0);
+    if pid.is_none() {
+        reporter
+            .report(ProgressEvent::new(
+                MigrationStage::StreamApply,
+                format!(
+                    "apply worker for subscription `{subscription_name}` has stopped \
+                     (pid is NULL) — check the target PostgreSQL log for the error"
+                ),
+            ))
+            .await;
+        return Err(MigrationError::apply(format!(
+            "apply worker for subscription `{subscription_name}` has stopped (pid is NULL). \
+             The worker likely crashed because a replicated table does not exist \
+             on the target (check the pg_restore error summary above). \
+             Inspect the target server's PostgreSQL log for the exact error, then \
+             either create the missing tables on the target or narrow the source \
+             publication to only tables that exist on both sides."
+        )));
+    }
+
+    debug!(
+        subscription = subscription_name,
+        pid = pid.unwrap(),
+        "apply worker is alive"
+    );
+    Ok(())
 }
 
 /// Disable (and optionally drop) the subscription. Always best-effort:
@@ -393,19 +507,20 @@ async fn report_lag_heartbeat(
     source_lsn: u64,
     confirmed_lsn: u64,
 ) {
+    let stage = if lag_bytes == 0 {
+        MigrationStage::CaughtUp
+    } else {
+        MigrationStage::Lag
+    };
     reporter
         .report(
             ProgressEvent::new(
-                MigrationStage::Lag,
-                // Match the legacy text format so external log consumers
-                // (integration tests, dashboards) keep matching the same
-                // patterns. For the native engine `received` and `applied`
-                // collapse to the slot's `confirmed_flush_lsn`.
+                stage,
                 format!(
-                    "replication lag {lag_bytes} bytes \
-                     (source LSN {source_lsn} [{src_text}], \
+                    "replication lag {lag_bytes} bytes, \
+                     source LSN {source_lsn} [{src_text}], \
                      received LSN {confirmed_lsn} [{conf_text}], \
-                     applied LSN {confirmed_lsn} [{conf_text}])",
+                     applied LSN {confirmed_lsn} [{conf_text}]",
                     src_text = format_lsn(source_lsn),
                     conf_text = format_lsn(confirmed_lsn),
                 ),

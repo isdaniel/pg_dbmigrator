@@ -6,7 +6,10 @@
 use std::io;
 use std::process::ExitStatus;
 
+use tracing::info;
+
 use crate::error::{MigrationError, Result};
+use crate::native_apply::quote_ident;
 use crate::tls::connect_with_sslmode;
 
 /// External tools that must be available on `$PATH` for the migrator to
@@ -94,6 +97,108 @@ pub async fn verify_publication_exists(source_conn: &str, publication: &str) -> 
     Ok(())
 }
 
+/// Rewrite a connection string so the path component (database name) points
+/// to the `postgres` maintenance database. Used to run admin commands like
+/// `CREATE DATABASE` which cannot target the database they are creating.
+pub fn maintenance_connection_string(conn: &str) -> String {
+    match conn.find('?') {
+        Some(q) => {
+            let scheme_end = conn.find("://").map(|i| i + 3).unwrap_or(0);
+            let at = conn[scheme_end..q].rfind('@').map(|i| i + scheme_end);
+            let host_start = at.map(|i| i + 1).unwrap_or(scheme_end);
+            // Find first '/' after host:port — that starts the db name.
+            match conn[host_start..q].find('/') {
+                Some(slash) => {
+                    let abs = host_start + slash;
+                    format!("{}/postgres{}", &conn[..abs], &conn[q..])
+                }
+                None => conn.to_string(),
+            }
+        }
+        None => {
+            let scheme_end = conn.find("://").map(|i| i + 3).unwrap_or(0);
+            let at = conn[scheme_end..].rfind('@').map(|i| i + scheme_end);
+            let host_start = at.map(|i| i + 1).unwrap_or(scheme_end);
+            match conn[host_start..].find('/') {
+                Some(slash) => {
+                    let abs = host_start + slash;
+                    format!("{}/postgres", &conn[..abs])
+                }
+                None => conn.to_string(),
+            }
+        }
+    }
+}
+
+/// Ensure the target database exists, creating it if necessary.
+///
+/// Connects to the `postgres` maintenance database on the target server and
+/// checks `pg_database`. If the target database is missing, issues
+/// `CREATE DATABASE`. This runs early in the online pipeline — before
+/// `pg_restore` needs a live target database.
+pub async fn ensure_target_database_exists(target_conn: &str, db_name: &str) -> Result<()> {
+    let maint_conn = maintenance_connection_string(target_conn);
+    let client = connect_with_sslmode(&maint_conn).await?;
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+            &[&db_name],
+        )
+        .await?;
+    let exists: bool = row.get(0);
+    if exists {
+        info!(database = db_name, "target database already exists");
+    } else {
+        info!(database = db_name, "creating target database");
+        let create_sql = format!("CREATE DATABASE {}", quote_ident(db_name));
+        client.batch_execute(&create_sql).await?;
+        info!(database = db_name, "target database created");
+    }
+    Ok(())
+}
+
+/// Check whether `pglogical` is loaded in `shared_preload_libraries` on the
+/// target and warn/error if so.
+///
+/// **Background**: when `pglogical` is a shared preload library it installs
+/// hooks into the logical-replication launcher that prevent native
+/// `CREATE SUBSCRIPTION` apply workers from starting. The workers launch,
+/// immediately crash, and never connect to the source — leaving replication
+/// permanently stalled with no useful error message in `pg_stat_subscription`.
+///
+/// This function detects the situation early and fails with an actionable
+/// message so the operator can remove `pglogical` from
+/// `shared_preload_libraries` (and restart the server) before proceeding.
+///
+/// On vanilla PostgreSQL (or any server where `pglogical` is not preloaded)
+/// the check is a silent no-op.
+pub async fn ensure_pglogical_not_interfering(target_conn: &str) -> Result<()> {
+    let client = connect_with_sslmode(target_conn).await?;
+
+    let row = client
+        .query_one("SELECT current_setting('shared_preload_libraries')", &[])
+        .await?;
+    let libs: &str = row.get(0);
+
+    if libs.split(',').any(|lib| lib.trim() == "pglogical") {
+        return Err(MigrationError::config(
+            "the target server has `pglogical` in `shared_preload_libraries`. \
+             This is known to prevent native PostgreSQL logical-replication apply \
+             workers from starting (the workers crash silently on launch). \
+             Remove `pglogical` from `shared_preload_libraries` and restart the \
+             server before retrying.\n\
+             hint: on Azure Flexible Server, set this via Portal → Server Parameters \
+             → shared_preload_libraries, or via: \
+             `az postgres flexible-server parameter set --name shared_preload_libraries \
+             --value '<libraries-without-pglogical>'`"
+                .to_string(),
+        ));
+    }
+
+    info!("pglogical is not in shared_preload_libraries — native logical replication will work");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +279,39 @@ mod tests {
         // tools; if they don't, the dump/restore tests would already be
         // useless. We tolerate either result so this test never blocks.
         let _ = verify_pg_tools_installed().await;
+    }
+
+    #[test]
+    fn maintenance_conn_swaps_database_name() {
+        assert_eq!(
+            maintenance_connection_string("postgresql://u:p@host:5432/mydb?sslmode=require"),
+            "postgresql://u:p@host:5432/postgres?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn maintenance_conn_no_query_params() {
+        assert_eq!(
+            maintenance_connection_string("postgresql://u:p@host:5432/mydb"),
+            "postgresql://u:p@host:5432/postgres"
+        );
+    }
+
+    #[test]
+    fn maintenance_conn_preserves_multiple_query_params() {
+        assert_eq!(
+            maintenance_connection_string(
+                "postgresql://u:p@host/db1?sslmode=require&connect_timeout=10"
+            ),
+            "postgresql://u:p@host/postgres?sslmode=require&connect_timeout=10"
+        );
+    }
+
+    #[test]
+    fn maintenance_conn_handles_no_password() {
+        assert_eq!(
+            maintenance_connection_string("postgresql://u@host/db1?sslmode=require"),
+            "postgresql://u@host/postgres?sslmode=require"
+        );
     }
 }

@@ -420,8 +420,8 @@ pub struct CutoverConfig {
     pub poll_interval: Duration,
     /// Tighter cadence used once the lag drops at or below
     /// `lag_threshold_bytes` (i.e. the operator might cut over at any
-    /// moment). Defaults to 500 ms — the goal is that the operator's
-    /// SIGINT lands on the apply loop within sub-second instead of
+    /// moment). Defaults to 1 s — the goal is that the operator's
+    /// SIGINT lands on the apply loop within a second instead of
     /// being capped by `poll_interval`.
     #[serde(with = "humantime_serde_workaround", default = "default_fast_poll")]
     pub fast_poll_interval: Duration,
@@ -433,7 +433,7 @@ pub struct CutoverConfig {
 }
 
 fn default_fast_poll() -> Duration {
-    Duration::from_millis(500)
+    Duration::from_secs(1)
 }
 
 impl Default for CutoverConfig {

@@ -113,28 +113,6 @@ When the customer is satisfied with the lag, they press **Ctrl+C** once:
 
 Cutover is always operator-driven; `--lag-threshold-bytes` is purely advisory and only controls when the one-shot `CaughtUp` "ready for cutover" event fires.
 
-```rust
-use pg_migrator::{
-    EndpointConfig, MigrationConfig, MigrationMode, Migrator,
-};
-use tokio_util::sync::CancellationToken;
-
-#[tokio::main]
-async fn main() -> pg_migrator::Result<()> {
-    let cfg = MigrationConfig {
-        mode: MigrationMode::Offline,
-        source: EndpointConfig::parse("postgres://u:p@src/db")?,
-        target: EndpointConfig::parse("postgres://u:p@dst/db")?,
-        ..MigrationConfig::default()
-    };
-
-    Migrator::new(cfg)
-        .run(CancellationToken::new())
-        .await?;
-    Ok(())
-}
-```
-
 For online migrations, hold on to `migrator.cutover_handle()` and call `request()` from your own signal handler / RPC endpoint when the operator is ready to cut over. See [`examples/online_migration`](examples/online_migration) for a complete program that wires Ctrl+C to the cutover handle.
 
 ## Known limitations

@@ -18,7 +18,10 @@ use crate::native_apply::{
     cleanup_target_subscription, force_clean_stale_state, run_native_apply, ApplyStats,
     PgSubscriptionLagProvider,
 };
-use crate::preflight::{verify_pg_tools_installed, verify_publication_exists};
+use crate::preflight::{
+    ensure_pglogical_not_interfering, ensure_target_database_exists, verify_pg_tools_installed,
+    verify_publication_exists,
+};
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
 use crate::restore::{run_pg_restore, run_pg_restore_in_sections, RestoreRequest};
 use crate::resume::{default_resume_path, CompletedStage, ResumeToken};
@@ -166,6 +169,21 @@ impl Migrator {
             .await?;
         }
 
+        // 0.5. Ensure the target database exists — pg_restore needs it.
+        self.report(
+            MigrationStage::Validate,
+            format!(
+                "ensuring target database `{}` exists",
+                self.config.target.database
+            ),
+        )
+        .await;
+        ensure_target_database_exists(
+            &self.config.target.connection_string,
+            &self.config.target.database,
+        )
+        .await?;
+
         let dump_path = self.dump_path_or_default("dump_online");
         let mut token = self.load_or_init_resume(&dump_path).await?;
 
@@ -276,6 +294,14 @@ impl Migrator {
             cleanup_target_subscription(&self.config.target.connection_string, &self.config.online)
                 .await?;
         }
+
+        // 4.5. Verify pglogical is NOT interfering with native logical replication.
+        self.report(
+            MigrationStage::Validate,
+            "checking pglogical is not blocking native replication on target",
+        )
+        .await;
+        ensure_pglogical_not_interfering(&self.config.target.connection_string).await?;
 
         let stats = self.run_native_engine(cancel).await?;
         token.last_applied_lsn = Some(stats.last_applied_lsn);
