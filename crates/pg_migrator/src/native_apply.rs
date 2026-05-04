@@ -20,7 +20,11 @@
 use std::time::Instant;
 
 use async_trait::async_trait;
-use pg_walstream::{format_lsn, parse_lsn};
+use pg_walstream::{
+    build_create_subscription_sql, build_detach_slot_sql, build_disable_subscription_sql,
+    build_drop_subscription_sql, format_lsn, parse_lsn, quote_ident, quote_literal,
+    CreateSubscriptionOptions,
+};
 use tokio_postgres::{Client, Statement};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -117,38 +121,7 @@ impl SubscriptionLagProvider for PgSubscriptionLagProvider {
     }
 }
 
-/// Quote a SQL identifier (`"foo""bar"`-style) so subscription / publication
-/// / slot names can never escape into the surrounding statement. Mirrors the
-/// quoting used by `apply::quote_ident`.
-pub fn quote_ident(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() + 2);
-    out.push('"');
-    for ch in name.chars() {
-        if ch == '"' {
-            out.push('"');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-    out
-}
-
-/// Quote a string for inclusion in a SQL literal (`'foo''bar'`-style).
-pub fn quote_literal(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push('\'');
-        }
-        out.push(ch);
-    }
-    out.push('\'');
-    out
-}
-
-/// Build the `CREATE SUBSCRIPTION ...` statement that attaches the target's
-/// apply worker to the slot already created on the source.
+/// Build the `CREATE SUBSCRIPTION ...` SQL using pg_walstream's sql_builder.
 ///
 /// `create_slot=false` is the critical bit: the slot was created during
 /// `PrepareSnapshot` so the dump could use the exported snapshot; we must
@@ -156,38 +129,17 @@ pub fn quote_literal(value: &str) -> String {
 ///
 /// `copy_data=false` avoids re-copying tables that `pg_restore` already
 /// loaded.
-pub fn build_create_subscription_sql(opts: &OnlineOptions, source_conn: &str) -> String {
-    format!(
-        "CREATE SUBSCRIPTION {sub} \
-         CONNECTION {conn} \
-         PUBLICATION {pubname} \
-         WITH (create_slot = false, slot_name = {slot}, \
-               enabled = true, copy_data = false)",
-        sub = quote_ident(&opts.subscription_name),
-        conn = quote_literal(source_conn),
-        pubname = quote_ident(&opts.publication),
-        slot = quote_literal(&opts.slot_name),
-    )
-}
-
-/// Build the `ALTER SUBSCRIPTION ... DISABLE` statement.
-pub fn build_disable_subscription_sql(name: &str) -> String {
-    format!("ALTER SUBSCRIPTION {} DISABLE", quote_ident(name))
-}
-
-/// Build the cleanup SQL run before `DROP SUBSCRIPTION` so the local slot
-/// reference is detached (otherwise `DROP SUBSCRIPTION` would try to drop the
-/// remote slot, which we still want to own from the source side).
-pub fn build_detach_slot_sql(name: &str) -> String {
-    format!(
-        "ALTER SUBSCRIPTION {} SET (slot_name = NONE)",
-        quote_ident(name)
-    )
-}
-
-/// Build the `DROP SUBSCRIPTION` statement.
-pub fn build_drop_subscription_sql(name: &str) -> String {
-    format!("DROP SUBSCRIPTION {}", quote_ident(name))
+pub fn make_create_subscription_sql(opts: &OnlineOptions, source_conn: &str) -> Result<String> {
+    let sub_opts = CreateSubscriptionOptions {
+        subscription_name: &opts.subscription_name,
+        connection_string: source_conn,
+        publication: &opts.publication,
+        slot_name: &opts.slot_name,
+        create_slot: false,
+        enabled: true,
+        copy_data: false,
+    };
+    build_create_subscription_sql(&sub_opts).map_err(Into::into)
 }
 
 /// Best-effort cleanup of any leftover subscription on the target and any
@@ -217,6 +169,7 @@ pub async fn force_clean_stale_state(
     // string the migrator already validated; pg_drop_replication_slot
     // requires a non-replication connection.
     let source = connect_with_sslmode(source_conn).await?;
+    let slot_lit = quote_literal(&online.slot_name)?;
     let cleanup_slot_sql = format!(
         "DO $$\n\
          BEGIN\n\
@@ -224,7 +177,6 @@ pub async fn force_clean_stale_state(
                 PERFORM pg_drop_replication_slot({slot_lit});\n\
             END IF;\n\
          END $$;",
-        slot_lit = quote_literal(&online.slot_name),
     );
     if let Err(e) = source.batch_execute(&cleanup_slot_sql).await {
         warn!(error = %e, "force-clean: source slot cleanup failed (continuing)");
@@ -240,7 +192,8 @@ pub async fn force_clean_stale_state(
 /// stage can be retried without forfeiting the slot's WAL position.
 pub async fn cleanup_target_subscription(target_conn: &str, online: &OnlineOptions) -> Result<()> {
     let target = connect_with_sslmode(target_conn).await?;
-    let sub = quote_ident(&online.subscription_name);
+    let sub = quote_ident(&online.subscription_name)?;
+    let sub_lit = quote_literal(&online.subscription_name)?;
     let cleanup_sub_sql = format!(
         "DO $$\n\
          BEGIN\n\
@@ -250,8 +203,6 @@ pub async fn cleanup_target_subscription(target_conn: &str, online: &OnlineOptio
                 EXECUTE 'DROP SUBSCRIPTION {sub}';\n\
             END IF;\n\
          END $$;",
-        sub = sub,
-        sub_lit = quote_literal(&online.subscription_name),
     );
     if let Err(e) = target.batch_execute(&cleanup_sub_sql).await {
         warn!(error = %e, "target subscription cleanup failed (continuing)");
@@ -282,7 +233,8 @@ pub async fn run_native_apply(
 
     // Drop any stale subscription left over from a previous (crashed) run.
     // This is idempotent — if the subscription does not exist the DO block is a no-op.
-    let sub = quote_ident(&online.subscription_name);
+    let sub = quote_ident(&online.subscription_name)?;
+    let sub_lit = quote_literal(&online.subscription_name)?;
     let cleanup_sql = format!(
         "DO $$\n\
          BEGIN\n\
@@ -292,14 +244,12 @@ pub async fn run_native_apply(
                 EXECUTE 'DROP SUBSCRIPTION {sub}';\n\
             END IF;\n\
          END $$;",
-        sub = sub,
-        sub_lit = quote_literal(&online.subscription_name),
     );
     if let Err(e) = target_client.batch_execute(&cleanup_sql).await {
         warn!(error = %e, "failed to clean up stale subscription (continuing)");
     }
 
-    let create_sql = build_create_subscription_sql(online, source_conn);
+    let create_sql = make_create_subscription_sql(online, source_conn)?;
     target_client.batch_execute(&create_sql).await?;
 
     let health_stmt = target_client
@@ -478,17 +428,17 @@ async fn teardown_subscription(
     );
 
     target_client
-        .batch_execute(&build_disable_subscription_sql(&online.subscription_name))
+        .batch_execute(&build_disable_subscription_sql(&online.subscription_name)?)
         .await?;
 
     if cutover_triggered && online.drop_subscription_on_cutover {
         // Detach from the slot so DROP SUBSCRIPTION doesn't try to drop the
         // remote slot — the operator owns slot lifecycle separately.
         target_client
-            .batch_execute(&build_detach_slot_sql(&online.subscription_name))
+            .batch_execute(&build_detach_slot_sql(&online.subscription_name)?)
             .await?;
         target_client
-            .batch_execute(&build_drop_subscription_sql(&online.subscription_name))
+            .batch_execute(&build_drop_subscription_sql(&online.subscription_name)?)
             .await?;
         info!(subscription = %online.subscription_name, "subscription dropped");
     } else {
@@ -594,14 +544,14 @@ mod tests {
 
     #[test]
     fn quote_ident_wraps_and_doubles_quotes() {
-        assert_eq!(quote_ident("plain"), "\"plain\"");
-        assert_eq!(quote_ident("has\"quote"), "\"has\"\"quote\"");
+        assert_eq!(quote_ident("plain").unwrap(), "\"plain\"");
+        assert_eq!(quote_ident("has\"quote").unwrap(), "\"has\"\"quote\"");
     }
 
     #[test]
     fn quote_literal_escapes_single_quotes() {
-        assert_eq!(quote_literal("plain"), "'plain'");
-        assert_eq!(quote_literal("o'reilly"), "'o''reilly'");
+        assert_eq!(quote_literal("plain").unwrap(), "'plain'");
+        assert_eq!(quote_literal("o'reilly").unwrap(), "'o''reilly'");
     }
 
     #[test]
@@ -612,7 +562,7 @@ mod tests {
             publication: "my_pub".into(),
             ..OnlineOptions::default()
         };
-        let sql = build_create_subscription_sql(&opts, "postgres://u:p@h/db");
+        let sql = make_create_subscription_sql(&opts, "postgres://u:p@h/db").unwrap();
         assert!(sql.contains("\"my_sub\""));
         assert!(sql.contains("\"my_pub\""));
         assert!(sql.contains("'my_slot'"));
@@ -625,23 +575,22 @@ mod tests {
     #[test]
     fn create_subscription_sql_escapes_password_with_single_quote() {
         let opts = OnlineOptions::default();
-        let sql = build_create_subscription_sql(&opts, "postgres://u:p'wn@h/db");
-        // The single quote must be doubled and the literal still well-formed.
+        let sql = make_create_subscription_sql(&opts, "postgres://u:p'wn@h/db").unwrap();
         assert!(sql.contains("'postgres://u:p''wn@h/db'"));
     }
 
     #[test]
     fn disable_and_drop_sql_quote_identifiers() {
         assert_eq!(
-            build_disable_subscription_sql("my_sub"),
+            build_disable_subscription_sql("my_sub").unwrap(),
             "ALTER SUBSCRIPTION \"my_sub\" DISABLE"
         );
         assert_eq!(
-            build_detach_slot_sql("my_sub"),
+            build_detach_slot_sql("my_sub").unwrap(),
             "ALTER SUBSCRIPTION \"my_sub\" SET (slot_name = NONE)"
         );
         assert_eq!(
-            build_drop_subscription_sql("my_sub"),
+            build_drop_subscription_sql("my_sub").unwrap(),
             "DROP SUBSCRIPTION \"my_sub\""
         );
     }

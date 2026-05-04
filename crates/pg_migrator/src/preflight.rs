@@ -9,7 +9,6 @@ use std::process::ExitStatus;
 use tracing::info;
 
 use crate::error::{MigrationError, Result};
-use crate::native_apply::quote_ident;
 use crate::tls::connect_with_sslmode;
 
 /// External tools that must be available on `$PATH` for the migrator to
@@ -150,7 +149,7 @@ pub async fn ensure_target_database_exists(target_conn: &str, db_name: &str) -> 
         info!(database = db_name, "target database already exists");
     } else {
         info!(database = db_name, "creating target database");
-        let create_sql = format!("CREATE DATABASE {}", quote_ident(db_name));
+        let create_sql = format!("CREATE DATABASE {}", pg_walstream::quote_ident(db_name)?);
         client.batch_execute(&create_sql).await?;
         info!(database = db_name, "target database created");
     }

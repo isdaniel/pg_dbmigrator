@@ -38,7 +38,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 
 # Replication library (this workspace's sibling)
-pg_walstream = { version = "0.6.2", features = ["rustls-tls"] }
+pg_walstream = { version = "0.6.3", features = ["rustls-tls"] }
 
 # TLS for tokio-postgres
 tokio-postgres-rustls = "0.13"
