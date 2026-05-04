@@ -1,4 +1,5 @@
-.PHONY: check build format audit test doc-check before-git-push deps-check deps-bump deps-bump-dry
+.PHONY: check build format audit test doc-check before-git-push deps-check deps-bump deps-bump-dry \
+       integration integration-offline integration-online
 
 deps-check:
 	@echo "=== Checking for outdated dependencies ==="
@@ -39,3 +40,12 @@ doc-check:
 	cargo doc --no-deps --all-features
 
 before-git-push: check build format audit test doc-check
+
+integration:
+	bash tests/integration/run_all.sh all
+
+integration-offline:
+	bash tests/integration/run_all.sh offline
+
+integration-online:
+	bash tests/integration/run_all.sh online

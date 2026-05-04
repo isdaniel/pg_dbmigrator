@@ -50,6 +50,7 @@
 //! ```
 
 use std::env;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -118,6 +119,9 @@ async fn main() -> Result<()> {
         drop_target_first: true,
         jobs: 4,
         online,
+        resume: env_flag("PG_MIGRATOR_RESUME"),
+        resume_file: env::var("PG_MIGRATOR_RESUME_FILE").ok().map(PathBuf::from),
+        dump_path: env::var("PG_MIGRATOR_DUMP_PATH").ok().map(PathBuf::from),
         ..MigrationConfig::default()
     };
 

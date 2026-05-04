@@ -1,27 +1,11 @@
 #!/usr/bin/env bash
 # Offline resume token test — verifies that a second run with
-# `--resume` (PG_MIGRATOR_RESUME=1) skips the previously-completed
-# `pg_dump` and `pg_restore` stages.
-#
-# Concretely:
-#   1. Reset source + target.
-#   2. Run #1 with PG_MIGRATOR_DUMP_PATH=<tmp>/dump (no resume).
-#      → emits the `dump.resume.json` token alongside.
-#   3. Reset target only.
-#   4. Run #2 with the same dump path AND PG_MIGRATOR_RESUME=1.
-#      → log must contain "skipped (resume): pg_dump already complete"
-#      AND  "skipped (resume): pg_restore already complete".
-#      Run #2 must NOT spawn pg_dump (we grep for "starting pg_dump")
-#      against the legitimate first-run pattern).
-#   5. Final state: source/target hashes match.
+# PG_MIGRATOR_RESUME=1 skips the previously-completed pg_dump and
+# pg_restore stages.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
-
-export SOURCE_URL="postgres://migrator:migrator@127.0.0.1:55432/appdb"
-export TARGET_URL="postgres://migrator:migrator@127.0.0.1:55433/appdb"
-
 source "$ROOT/tests/integration/lib.sh"
 
 DUMP_DIR="$(mktemp -d -t pg_migrator_resume_dump.XXXXXX)"
@@ -33,20 +17,13 @@ echo "==> dump dir: $DUMP_DIR"
 echo "==> log #1: $LOG1"
 echo "==> log #2: $LOG2"
 
-cleanup() {
-    rm -rf "$DUMP_DIR"
-}
-trap cleanup EXIT
+trap 'rm -rf "$DUMP_DIR"' EXIT
 
 wait_for_pg "$SOURCE_URL" "source"
 wait_for_pg "$TARGET_URL" "target"
 
-echo "==> resetting source schema"
-PGPASSWORD=migrator psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 55432 -U migrator -d appdb \
-    -f "$ROOT/tests/integration/seed.sql" >/dev/null
-
-echo "==> resetting target schema"
-psql_exec "$TARGET_URL" "DROP SCHEMA IF EXISTS app CASCADE;"
+seed_source
+reset_target_schema
 
 echo "==> RUN #1: full migration (no resume) — also writes resume token"
 PG_MIGRATOR_SOURCE="$SOURCE_URL" \
@@ -75,7 +52,6 @@ echo "==> resume token contents:"
 cat "$RESUME_FILE"
 echo
 
-# Sanity: token must mark BOTH Dump and Restore as completed.
 for stage in dump restore; do
     if ! grep -qi "\"$stage\"" "$RESUME_FILE"; then
         echo "FAIL: resume token missing completed stage '$stage'" >&2
@@ -83,8 +59,8 @@ for stage in dump restore; do
     fi
 done
 
-echo "==> wiping target schema before RUN #2 (so any reload would be visible)"
-psql_exec "$TARGET_URL" "DROP SCHEMA IF EXISTS app CASCADE;"
+echo "==> wiping target schema before RUN #2"
+reset_target_schema
 
 echo "==> RUN #2: with --resume, must skip both stages"
 PG_MIGRATOR_SOURCE="$SOURCE_URL" \
@@ -94,7 +70,6 @@ PG_MIGRATOR_RESUME=1 \
 RUST_LOG="info,pg_migrator=info" \
     cargo run --quiet -p offline_migration_example >"$LOG2" 2>&1
 
-# Must see the skip markers.
 if ! grep -q "skipped (resume): pg_dump already complete" "$LOG2"; then
     echo "FAIL: run #2 did not skip pg_dump on resume" >&2
     tail -n 40 "$LOG2" >&2
@@ -105,18 +80,13 @@ if ! grep -q "skipped (resume): pg_restore already complete" "$LOG2"; then
     tail -n 40 "$LOG2" >&2
     exit 1
 fi
-
-# Must NOT see fresh execution markers.
 if grep -q "starting pg_dump" "$LOG2"; then
     echo "FAIL: run #2 still ran pg_dump despite resume token" >&2
     tail -n 40 "$LOG2" >&2
     exit 1
 fi
 
-# Because the target was wiped between runs and run #2 also skipped
-# restore, the target should now be EMPTY — that's the proof the second
-# run truly relied on the token rather than redoing work. Validate.
-if PGPASSWORD=migrator "${PSQL_BASE[@]}" "$TARGET_URL" \
+if "${PSQL_BASE[@]}" "$TARGET_URL" \
         -c "SELECT 1 FROM pg_namespace WHERE nspname='app'" | grep -q '1'; then
     echo "FAIL: target schema 'app' was reloaded — run #2 did NOT honour resume token" >&2
     exit 1
