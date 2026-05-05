@@ -26,7 +26,7 @@ re-used — `create_slot=false` is the critical bit — and the built-in apply
 worker streams WAL from the source's `confirmed_flush_lsn`.
 
 `pg_walstream` is now used **only** as a slot-creation helper inside
-[snapshot.rs](crates/pg_dbmigrator/src/snapshot.rs). There is no longer an
+[snapshot.rs](pg_dbmigrator/src/snapshot.rs). There is no longer an
 in-process apply path; the previous `OnlineApplyEngine` enum and
 `--apply-engine` CLI flag have been removed.
 
@@ -54,25 +54,25 @@ examples/online_migration/
 
 | File                                                                       | Responsibility                                                              |
 | -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| [crates/pg_dbmigrator/src/lib.rs](crates/pg_dbmigrator/src/lib.rs)                   | Crate entry point, re-exports, `#![deny]`/`#![warn]` lints                  |
-| [crates/pg_dbmigrator/src/config.rs](crates/pg_dbmigrator/src/config.rs)             | `MigrationConfig` / `EndpointConfig` / `OnlineOptions` and validation. Performance defaults: `split_sections`, `dump_compress`, `no_sync`, `no_comments`, `no_security_labels` |
-| [crates/pg_dbmigrator/src/error.rs](crates/pg_dbmigrator/src/error.rs)               | `MigrationError` (`thiserror`) + `Result<T>` alias                          |
-| [crates/pg_dbmigrator/src/dump.rs](crates/pg_dbmigrator/src/dump.rs)                 | `pg_dump` wrapper, `CommandRunner` trait, pure argv builder                 |
-| [crates/pg_dbmigrator/src/restore.rs](crates/pg_dbmigrator/src/restore.rs)           | `pg_restore` / `psql` wrapper                                               |
-| [crates/pg_dbmigrator/src/snapshot.rs](crates/pg_dbmigrator/src/snapshot.rs)         | Replication slot creation + exported snapshot retrieval                     |
-| [crates/pg_dbmigrator/src/native_apply.rs](crates/pg_dbmigrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn`, `wait_for_slot_inactive`, `disable_target_subscription` |
-| [crates/pg_dbmigrator/src/orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
-| [crates/pg_dbmigrator/src/progress.rs](crates/pg_dbmigrator/src/progress.rs)         | `ProgressReporter` trait + Tracing/Collecting implementations               |
-| [crates/pg_dbmigrator/src/preflight.rs](crates/pg_dbmigrator/src/preflight.rs)       | Pre-migration checks (target empty, source `wal_level=logical`, slot/sender capacity) |
-| [crates/pg_dbmigrator/src/sequences.rs](crates/pg_dbmigrator/src/sequences.rs)       | Source→target sequence value sync at cutover (closes the PG logical-replication sequence gap) |
+| [pg_dbmigrator/src/lib.rs](pg_dbmigrator/src/lib.rs)                   | Crate entry point, re-exports, `#![deny]`/`#![warn]` lints                  |
+| [pg_dbmigrator/src/config.rs](pg_dbmigrator/src/config.rs)             | `MigrationConfig` / `EndpointConfig` / `OnlineOptions` and validation. Performance defaults: `split_sections`, `dump_compress`, `no_sync`, `no_comments`, `no_security_labels` |
+| [pg_dbmigrator/src/error.rs](pg_dbmigrator/src/error.rs)               | `MigrationError` (`thiserror`) + `Result<T>` alias                          |
+| [pg_dbmigrator/src/dump.rs](pg_dbmigrator/src/dump.rs)                 | `pg_dump` wrapper, `CommandRunner` trait, pure argv builder                 |
+| [pg_dbmigrator/src/restore.rs](pg_dbmigrator/src/restore.rs)           | `pg_restore` / `psql` wrapper                                               |
+| [pg_dbmigrator/src/snapshot.rs](pg_dbmigrator/src/snapshot.rs)         | Replication slot creation + exported snapshot retrieval                     |
+| [pg_dbmigrator/src/native_apply.rs](pg_dbmigrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn`, `wait_for_slot_inactive`, `disable_target_subscription` |
+| [pg_dbmigrator/src/orchestrator.rs](pg_dbmigrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
+| [pg_dbmigrator/src/progress.rs](pg_dbmigrator/src/progress.rs)         | `ProgressReporter` trait + Tracing/Collecting implementations               |
+| [pg_dbmigrator/src/preflight.rs](pg_dbmigrator/src/preflight.rs)       | Pre-migration checks (target empty, source `wal_level=logical`, slot/sender capacity) |
+| [pg_dbmigrator/src/sequences.rs](pg_dbmigrator/src/sequences.rs)       | Source→target sequence value sync at cutover (closes the PG logical-replication sequence gap) |
 
 ### Pipeline stages (`MigrationStage`)
 
 `Validate → PrepareSnapshot* → Dump → Restore → StreamApply* → Lag* → CaughtUp* → Cutover* → Complete`
 (stages marked `*` are Online-only). Any new stage must be added in **both**
-[progress.rs](crates/pg_dbmigrator/src/progress.rs) (the enum) and
-[orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs) /
-[native_apply.rs](crates/pg_dbmigrator/src/native_apply.rs) (the reporting site).
+[progress.rs](pg_dbmigrator/src/progress.rs) (the enum) and
+[orchestrator.rs](pg_dbmigrator/src/orchestrator.rs) /
+[native_apply.rs](pg_dbmigrator/src/native_apply.rs) (the reporting site).
 
 ### Online cutover model
 
@@ -89,14 +89,14 @@ DMS "Cut over" button:
    continuous bytes-behind read-out.
 3. When the lag drops at or below `CutoverConfig::lag_threshold_bytes`, a
    one-shot `CaughtUp` event is emitted.
-4. The CLI (`crates/pg_dbmigrator-cli/src/main.rs`) installs a SIGINT handler that
+4. The CLI (`pg_dbmigrator/src/bin/pg_dbmigrator/main.rs`) installs a SIGINT handler that
    calls `CutoverHandle::request()` on the first Ctrl+C. The apply loop
    sees the request on its next poll, runs `ALTER SUBSCRIPTION ... DISABLE`
    and (unless `--keep-subscription` is set) `DROP SUBSCRIPTION`, emits
    `Cutover`, and `Migrator::run` returns with
    `MigrationOutcome::cutover_triggered() == true`.
 5. A second SIGINT cancels via the `CancellationToken` (escape hatch). See
-   `classify_sigint` in `crates/pg_dbmigrator-cli/src/main.rs`.
+   `classify_sigint` in `pg_dbmigrator/src/bin/pg_dbmigrator/main.rs`.
 
 Cutover is **always operator-driven**: the apply loop never exits on
 `CaughtUp` alone. The `lag_threshold_bytes` knob is purely advisory —
@@ -132,7 +132,7 @@ the target's sequences stay frozen at whatever `pg_dump`/`pg_restore`
 baked in. Without intervention, the first INSERT after cutover can
 collide with rows the apply worker streamed from the source.
 
-[`sequences.rs`](crates/pg_dbmigrator/src/sequences.rs) closes that gap:
+[`sequences.rs`](pg_dbmigrator/src/sequences.rs) closes that gap:
 
 1. After the operator presses Ctrl+C and `run_native_apply` returns with
    `cutover_triggered = true`, the orchestrator calls
@@ -270,7 +270,7 @@ that never require a running database.
 
 ### 3.1 Crate-level lints
 
-[lib.rs](crates/pg_dbmigrator/src/lib.rs#L42-L43) sets:
+[lib.rs](pg_dbmigrator/src/lib.rs#L42-L43) sets:
 
 ```rust
 #![deny(rust_2018_idioms)]
@@ -283,12 +283,12 @@ When adding a new `pub` type:
 - If the type contains a non-`Debug` member (e.g. `LogicalReplicationStream`),
   attach `#[allow(missing_debug_implementations)]` and explain why in a doc
   comment (see
-  [snapshot.rs](crates/pg_dbmigrator/src/snapshot.rs#L26-L29)).
+  [snapshot.rs](pg_dbmigrator/src/snapshot.rs#L26-L29)).
 
 ### 3.2 Error handling
 
 - Library errors always go through
-  [`MigrationError`](crates/pg_dbmigrator/src/error.rs#L17):
+  [`MigrationError`](pg_dbmigrator/src/error.rs#L17):
   - String-bearing variants must be built via the helpers
     `MigrationError::config(...)`, `::external(...)`, `::apply(...)`. Do not
     construct the enum directly.
@@ -320,7 +320,7 @@ When adding a new `pub` type:
 
 - One responsibility per module. Each file starts with a `//!` doc comment
   describing **why the module exists** and **what it deliberately does not
-  do**. See [native_apply.rs](crates/pg_dbmigrator/src/native_apply.rs#L1-L19) for the pattern.
+  do**. See [native_apply.rs](pg_dbmigrator/src/native_apply.rs#L1-L19) for the pattern.
 - File ordering: `use` → public types → public functions → private helpers
   → `#[cfg(test)] mod tests`.
 - Do not introduce `mod.rs`-style folders; keep the flat `lib.rs` + sibling
@@ -331,10 +331,10 @@ When adding a new `pub` type:
 - Every `pub` item has a `///` comment that covers purpose, required call
   ordering, and edge cases.
 - Configuration fields are documented **per field** (see
-  [config.rs](crates/pg_dbmigrator/src/config.rs#L11-L33)).
+  [config.rs](pg_dbmigrator/src/config.rs#L11-L33)).
 - Crate- and module-level docs include an `# Examples` block, marked
   `no_run` so doc-tests do not actually connect to PostgreSQL (see
-  [lib.rs](crates/pg_dbmigrator/src/lib.rs#L19-L37)).
+  [lib.rs](pg_dbmigrator/src/lib.rs#L19-L37)).
 
 ---
 
@@ -347,9 +347,9 @@ When adding a new `pub` type:
   `build_args_includes_jobs_only_for_directory_format`.
 - Do not depend on a real PostgreSQL instance:
   - Use `RecordingRunner` for dump/restore tests (see
-    [orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs#L246-L276)).
+    [orchestrator.rs](pg_dbmigrator/src/orchestrator.rs#L246-L276)).
   - Use `CollectingReporter` for progress tests
-    ([progress.rs](crates/pg_dbmigrator/src/progress.rs#L83)).
+    ([progress.rs](pg_dbmigrator/src/progress.rs#L83)).
   - Use `StaticLagProvider` for lag-loop cadence tests.
 - Modifying any pure function (`build_pg_dump_args`,
   `build_pg_restore_args`, `make_create_subscription_sql`, `parse_pg_lsn`)
@@ -402,7 +402,7 @@ When you receive a new requirement, work in this order:
    `Migrator::run_offline` / `run_online` and emit progress events via
    `self.report(stage, message)`.
 5. **Mirror it in the CLI** — add `#[arg(...)]` in
-   [args.rs](crates/pg_dbmigrator-cli/src/args.rs) and map it in `into_config`. Use
+   [args.rs](pg_dbmigrator/src/bin/pg_dbmigrator/args.rs) and map it in `into_config`. Use
    kebab-case for flag names.
 6. **Update README + examples** if user-visible behaviour changes.
 7. **Run lint and tests**:
@@ -437,7 +437,7 @@ When you receive a new requirement, work in this order:
   error message must go through `redacted()`.
 - `pg_dump` / `pg_restore` are external processes. We pass the password via
   the `PGPASSWORD` environment variable (see
-  [dump.rs](crates/pg_dbmigrator/src/dump.rs#L165-L172)). **Do not** put it in
+  [dump.rs](pg_dbmigrator/src/dump.rs#L165-L172)). **Do not** put it in
   argv where `ps` could expose it.
 - SQL injection surface: `native_apply` and `sequences` use `quote_ident`
   / `quote_literal` from `pg_walstream` for identifiers and string

@@ -42,7 +42,7 @@ Validate → PrepareSnapshot → Dump → Restore → StreamApply → (Lag heart
 
 ```bash
 # Install the CLI from source. Produces a binary called `pg_dbmigrator`.
-cargo install --path crates/pg_dbmigrator-cli
+cargo install --path pg_dbmigrator
 
 pg_dbmigrator --mode offline --source '…' --target '…' --jobs 4
 ```

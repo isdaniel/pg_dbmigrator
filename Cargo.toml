@@ -1,8 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/pg_dbmigrator",
-    "crates/pg_dbmigrator-cli",
+    "pg_dbmigrator",
     "examples/offline_migration",
     "examples/online_migration",
 ]
