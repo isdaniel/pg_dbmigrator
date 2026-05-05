@@ -803,7 +803,9 @@ mod tests {
         let mut req = base_request();
         req.exclude_tables = vec!["public.large_table".into()];
         let args = build_pg_dump_args(&req);
-        assert!(args.iter().any(|a| a == "--exclude-table=public.large_table"));
+        assert!(args
+            .iter()
+            .any(|a| a == "--exclude-table=public.large_table"));
     }
 
     #[test]
