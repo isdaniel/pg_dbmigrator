@@ -826,4 +826,107 @@ mod tests {
         });
         assert!(out.cutover_triggered());
     }
+
+    #[test]
+    fn config_accessor_returns_migrator_config() {
+        let cfg = baseline_config();
+        let m = Migrator::new(cfg.clone());
+        assert_eq!(m.config().source.host, "src");
+        assert_eq!(m.config().target.host, "dst");
+        assert!(matches!(m.config().mode, MigrationMode::Offline));
+    }
+
+    #[tokio::test]
+    async fn offline_run_cancels_after_dump_before_restore() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct CancellingRunner {
+            cancel: CancellationToken,
+            called: AtomicBool,
+        }
+
+        #[async_trait]
+        impl CommandRunner for CancellingRunner {
+            async fn run(
+                &self,
+                program: &str,
+                _args: &[String],
+                _env: &[(String, String)],
+                _cancel: &CancellationToken,
+            ) -> Result<()> {
+                if program == "pg_dump" {
+                    self.cancel.cancel();
+                }
+                self.called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let runner = Arc::new(CancellingRunner {
+            cancel: cancel.clone(),
+            called: AtomicBool::new(false),
+        });
+        let reporter = Arc::new(CollectingReporter::new());
+        let migrator = Migrator::new(baseline_config())
+            .with_runner(runner)
+            .with_reporter(reporter)
+            .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_cancel_test"));
+
+        let err = migrator.run(cancel).await.unwrap_err();
+        assert!(matches!(err, MigrationError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn offline_run_skips_both_dump_and_restore_when_resume_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        let resume = dir.path().join("dump.resume.json");
+
+        let cfg = MigrationConfig {
+            resume: true,
+            dump_path: Some(dump.clone()),
+            resume_file: Some(resume.clone()),
+            split_sections: false,
+            ..baseline_config()
+        };
+
+        let mut t = crate::resume::ResumeToken::new(&cfg, dump.clone());
+        t.mark(crate::resume::CompletedStage::Dump);
+        t.mark(crate::resume::CompletedStage::Restore);
+        t.save(&resume).await.unwrap();
+
+        let runner = Arc::new(RecordingRunner::default());
+        let migrator = Migrator::new(cfg)
+            .with_runner(runner.clone())
+            .with_reporter(Arc::new(CollectingReporter::new()));
+
+        migrator.run(CancellationToken::new()).await.unwrap();
+        assert!(
+            runner.snapshot().is_empty(),
+            "neither dump nor restore should have been invoked"
+        );
+    }
+
+    #[test]
+    fn dump_request_propagates_exclude_schemas_and_tables() {
+        let cfg = MigrationConfig {
+            exclude_schemas: vec!["audit".into(), "temp".into()],
+            exclude_tables: vec!["public.large".into()],
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        assert_eq!(req.exclude_schemas, vec!["audit", "temp"]);
+        assert_eq!(req.exclude_tables, vec!["public.large"]);
+    }
+
+    #[test]
+    fn dump_request_propagates_snapshot() {
+        let cfg = baseline_config();
+        let m = Migrator::new(cfg);
+        let req = m.dump_request(Path::new("/tmp/dump"), Some("00000003-deadbeef-1".into()));
+        assert_eq!(req.snapshot.as_deref(), Some("00000003-deadbeef-1"));
+    }
 }

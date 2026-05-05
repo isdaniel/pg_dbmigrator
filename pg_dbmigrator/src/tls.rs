@@ -243,4 +243,26 @@ mod tests {
         let c = make_tls_connector(SslMode::VerifyFull).unwrap();
         assert!(c.is_some());
     }
+
+    #[test]
+    fn no_cert_verification_verify_server_cert_always_succeeds() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let verifier = NoCertVerification::default();
+        let dummy_cert = CertificateDer::from(vec![0u8; 32]);
+        let server_name = ServerName::try_from("example.com").unwrap();
+        let result =
+            verifier.verify_server_cert(&dummy_cert, &[], &server_name, &[], UnixTime::now());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn no_cert_verification_supported_verify_schemes_non_empty() {
+        use rustls::client::danger::ServerCertVerifier;
+
+        let verifier = NoCertVerification::default();
+        let schemes = verifier.supported_verify_schemes();
+        assert!(!schemes.is_empty());
+    }
 }

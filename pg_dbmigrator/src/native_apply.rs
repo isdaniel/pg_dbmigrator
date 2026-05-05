@@ -728,6 +728,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_transition_fell_behind_emits_stream_apply() {
+        let r = CollectingReporter::new();
+        report_transition(&r, Transition::FellBehind { lag: 1000 }, 2000, 1000).await;
+        let events = r.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, MigrationStage::StreamApply);
+        assert!(events[0].message.contains("fell behind"));
+        let detail = events[0].detail.as_ref().unwrap();
+        assert_eq!(detail["lag_bytes"], 1000);
+        assert_eq!(detail["engine"], "native");
+    }
+
+    #[tokio::test]
+    async fn report_transition_still_caught_up_emits_nothing() {
+        let r = CollectingReporter::new();
+        report_transition(&r, Transition::StillCaughtUp { lag: 3 }, 100, 97).await;
+        assert!(r.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn report_transition_still_behind_emits_nothing() {
+        let r = CollectingReporter::new();
+        report_transition(&r, Transition::StillBehind { lag: 500 }, 1000, 500).await;
+        assert!(r.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn report_lag_heartbeat_zero_lag_uses_caught_up_stage() {
+        let r = CollectingReporter::new();
+        report_lag_heartbeat(&r, 0, 100, 100).await;
+        let events = r.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, MigrationStage::CaughtUp);
+    }
+
+    #[tokio::test]
+    async fn report_lag_heartbeat_nonzero_lag_uses_lag_stage() {
+        let r = CollectingReporter::new();
+        report_lag_heartbeat(&r, 512, 1000, 488).await;
+        let events = r.events().await;
+        assert_eq!(events[0].stage, MigrationStage::Lag);
+        let detail = events[0].detail.as_ref().unwrap();
+        assert_eq!(detail["lag_bytes"], 512);
+        assert_eq!(detail["source_lsn"], 1000);
+        assert_eq!(detail["applied_lsn"], 488);
+    }
+
+    #[test]
+    fn format_lsn_produces_expected_output() {
+        assert_eq!(format_lsn(0), "0/0");
+        assert_eq!(format_lsn(0x16B0378), "0/16B0378");
+        assert_eq!(format_lsn(1u64 << 32), "1/0");
+        assert_eq!(format_lsn((1u64 << 32) | 0xABC), "1/ABC");
+    }
+
+    #[tokio::test]
     async fn static_lag_provider_returns_pair() {
         let p = StaticLagProvider {
             source: AtomicU64::new(500),

@@ -19,7 +19,7 @@ categories = ["database", "command-line-utilities"]
 
 [workspace.dependencies]
 # Core async runtime + helpers
-tokio = { version = "1.52.1", features = ["full"] }
+tokio = { version = "1.52.2", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 tokio-postgres = { version = "0.7.17", features = ["with-chrono-0_4"] }
 futures = "0.3.32"
@@ -48,7 +48,7 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
 rustls-native-certs = "0.8.3"
 
 # Unix signal helpers (process-group SIGTERM/SIGKILL on cancel).
-libc = "0.2"
+libc = "0.2.186"
 
 # Test utilities
 tempfile = "3.27"
