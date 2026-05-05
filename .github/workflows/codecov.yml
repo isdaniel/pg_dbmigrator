@@ -13,7 +13,6 @@ jobs:
   coverage:
     name: Generate coverage report
     runs-on: ubuntu-latest
-    services:
       postgres-source:
         image: postgres:17
         env:
@@ -53,28 +52,8 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Configure source for logical replication
-        env:
-          PGPASSWORD: postgres
-        run: |
-          psql -h localhost -p 5432 -U postgres -d source_db -c "ALTER SYSTEM SET wal_level = 'logical';"
-          psql -h localhost -p 5432 -U postgres -d source_db -c "ALTER SYSTEM SET max_replication_slots = 10;"
-          psql -h localhost -p 5432 -U postgres -d source_db -c "ALTER SYSTEM SET max_wal_senders = 10;"
-          # Restart the container to apply wal_level change (not reloadable)
-          docker restart $(docker ps -q --filter "publish=5432")
-          # Wait for container to be ready after restart
-          for i in $(seq 1 30); do
-            if pg_isready -h localhost -p 5432 -U postgres 2>/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-
       - name: Run tests with coverage
-        env:
-          PG_SOURCE_URL: "postgresql://postgres:postgres@localhost:5432/source_db?sslmode=disable"
-          PG_TARGET_URL: "postgresql://postgres:postgres@localhost:5433/target_db?sslmode=disable"
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --ignore-filename-regex "(bin/pg_dbmigrator/main\.rs)"
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
