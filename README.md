@@ -89,6 +89,29 @@ The library creates a subscription called `--subscription-name` (default
 the subscription is disabled and, unless `--keep-subscription` is set,
 dropped.
 
+Before the dump runs, the migrator pre-flights the source:
+`wal_level = 'logical'`, `max_replication_slots > 0`, and
+`max_wal_senders > 0`. A misconfigured source fails fast with a clear
+error instead of stalling later inside `CREATE_REPLICATION_SLOT`.
+
+At cutover, the migrator runs `setval(...)` on every sequence in the
+included schemas so the target picks up where the source left off —
+otherwise the first `INSERT` after cutover would collide with rows the
+subscription replicated. Disable with `--no-sequence-sync` if your
+target role lacks privileges for `setval` on those sequences.
+
+### Filtering
+
+Use `--exclude-schema` and `--exclude-table` to omit large or transient
+objects from the dump. Both flags accept multiple values.
+
+```bash
+cargo pg_migrator --mode offline \
+    --source ... --target ... \
+    --exclude-schema audit \
+    --exclude-table public.large_log
+```
+
 ## Cutover (online mode)
 
 Cutover is driven by `SIGINT` (Ctrl+C). The CLI prints a periodic `Lag` heartbeat after the dump completes, so the operator has a continuous bytes-behind read-out:
@@ -126,3 +149,8 @@ For online migrations, hold on to `migrator.cutover_handle()` and call `request(
   `pg_restore` to exit with code 1. Pass `--allow-restore-errors` to
   treat that as a non-fatal warning when user data was restored
   successfully.
+* Sequence sync at cutover requires the target role to have permission
+  to call `setval()` on the destination sequences. Per-sequence
+  failures are logged but do not abort cutover — inspect the warnings
+  and re-`setval` manually if needed, or pre-grant `USAGE` on the
+  sequences before the migration.

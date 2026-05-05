@@ -131,6 +131,48 @@ content_hash() {
         | tr -d '[:space:]'
 }
 
+# query_seq_last_value URL SEQ_QUALIFIED_NAME
+# — return `pg_sequence_last_value(SEQ::regclass)` as a trimmed string.
+#   Returns the empty string when the sequence has never been advanced
+#   (i.e. `is_called=false`), which is what PostgreSQL reports as NULL.
+#   Use this anywhere we need to compare source/target sequence state
+#   without duplicating an inline psql call.
+query_seq_last_value() {
+    local url="$1"
+    local seq="$2"
+    "${PSQL_BASE[@]}" "$url" \
+        -c "SELECT pg_sequence_last_value('${seq}'::regclass)" \
+        | tr -d '[:space:]'
+}
+
+# wait_for_table_count URL FQTABLE EXPECTED TIMEOUT_SECS
+# — block until SELECT count(*) FROM FQTABLE on URL equals EXPECTED, or
+#   fail after TIMEOUT_SECS. FQTABLE may be schema-qualified
+#   (e.g. `app.events`). Echoes the matched count on success.
+#
+#   This is a generic counterpart to query_count (which is hard-coded to
+#   app.widgets); use it for any new table the test cares about.
+wait_for_table_count() {
+    local url="$1"
+    local fqtable="$2"
+    local expected="$3"
+    local timeout_secs="$4"
+    local deadline=$(( $(date +%s) + timeout_secs ))
+    local cur=""
+    while (( $(date +%s) < deadline )); do
+        cur=$("${PSQL_BASE[@]}" "$url" \
+            -c "SELECT count(*) FROM ${fqtable}" 2>/dev/null \
+            | tr -d '[:space:]')
+        if [[ "$cur" == "$expected" ]]; then
+            echo "$cur"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "timeout waiting for ${fqtable} count == ${expected} on ${url} (last=${cur})" >&2
+    return 1
+}
+
 # start_mutations SOURCE_URL TICK_FILE
 # — kick off a background loop that produces a mix of UPDATE / DELETE / INSERT
 #   on app.widgets, exercising every replication path (not just INSERT).

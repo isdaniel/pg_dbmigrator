@@ -123,6 +123,7 @@ ONLINE_TESTS=(
     tests/integration/run_online_lag_cadence.sh
     tests/integration/run_online_cancel_resume.sh
     tests/integration/run_online_multi_resume_sustained.sh
+    tests/integration/run_online_sequence_sync.sh
 )
 
 case "$FILTER" in

@@ -27,6 +27,18 @@ pub struct MigrationConfig {
     pub schemas: Vec<String>,
     /// Optional list of tables (`schema.table`) to migrate.
     pub tables: Vec<String>,
+    /// Optional list of schemas to **exclude** from the migration. Maps
+    /// to `pg_dump --exclude-schema=<name>` (repeatable). Useful when
+    /// the source has tenant schemas, audit schemas, or vendor-managed
+    /// extension schemas that should not be replicated. Empty by
+    /// default.
+    #[serde(default)]
+    pub exclude_schemas: Vec<String>,
+    /// Optional list of tables (`schema.table`) to **exclude** from the
+    /// migration. Maps to `pg_dump --exclude-table=<schema.table>`
+    /// (repeatable). Empty by default.
+    #[serde(default)]
+    pub exclude_tables: Vec<String>,
     /// Online-only options — ignored in [`MigrationMode::Offline`].
     pub online: OnlineOptions,
     /// If `true`, treat `pg_restore` exit-1 (the conventional "completed
@@ -129,6 +141,8 @@ impl Default for MigrationConfig {
             jobs: default_jobs(),
             schemas: Vec::new(),
             tables: Vec::new(),
+            exclude_schemas: Vec::new(),
+            exclude_tables: Vec::new(),
             online: OnlineOptions::default(),
             allow_restore_errors: false,
             no_publications: true,
@@ -322,6 +336,17 @@ pub struct OnlineOptions {
     /// `--force-clean`.
     #[serde(default)]
     pub force_clean: bool,
+    /// If `true` (default), sync every user sequence from source to
+    /// target right after the operator triggers cutover but before the
+    /// migration returns. PostgreSQL logical replication does **not**
+    /// replay sequence advances, so without this step the target's
+    /// sequences stay at their dump-time values and the first
+    /// post-cutover `INSERT … DEFAULT nextval(...)` will produce a
+    /// duplicate-key violation. Disable only if you have your own
+    /// out-of-band sequence sync (e.g. application-level UUIDs).
+    /// Equivalent to `pgcopydb copy sequences`.
+    #[serde(default = "default_true")]
+    pub sync_sequences_on_cutover: bool,
     /// Configuration for the WAL apply worker.
     pub apply: ReplicationApplyConfig,
     /// Cutover knobs — when to declare the target "caught up" and how the
@@ -343,6 +368,7 @@ impl Default for OnlineOptions {
             subscription_source_conn: None,
             drop_subscription_on_cutover: true,
             force_clean: false,
+            sync_sequences_on_cutover: true,
             apply: ReplicationApplyConfig::default(),
             cutover: CutoverConfig::default(),
         }
@@ -607,5 +633,21 @@ mod tests {
             ..OnlineOptions::default()
         };
         assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn online_options_default_syncs_sequences_on_cutover() {
+        // Online migrations MUST default to syncing sequences. PG
+        // logical replication does not replay nextval(), so leaving
+        // this off silently breaks every post-cutover INSERT.
+        let opts = OnlineOptions::default();
+        assert!(opts.sync_sequences_on_cutover);
+    }
+
+    #[test]
+    fn migration_config_default_has_empty_exclude_lists() {
+        let cfg = MigrationConfig::default();
+        assert!(cfg.exclude_schemas.is_empty());
+        assert!(cfg.exclude_tables.is_empty());
     }
 }

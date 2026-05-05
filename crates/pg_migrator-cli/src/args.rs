@@ -46,6 +46,17 @@ pub struct Cli {
     #[arg(long = "table")]
     pub tables: Vec<String>,
 
+    /// Repeatable: schemas to exclude from the migration. Useful when
+    /// the source has tenant / audit / vendor-managed schemas that
+    /// should not be replicated. Forwarded to `pg_dump --exclude-schema=`.
+    #[arg(long = "exclude-schema")]
+    pub exclude_schemas: Vec<String>,
+
+    /// Repeatable: tables to exclude from the migration, formatted as
+    /// `schema.table`. Forwarded to `pg_dump --exclude-table=`.
+    #[arg(long = "exclude-table")]
+    pub exclude_tables: Vec<String>,
+
     /// Replication slot name (online mode only).
     #[arg(long, default_value = "pg_migrator_slot")]
     pub slot_name: String,
@@ -79,6 +90,15 @@ pub struct Cli {
     /// only.
     #[arg(long)]
     pub force_clean: bool,
+
+    /// Disable the post-cutover sequence sync (online mode only).
+    /// PostgreSQL logical replication does not replay `nextval()`, so by
+    /// default the migrator runs `setval(...)` on every target sequence
+    /// at cutover so the first post-cutover INSERT does not collide
+    /// with a replicated row. Disable only if you have your own
+    /// out-of-band sequence sync (e.g. UUID PKs).
+    #[arg(long)]
+    pub no_sequence_sync: bool,
 
     /// pgoutput protocol version.
     #[arg(long, default_value_t = 2)]
@@ -238,6 +258,7 @@ impl Cli {
             subscription_source_conn: self.subscription_source,
             drop_subscription_on_cutover: !self.keep_subscription,
             force_clean: self.force_clean,
+            sync_sequences_on_cutover: !self.no_sequence_sync,
             apply,
             cutover: CutoverConfig {
                 poll_interval: std::time::Duration::from_secs(self.cutover_poll_secs),
@@ -255,6 +276,8 @@ impl Cli {
             jobs: self.jobs,
             schemas: self.schemas,
             tables: self.tables,
+            exclude_schemas: self.exclude_schemas,
+            exclude_tables: self.exclude_tables,
             online,
             allow_restore_errors: self.allow_restore_errors,
             no_publications: !self.keep_publications,

@@ -10,10 +10,10 @@
 ## 1. Project Overview
 
 
-| Mode      | Behaviour                                                                                                                                                                |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Offline` | `pg_dump` → `pg_restore`. One-shot copy.                                                                                                                                 |
-| `Online`  | Create a logical replication slot with `EXPORT_SNAPSHOT` → snapshot-consistent dump → restore → `CREATE SUBSCRIPTION` on target so PostgreSQL's apply worker streams WAL. |
+| Mode      | Behaviour                                                                                                                                                                                                  |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Offline` | `pg_dump` → `pg_restore`. One-shot copy. Sequences are carried inside the dump, no extra step.                                                                                                             |
+| `Online`  | Create a logical replication slot with `EXPORT_SNAPSHOT` → snapshot-consistent dump → restore → `CREATE SUBSCRIPTION` on target so PostgreSQL's apply worker streams WAL → on cutover, sync sequence values. |
 
 ### Apply path
 
@@ -63,6 +63,8 @@ examples/online_migration/
 | [crates/pg_migrator/src/native_apply.rs](crates/pg_migrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn` |
 | [crates/pg_migrator/src/orchestrator.rs](crates/pg_migrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
 | [crates/pg_migrator/src/progress.rs](crates/pg_migrator/src/progress.rs)         | `ProgressReporter` trait + Tracing/Collecting implementations               |
+| [crates/pg_migrator/src/preflight.rs](crates/pg_migrator/src/preflight.rs)       | Pre-migration checks (target empty, source `wal_level=logical`, slot/sender capacity) |
+| [crates/pg_migrator/src/sequences.rs](crates/pg_migrator/src/sequences.rs)       | Source→target sequence value sync at cutover (closes the PG logical-replication sequence gap) |
 
 ### Pipeline stages (`MigrationStage`)
 
@@ -100,6 +102,44 @@ Cutover is **always operator-driven**: the apply loop never exits on
 `CaughtUp` alone. The `lag_threshold_bytes` knob is purely advisory —
 it controls when the one-shot `CaughtUp` event fires, never whether the
 loop terminates.
+
+### Sequence sync at cutover (online only)
+
+PostgreSQL logical replication does **not** replicate sequence values —
+the target's sequences stay frozen at whatever `pg_dump`/`pg_restore`
+baked in. Without intervention, the first INSERT after cutover can
+collide with rows the apply worker streamed from the source.
+
+[`sequences.rs`](crates/pg_migrator/src/sequences.rs) closes that gap:
+
+1. After the operator presses Ctrl+C and `run_native_apply` returns with
+   `cutover_triggered = true`, the orchestrator calls
+   `sync_sequences(source, target, schemas)`.
+2. `collect_source_sequences` reads `pg_class` joined with
+   `pg_sequence_last_value(...)`; `apply_sequences_to_target` runs
+   `setval('"schema"."name"'::regclass, $1::bigint, true)` on the target
+   for each one.
+3. Per-sequence failures are logged with `warn!` and counted, but never
+   abort the migration — a managed-PG role-permission issue should not
+   roll back an otherwise-successful cutover. The aggregate count is
+   emitted as a `Cutover` progress event.
+4. The behaviour can be turned off via
+   `OnlineOptions.sync_sequences_on_cutover = false` (CLI flag
+   `--no-sequence-sync`).
+
+The SQL layer escapes both halves of the qualified name: `quote_ident`
+for any embedded `"`, then `quote_literal` for any embedded `'` so the
+resulting `'...'::regclass` string literal parses cleanly.
+
+### Filtering schemas / tables
+
+`MigrationConfig.exclude_schemas` and `exclude_tables` propagate to
+`pg_dump` as `--exclude-schema=` / `--exclude-table=` arguments. Use
+them to skip very large or transient tables (or schemas owned by
+background services) that should not be part of the cutover. Online
+mode still captures their changes via the slot if they are in the
+publication, so combine with a narrower `pg_migrator_pub` definition
+for full coverage.
 
 ---
 

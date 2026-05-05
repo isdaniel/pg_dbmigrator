@@ -48,6 +48,7 @@ pub mod preflight;
 pub mod progress;
 pub mod restore;
 pub mod resume;
+pub mod sequences;
 pub mod snapshot;
 pub mod tls;
 

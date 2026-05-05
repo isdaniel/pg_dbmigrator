@@ -242,6 +242,26 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
 
+  integration-online-sequence-sync:
+    name: Integration test (online, sequence sync at cutover — no post-cutover PK collision)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-integration
+
+      - name: Run online sequence-sync e2e
+        run: bash tests/integration/run_online_sequence_sync.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
   publish:
     name: Publish to crates.io
     if: startsWith(github.ref, 'refs/tags/v')
@@ -257,6 +277,7 @@ jobs:
       - integration-online-lag-cadence
       - integration-online-cancel-resume
       - integration-online-multi-resume-sustained
+      - integration-online-sequence-sync
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

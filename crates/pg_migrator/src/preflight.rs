@@ -96,6 +96,57 @@ pub async fn verify_publication_exists(source_conn: &str, publication: &str) -> 
     Ok(())
 }
 
+/// Confirm that the source server is configured for logical replication.
+///
+/// Online migrations *always* require `wal_level=logical` on the source — without it `CREATE_REPLICATION_SLOT` fails with a low-level libpq error several seconds into the run. This pre-flight produces a much better error: it points the operator at the exact GUC and reminds them a server restart is required.
+///
+/// Also opportunistically checks `max_replication_slots` and  `max_wal_senders` — both must be > 0 for any logical replication to work. A value of 0 (sometimes seen on freshly-spun managed PG instances) would otherwise show up as a confusing "all replication slots are in use" error.
+pub async fn verify_source_logical_replication_ready(source_conn: &str) -> Result<()> {
+    let client = connect_with_sslmode(source_conn).await?;
+
+    // wal_level: must be 'logical'. 'replica' / 'minimal' won't work.
+    let row = client
+        .query_one("SELECT current_setting('wal_level')", &[])
+        .await?;
+    let wal_level: String = row.get(0);
+    if wal_level != "logical" {
+        return Err(MigrationError::config(format!(
+            "the source server has `wal_level = '{wal_level}'`. \
+             Online migrations require `wal_level = 'logical'`. \
+             Set it via `ALTER SYSTEM SET wal_level = 'logical';` \
+             and restart the source server (this GUC is not reloadable). \
+             hint: on Azure Flexible Server, set this via Portal -> \
+             Server Parameters -> wal_level, then restart."
+        )));
+    }
+
+    // max_replication_slots / max_wal_senders: ensure they are > 0.
+    // current_setting() returns the value as text; integer GUCs are
+    // safe to parse with FromStr.
+    for guc in ["max_replication_slots", "max_wal_senders"] {
+        let row = client
+            .query_one("SELECT current_setting($1)::text", &[&guc])
+            .await?;
+        let raw: String = row.get(0);
+        let parsed: i64 = raw.trim().parse().map_err(|_| {
+            MigrationError::config(format!(
+                "could not parse `{guc}` value `{raw}` as an integer"
+            ))
+        })?;
+        if parsed <= 0 {
+            return Err(MigrationError::config(format!(
+                "the source server has `{guc} = {parsed}`. \
+                 Online migrations require `{guc} > 0`. \
+                 Raise it (PostgreSQL recommends >= 4) and restart \
+                 the source server."
+            )));
+        }
+    }
+
+    info!("source is configured for logical replication (wal_level=logical)");
+    Ok(())
+}
+
 /// Rewrite a connection string so the path component (database name) points
 /// to the `postgres` maintenance database. Used to run admin commands like
 /// `CREATE DATABASE` which cannot target the database they are creating.

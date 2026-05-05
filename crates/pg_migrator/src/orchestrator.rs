@@ -20,11 +20,12 @@ use crate::native_apply::{
 };
 use crate::preflight::{
     ensure_pglogical_not_interfering, ensure_target_database_exists, verify_pg_tools_installed,
-    verify_publication_exists,
+    verify_publication_exists, verify_source_logical_replication_ready,
 };
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
 use crate::restore::{run_pg_restore, run_pg_restore_in_sections, RestoreRequest};
 use crate::resume::{default_resume_path, CompletedStage, ResumeToken};
+use crate::sequences::sync_sequences;
 use crate::snapshot::prepare_replication_slot;
 use crate::tls::connect_with_sslmode;
 
@@ -184,6 +185,17 @@ impl Migrator {
         )
         .await?;
 
+        // 0.6. Verify the source is configured for logical replication.
+        // Doing this *before* slot creation gives the operator a clean,
+        // actionable error instead of a confusing libpq error 30 s into
+        // CREATE_REPLICATION_SLOT.
+        self.report(
+            MigrationStage::Validate,
+            "verifying source is configured for logical replication",
+        )
+        .await;
+        verify_source_logical_replication_ready(&self.config.source.connection_string).await?;
+
         let dump_path = self.dump_path_or_default("dump_online");
         let mut token = self.load_or_init_resume(&dump_path).await?;
 
@@ -307,6 +319,56 @@ impl Migrator {
         token.last_applied_lsn = Some(stats.last_applied_lsn);
         self.save_resume(&token, &dump_path).await;
 
+        // After a cutover-driven exit, sync sequences so the target's
+        // `last_value`s match the source. PostgreSQL logical replication
+        // does NOT replay nextval(), so without this step the first
+        // post-cutover INSERT … DEFAULT nextval(...) would collide with
+        // a row already replicated by the apply worker. Equivalent to
+        // pgcopydb's `copy sequences` step.
+        if stats.cutover_triggered && self.config.online.sync_sequences_on_cutover {
+            self.report(
+                MigrationStage::Cutover,
+                "syncing sequences from source to target",
+            )
+            .await;
+            match sync_sequences(
+                &self.config.source.connection_string,
+                &self.config.target.connection_string,
+                &self.config.schemas,
+            )
+            .await
+            {
+                Ok(applied) => {
+                    self.report(
+                        MigrationStage::Cutover,
+                        format!("synced {applied} sequence(s) from source to target"),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    // Sequence sync is best-effort — if a managed-PG
+                    // role can't write to one of the target sequences,
+                    // we should not roll back the otherwise-successful
+                    // cutover. Surface a loud warning so the operator
+                    // can fix it manually before re-pointing traffic.
+                    tracing::warn!(
+                        error = %e,
+                        "sequence sync failed — manually run \
+                         `SELECT setval('<seq>', <value>, true)` on the target \
+                         for each sequence before resuming application traffic",
+                    );
+                    self.report(
+                        MigrationStage::Cutover,
+                        format!(
+                            "sequence sync failed: {e} (manual sync required \
+                             before re-enabling traffic)"
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+
         self.report(MigrationStage::Complete, "online migration finished")
             .await;
         Ok(MigrationOutcome {
@@ -369,6 +431,8 @@ impl Migrator {
             snapshot,
             schemas: self.config.schemas.clone(),
             tables: self.config.tables.clone(),
+            exclude_schemas: self.config.exclude_schemas.clone(),
+            exclude_tables: self.config.exclude_tables.clone(),
             output_path: dump_path.to_path_buf(),
             format,
             no_publications: self.config.no_publications,

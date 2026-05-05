@@ -35,6 +35,15 @@ pub struct DumpRequest {
     pub schemas: Vec<String>,
     /// Tables to include (`--table=...`).
     pub tables: Vec<String>,
+    /// Schemas to **exclude** (`--exclude-schema=...`). Combined with
+    /// `schemas` (which restricts the include set), this lets the
+    /// operator both opt-in a tenant schema and opt-out an audit
+    /// schema in the same dump invocation. `pg_dump` evaluates exclude
+    /// rules after include rules, so an excluded child of an included
+    /// schema is correctly omitted.
+    pub exclude_schemas: Vec<String>,
+    /// Tables to **exclude** (`--exclude-table=...`).
+    pub exclude_tables: Vec<String>,
     /// Where to write the dump archive.
     pub output_path: PathBuf,
     /// Output format. Defaults to [`DumpFormat::Custom`].
@@ -127,6 +136,14 @@ pub fn build_pg_dump_args(req: &DumpRequest) -> Vec<String> {
 
     for t in &req.tables {
         args.push(format!("--table={t}"));
+    }
+
+    for s in &req.exclude_schemas {
+        args.push(format!("--exclude-schema={s}"));
+    }
+
+    for t in &req.exclude_tables {
+        args.push(format!("--exclude-table={t}"));
     }
 
     if req.no_publications {
@@ -378,6 +395,8 @@ mod tests {
             snapshot: None,
             schemas: Vec::new(),
             tables: Vec::new(),
+            exclude_schemas: Vec::new(),
+            exclude_tables: Vec::new(),
             output_path: PathBuf::from("/tmp/dump.bin"),
             format: DumpFormat::Custom,
             no_publications: true,
@@ -444,6 +463,17 @@ mod tests {
         assert!(args.iter().any(|a| a == "--schema=public"));
         assert!(args.iter().any(|a| a == "--schema=app"));
         assert!(args.iter().any(|a| a == "--table=public.users"));
+    }
+
+    #[test]
+    fn build_args_appends_exclude_schemas_and_tables() {
+        let mut req = base_request();
+        req.exclude_schemas = vec!["audit".into(), "tenant_z".into()];
+        req.exclude_tables = vec!["app.scratch".into()];
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--exclude-schema=audit"));
+        assert!(args.iter().any(|a| a == "--exclude-schema=tenant_z"));
+        assert!(args.iter().any(|a| a == "--exclude-table=app.scratch"));
     }
 
     #[test]
