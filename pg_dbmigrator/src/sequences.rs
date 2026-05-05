@@ -275,4 +275,43 @@ mod tests {
         assert!(sql.starts_with("SELECT setval('"));
         assert!(sql.contains("::regclass, $1::bigint, true)"));
     }
+
+    #[test]
+    fn build_setval_sql_handles_spaces_in_identifiers() {
+        let sql = build_setval_sql("my schema", "my seq").unwrap();
+        assert!(sql.contains("\"my schema\""));
+        assert!(sql.contains("\"my seq\""));
+    }
+
+    #[test]
+    fn build_setval_sql_handles_backtick_in_identifiers() {
+        let sql = build_setval_sql("pub`lic", "seq`name").unwrap();
+        assert!(sql.contains("\"pub`lic\""));
+        assert!(sql.contains("\"seq`name\""));
+    }
+
+    #[test]
+    fn source_sequence_none_last_value_serde_roundtrip() {
+        let s = SourceSequence {
+            schema: "public".into(),
+            name: "fresh".into(),
+            last_value: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("null"));
+        let s2: SourceSequence = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, s2);
+        assert!(s2.last_value.is_none());
+    }
+
+    #[test]
+    fn collect_sql_no_filter_excludes_temp_schemas() {
+        assert!(COLLECT_SEQUENCES_SQL_NO_FILTER.contains("pg_temp_%"));
+        assert!(COLLECT_SEQUENCES_SQL_NO_FILTER.contains("pg_toast_temp_%"));
+    }
+
+    #[test]
+    fn collect_sql_with_schema_filter_uses_any_operator() {
+        assert!(COLLECT_SEQUENCES_SQL_WITH_SCHEMA_FILTER.contains("ANY($1::text[])"));
+    }
 }

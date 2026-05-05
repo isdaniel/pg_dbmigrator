@@ -279,6 +279,8 @@ jobs:
       - integration-online-multi-resume-sustained
       - integration-online-sequence-sync
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -295,15 +297,15 @@ jobs:
           fi
           echo "Version verified: $TAG_VERSION"
 
-      - name: Publish pg_dbmigrator (library)
+      - name: Publish pg_dbmigrator
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p pg_dbmigrator --locked
 
-      - name: Wait for crates.io index update
-        run: sleep 30
-
-      - name: Publish pg_dbmigrator-cli
+      - name: Create GitHub Release
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p pg_dbmigrator-cli --locked
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Release ${GITHUB_REF_NAME}" \
+            --generate-notes

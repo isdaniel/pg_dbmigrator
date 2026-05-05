@@ -306,3 +306,369 @@ impl Cli {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse_args(args: &[&str]) -> Cli {
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn minimal_offline_args_parse() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+        ]);
+        assert!(matches!(cli.mode, ModeArg::Offline));
+        assert_eq!(cli.source, "postgresql://u@src/db");
+        assert_eq!(cli.target, "postgresql://u@dst/db");
+    }
+
+    #[test]
+    fn online_mode_parses() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "online",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+        ]);
+        assert!(matches!(cli.mode, ModeArg::Online));
+    }
+
+    #[test]
+    fn into_config_offline_defaults() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u:p@src/db",
+            "--target",
+            "postgresql://u:p@dst/db",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(matches!(cfg.mode, MigrationMode::Offline));
+        assert_eq!(cfg.source.host, "src");
+        assert_eq!(cfg.target.host, "dst");
+        assert!(cfg.no_publications);
+        assert!(cfg.no_subscriptions);
+        assert!(cfg.split_sections);
+        assert!(cfg.no_sync);
+        assert!(cfg.no_comments);
+        assert!(cfg.no_security_labels);
+        assert!(!cfg.no_table_access_method);
+        assert!(!cfg.allow_restore_errors);
+        assert!(!cfg.resume);
+    }
+
+    #[test]
+    fn into_config_online_with_all_flags() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "online",
+            "--source",
+            "postgresql://u:p@src/db",
+            "--target",
+            "postgresql://u:p@dst/db",
+            "--slot-name",
+            "my_slot",
+            "--publication",
+            "my_pub",
+            "--subscription-name",
+            "my_sub",
+            "--keep-subscription",
+            "--force-clean",
+            "--no-sequence-sync",
+            "--lag-threshold-bytes",
+            "4096",
+            "--cutover-poll-secs",
+            "10",
+            "--cutover-fast-poll-ms",
+            "500",
+            "--max-runtime-seconds",
+            "3600",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(matches!(cfg.mode, MigrationMode::Online));
+        assert_eq!(cfg.online.slot_name, "my_slot");
+        assert_eq!(cfg.online.publication, "my_pub");
+        assert_eq!(cfg.online.subscription_name, "my_sub");
+        assert!(!cfg.online.drop_subscription_on_cutover);
+        assert!(cfg.online.force_clean);
+        assert!(!cfg.online.sync_sequences_on_cutover);
+        assert_eq!(cfg.online.cutover.lag_threshold_bytes, 4096);
+        assert_eq!(
+            cfg.online.cutover.poll_interval,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            cfg.online.cutover.fast_poll_interval,
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(cfg.online.apply.max_runtime_seconds, Some(3600));
+    }
+
+    #[test]
+    fn into_config_exclude_flags() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--exclude-schema",
+            "audit",
+            "--exclude-schema",
+            "temp",
+            "--exclude-table",
+            "public.big_log",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.exclude_schemas, vec!["audit", "temp"]);
+        assert_eq!(cfg.exclude_tables, vec!["public.big_log"]);
+    }
+
+    #[test]
+    fn into_config_no_split_sections_overrides_default() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--no-split-sections",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(!cfg.split_sections);
+    }
+
+    #[test]
+    fn into_config_keep_sync_disables_no_sync() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--keep-sync",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(!cfg.no_sync);
+    }
+
+    #[test]
+    fn into_config_keep_publications_and_subscriptions() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--keep-publications",
+            "--keep-subscriptions",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(!cfg.no_publications);
+        assert!(!cfg.no_subscriptions);
+    }
+
+    #[test]
+    fn into_config_dump_compress() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--dump-compress",
+            "zstd:3",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.dump_compress, Some("zstd:3".to_string()));
+    }
+
+    #[test]
+    fn into_config_resume_and_dump_path() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--resume",
+            "--dump-path",
+            "/tmp/my_dump",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.resume);
+        assert_eq!(cfg.dump_path, Some(PathBuf::from("/tmp/my_dump")));
+    }
+
+    #[test]
+    fn into_config_allow_restore_errors() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--allow-restore-errors",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.allow_restore_errors);
+    }
+
+    #[test]
+    fn into_config_dump_scope_schema_only() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--dump-scope",
+            "schema-only",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.dump_scope, DumpScope::SchemaOnly);
+    }
+
+    #[test]
+    fn into_config_dump_scope_data_only() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--dump-scope",
+            "data-only",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.dump_scope, DumpScope::DataOnly);
+    }
+
+    #[test]
+    fn into_config_no_table_access_method() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--no-table-access-method",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.no_table_access_method);
+    }
+
+    #[test]
+    fn into_config_verbose() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--verbose",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.verbose);
+    }
+
+    #[test]
+    fn mode_arg_into_migration_mode() {
+        assert!(matches!(
+            MigrationMode::from(ModeArg::Offline),
+            MigrationMode::Offline
+        ));
+        assert!(matches!(
+            MigrationMode::from(ModeArg::Online),
+            MigrationMode::Online
+        ));
+    }
+
+    #[test]
+    fn dump_scope_arg_into_dump_scope() {
+        assert_eq!(DumpScope::from(DumpScopeArg::All), DumpScope::All);
+        assert_eq!(
+            DumpScope::from(DumpScopeArg::SchemaOnly),
+            DumpScope::SchemaOnly
+        );
+        assert_eq!(DumpScope::from(DumpScopeArg::DataOnly), DumpScope::DataOnly);
+    }
+
+    #[test]
+    fn into_config_subscription_source_override() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "online",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--subscription-source",
+            "postgresql://u@internal-src/db",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(
+            cfg.online.subscription_source_conn,
+            Some("postgresql://u@internal-src/db".to_string())
+        );
+    }
+
+    #[test]
+    fn into_config_schemas_and_tables() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--schema",
+            "public",
+            "--schema",
+            "app",
+            "--table",
+            "public.users",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.schemas, vec!["public", "app"]);
+        assert_eq!(cfg.tables, vec!["public.users"]);
+    }
+
+    #[test]
+    fn into_config_drop_target_first() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--drop-target-first",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.drop_target_first);
+    }
+
+    #[test]
+    fn into_config_invalid_source_url_returns_error() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "not-a-url",
+            "--target",
+            "postgresql://u@dst/db",
+        ]);
+        assert!(cli.into_config().is_err());
+    }
+}

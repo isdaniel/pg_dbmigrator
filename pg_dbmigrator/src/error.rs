@@ -148,4 +148,91 @@ mod tests {
         let err = MigrationError::apply("oops");
         assert!(matches!(err, MigrationError::Apply(ref m) if m == "oops"));
     }
+
+    #[test]
+    fn missing_tool_helper_constructs_variant() {
+        let err = MigrationError::missing_tool("pg_dump", "not found in $PATH");
+        match err {
+            MigrationError::MissingTool {
+                ref tool,
+                ref reason,
+            } => {
+                assert_eq!(tool, "pg_dump");
+                assert_eq!(reason, "not found in $PATH");
+            }
+            _ => panic!("expected MissingTool variant"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("pg_dump"));
+        assert!(msg.contains("not installed or not on $PATH"));
+        assert!(msg.contains("postgresql-client"));
+    }
+
+    #[test]
+    fn cancelled_display() {
+        let err = MigrationError::Cancelled;
+        assert_eq!(err.to_string(), "operation cancelled");
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io_err = io::Error::new(io::ErrorKind::BrokenPipe, "pipe broke");
+        let err: MigrationError = io_err.into();
+        assert!(matches!(err, MigrationError::Io(_)));
+        assert!(err.to_string().contains("pipe broke"));
+    }
+
+    #[test]
+    fn format_pg_error_non_db_error() {
+        let err = "host not found".parse::<std::net::IpAddr>().unwrap_err();
+        let pg_err = tokio_postgres::Error::__private_api_timeout();
+        let formatted = format_pg_error(&pg_err);
+        assert!(formatted.starts_with("postgres error:"));
+        let _ = err;
+    }
+
+    #[test]
+    fn invalid_connection_string_display() {
+        let err = MigrationError::InvalidConnectionString("bad://url".into());
+        assert_eq!(err.to_string(), "invalid connection string: bad://url");
+    }
+
+    #[test]
+    fn replication_error_display() {
+        let rep_err = pg_walstream::ReplicationError::Protocol("test message".into());
+        let err: MigrationError = rep_err.into();
+        let msg = err.to_string();
+        assert!(msg.contains("replication error"));
+    }
+
+    #[test]
+    fn external_command_fields_accessible_via_match() {
+        let err = MigrationError::external("pg_restore", "exit code 2");
+        match &err {
+            MigrationError::ExternalCommand { command, message } => {
+                assert_eq!(command, "pg_restore");
+                assert_eq!(message, "exit code 2");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn io_error_preserves_kind() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "forbidden");
+        let err: MigrationError = io_err.into();
+        match err {
+            MigrationError::Io(ref e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            _ => panic!("expected Io variant"),
+        }
+        assert!(err.to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn config_error_debug_format() {
+        let err = MigrationError::config("test cfg error");
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("Config"));
+        assert!(dbg.contains("test cfg error"));
+    }
 }

@@ -728,6 +728,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_transition_fell_behind_emits_stream_apply() {
+        let r = CollectingReporter::new();
+        report_transition(&r, Transition::FellBehind { lag: 1000 }, 2000, 1000).await;
+        let events = r.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, MigrationStage::StreamApply);
+        assert!(events[0].message.contains("fell behind"));
+        let detail = events[0].detail.as_ref().unwrap();
+        assert_eq!(detail["lag_bytes"], 1000);
+        assert_eq!(detail["engine"], "native");
+    }
+
+    #[tokio::test]
+    async fn report_transition_still_caught_up_emits_nothing() {
+        let r = CollectingReporter::new();
+        report_transition(&r, Transition::StillCaughtUp { lag: 3 }, 100, 97).await;
+        assert!(r.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn report_transition_still_behind_emits_nothing() {
+        let r = CollectingReporter::new();
+        report_transition(&r, Transition::StillBehind { lag: 500 }, 1000, 500).await;
+        assert!(r.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn report_lag_heartbeat_zero_lag_uses_caught_up_stage() {
+        let r = CollectingReporter::new();
+        report_lag_heartbeat(&r, 0, 100, 100).await;
+        let events = r.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, MigrationStage::CaughtUp);
+    }
+
+    #[tokio::test]
+    async fn report_lag_heartbeat_nonzero_lag_uses_lag_stage() {
+        let r = CollectingReporter::new();
+        report_lag_heartbeat(&r, 512, 1000, 488).await;
+        let events = r.events().await;
+        assert_eq!(events[0].stage, MigrationStage::Lag);
+        let detail = events[0].detail.as_ref().unwrap();
+        assert_eq!(detail["lag_bytes"], 512);
+        assert_eq!(detail["source_lsn"], 1000);
+        assert_eq!(detail["applied_lsn"], 488);
+    }
+
+    #[test]
+    fn format_lsn_produces_expected_output() {
+        assert_eq!(format_lsn(0), "0/0");
+        assert_eq!(format_lsn(0x16B0378), "0/16B0378");
+        assert_eq!(format_lsn(1u64 << 32), "1/0");
+        assert_eq!(format_lsn((1u64 << 32) | 0xABC), "1/ABC");
+    }
+
+    #[tokio::test]
     async fn static_lag_provider_returns_pair() {
         let p = StaticLagProvider {
             source: AtomicU64::new(500),
@@ -762,6 +818,54 @@ mod tests {
         let s = ApplyStats::default();
         assert_eq!(s.last_lag_bytes, 0);
         assert!(!s.cutover_triggered);
+    }
+
+    #[test]
+    fn apply_stats_fields_are_settable() {
+        let s = ApplyStats {
+            last_applied_lsn: 0x1234,
+            last_received_lsn: 0x1234,
+            last_lag_bytes: 100,
+            cutover_triggered: true,
+        };
+        assert_eq!(s.last_applied_lsn, 0x1234);
+        assert_eq!(s.last_received_lsn, 0x1234);
+        assert_eq!(s.last_lag_bytes, 100);
+        assert!(s.cutover_triggered);
+    }
+
+    #[test]
+    fn parse_pg_lsn_large_values() {
+        assert_eq!(parse_pg_lsn("A/BCDE").unwrap(), (0xA_u64 << 32) | 0xBCDE);
+        assert_eq!(
+            parse_pg_lsn("FF/FFFFFFFF").unwrap(),
+            (0xFF_u64 << 32) | 0xFFFF_FFFF
+        );
+        assert_eq!(parse_pg_lsn("0/1").unwrap(), 1);
+    }
+
+    #[test]
+    fn make_create_subscription_sql_special_chars_in_names() {
+        let opts = OnlineOptions {
+            subscription_name: "sub\"special".into(),
+            slot_name: "slot'name".into(),
+            publication: "pub\"name".into(),
+            ..OnlineOptions::default()
+        };
+        let sql = make_create_subscription_sql(&opts, "postgres://u@h/db").unwrap();
+        assert!(sql.contains("\"sub\"\"special\""));
+        assert!(sql.contains("'slot''name'"));
+        assert!(sql.contains("\"pub\"\"name\""));
+    }
+
+    #[test]
+    fn make_create_subscription_sql_default_options() {
+        let opts = OnlineOptions::default();
+        let sql = make_create_subscription_sql(&opts, "postgres://u@h/db").unwrap();
+        assert!(sql.contains("CREATE SUBSCRIPTION"));
+        assert!(sql.contains("create_slot = false"));
+        assert!(sql.contains("copy_data = false"));
+        assert!(sql.contains("enabled = true"));
     }
 
     /// Drives `run_native_apply` against a deterministic lag provider that
@@ -839,5 +943,56 @@ mod tests {
             "expected fast cadence (≥5 heartbeats in 600ms with 50ms fast \
              interval), got {n}"
         );
+    }
+
+    #[test]
+    fn format_lsn_edge_cases() {
+        assert_eq!(format_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
+        assert_eq!(format_lsn(0xABCDEF00_12345678), "ABCDEF00/12345678");
+    }
+
+    #[test]
+    fn parse_pg_lsn_case_insensitive() {
+        assert_eq!(parse_pg_lsn("a/bcde").unwrap(), (0xA_u64 << 32) | 0xBCDE);
+        assert_eq!(parse_pg_lsn("A/BCDE").unwrap(), (0xA_u64 << 32) | 0xBCDE);
+    }
+
+    #[test]
+    fn apply_stats_equality() {
+        let s1 = ApplyStats {
+            last_applied_lsn: 100,
+            last_received_lsn: 100,
+            last_lag_bytes: 0,
+            cutover_triggered: false,
+        };
+        let s2 = s1;
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn apply_stats_debug_format() {
+        let s = ApplyStats::default();
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("ApplyStats"));
+        assert!(dbg.contains("last_lag_bytes"));
+    }
+
+    #[tokio::test]
+    async fn lag_heartbeat_includes_lsn_text_fields() {
+        let r = CollectingReporter::new();
+        report_lag_heartbeat(&r, 100, 0x1_00000000, 0x0_FFFFFF00).await;
+        let events = r.events().await;
+        let detail = events[0].detail.as_ref().unwrap();
+        assert_eq!(detail["source_lsn_text"], "1/0");
+        assert_eq!(detail["received_lsn_text"], "0/FFFFFF00");
+        assert_eq!(detail["applied_lsn_text"], "0/FFFFFF00");
+    }
+
+    #[test]
+    fn create_subscription_sql_contains_connection_string() {
+        let opts = OnlineOptions::default();
+        let conn = "postgres://user:pass@host:5432/mydb";
+        let sql = make_create_subscription_sql(&opts, conn).unwrap();
+        assert!(sql.contains(conn));
     }
 }
