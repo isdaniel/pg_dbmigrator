@@ -1,4 +1,4 @@
-//! # pg_migrator
+//! # pg_dbmigrator
 //!
 //! A Rust library for migrating PostgreSQL databases between two endpoints.
 //!
@@ -16,10 +16,10 @@
 //! ## High level usage
 //!
 //! ```no_run
-//! use pg_migrator::{MigrationConfig, MigrationMode, Migrator, EndpointConfig};
+//! use pg_dbmigrator::{MigrationConfig, MigrationMode, Migrator, EndpointConfig};
 //! use tokio_util::sync::CancellationToken;
 //!
-//! # async fn run() -> pg_migrator::Result<()> {
+//! # async fn run() -> pg_dbmigrator::Result<()> {
 //! let cfg = MigrationConfig {
 //!     mode: MigrationMode::Offline,
 //!     source: EndpointConfig::parse("postgresql://user:pw@src/db")?,

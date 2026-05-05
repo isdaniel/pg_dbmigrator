@@ -20,13 +20,13 @@ source "$ROOT/tests/integration/lib.sh"
 
 SUSTAIN_SECS="${SUSTAIN_SECS:-30}"
 
-DUMP_DIR="$(mktemp -d -t pg_migrator_multi_resume.XXXXXX)"
+DUMP_DIR="$(mktemp -d -t pg_dbmigrator_multi_resume.XXXXXX)"
 DUMP_PATH="$DUMP_DIR/dump"
 RESUME_FILE="$DUMP_PATH.resume.json"
-LOG1="$(mktemp -t pg_migrator_mr_run1.XXXXXX.log)"
-LOG2="$(mktemp -t pg_migrator_mr_run2.XXXXXX.log)"
-LOG3="$(mktemp -t pg_migrator_mr_run3.XXXXXX.log)"
-TICK_FILE="$(mktemp -t pg_migrator_mr_tick.XXXXXX)"
+LOG1="$(mktemp -t pg_dbmigrator_mr_run1.XXXXXX.log)"
+LOG2="$(mktemp -t pg_dbmigrator_mr_run2.XXXXXX.log)"
+LOG3="$(mktemp -t pg_dbmigrator_mr_run3.XXXXXX.log)"
+TICK_FILE="$(mktemp -t pg_dbmigrator_mr_tick.XXXXXX)"
 echo "==> dump dir: $DUMP_DIR"
 echo "==> log #1: $LOG1"
 echo "==> log #2: $LOG2"
@@ -47,8 +47,8 @@ wait_for_pg "$TARGET_URL" "target"
 setup_online_test
 build_example online_migration_example
 
-export PG_MIGRATOR_DUMP_PATH="$DUMP_PATH"
-export PG_MIGRATOR_MAX_RUNTIME_SECS=1200
+export PG_DBMIGRATOR_DUMP_PATH="$DUMP_PATH"
+export PG_DBMIGRATOR_MAX_RUNTIME_SECS=1200
 
 # ═══════════════════════════════════════════════════════════════════════════
 # RUN #1: initial run — cancelled mid-apply via SIGINT (graceful cutover)
@@ -91,7 +91,7 @@ echo "==> resume token valid with dump+restore marked complete"
 # RUN #2: first resume — skips dump+restore, new subscription, SIGINT cutover
 # ═══════════════════════════════════════════════════════════════════════════
 echo "==> RUN #2: launching migrator (resume #1)"
-launch_online_migrator "$LOG2" PG_MIGRATOR_RESUME=1
+launch_online_migrator "$LOG2" PG_DBMIGRATOR_RESUME=1
 
 echo "==> waiting for apply phase (run #2)"
 APPLY2_LINE=$(wait_for_log_match "$LOG2" "replication lag" 0 180)
@@ -118,7 +118,7 @@ echo "==> RUN #2 exited"
 # RUN #3: final resume — sustained mutations, then graceful cutover
 # ═══════════════════════════════════════════════════════════════════════════
 echo "==> RUN #3: launching migrator (resume #2, final)"
-launch_online_migrator "$LOG3" PG_MIGRATOR_RESUME=1
+launch_online_migrator "$LOG3" PG_DBMIGRATOR_RESUME=1
 
 echo "==> waiting for apply phase (run #3)"
 APPLY3_LINE=$(wait_for_log_match "$LOG3" "replication lag" 0 180)

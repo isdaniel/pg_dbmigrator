@@ -1,4 +1,4 @@
-# pg_migrator
+# pg_dbmigrator
 
 A Rust library and CLI for migrating PostgreSQL databases between two
 endpoints, a one-shot dump/restore for cold moves, and an online path that
@@ -35,18 +35,18 @@ Validate → PrepareSnapshot → Dump → Restore → StreamApply → (Lag heart
 ## Install / build
 
 ```bash
-# Install the CLI from source. Produces a binary called `pg_migrator`.
-cargo install --path crates/pg_migrator-cli
+# Install the CLI from source. Produces a binary called `pg_dbmigrator`.
+cargo install --path crates/pg_dbmigrator-cli
 
-pg_migrator --mode offline --source '…' --target '…' --jobs 4
+pg_dbmigrator --mode offline --source '…' --target '…' --jobs 4
 ```
 
 For development from a clone, the workspace ships a `cargo` alias so you
 don't need `--bin` / `-p`:
 
 ```bash
-cargo pg_migrator --help                      # equivalent to `cargo run --bin pg_migrator -- --help`
-cargo pg_migrator --mode offline --source '…' --target '…'
+cargo pg_dbmigrator --help                      # equivalent to `cargo run --bin pg_dbmigrator -- --help`
+cargo pg_dbmigrator --mode offline --source '…' --target '…'
 ```
 
 ## CLI
@@ -54,7 +54,7 @@ cargo pg_migrator --mode offline --source '…' --target '…'
 ### Offline
 
 ```bash
-cargo pg_migrator \
+cargo pg_dbmigrator \
     --mode offline \
     --source 'postgres://user:pw@src.example/db' \
     --target 'postgres://user:pw@dst.example/db' \
@@ -68,24 +68,24 @@ On the source, before starting:
 
 ```sql
 ALTER SYSTEM SET wal_level = 'logical';   -- requires restart
-CREATE PUBLICATION pg_migrator_pub FOR ALL TABLES;
+CREATE PUBLICATION pg_dbmigrator_pub FOR ALL TABLES;
 ```
 
 ```bash
-cargo pg_migrator \
+cargo pg_dbmigrator \
     --mode online \
     --source 'postgres://user:pw@src/db' \
     --target 'postgres://user:pw@dst/db' \
-    --slot-name pg_migrator_slot \
-    --publication pg_migrator_pub \
-    --subscription-name pg_migrator_sub \
+    --slot-name pg_dbmigrator_slot \
+    --publication pg_dbmigrator_pub \
+    --subscription-name pg_dbmigrator_sub \
     --jobs 4 \
     --lag-threshold-bytes 8192 \
     --cutover-poll-secs 5
 ```
 
 The library creates a subscription called `--subscription-name` (default
-`pg_migrator_sub`) on the target attached to the existing slot. On cutover
+`pg_dbmigrator_sub`) on the target attached to the existing slot. On cutover
 the subscription is disabled and, unless `--keep-subscription` is set,
 dropped.
 
@@ -106,7 +106,7 @@ Use `--exclude-schema` and `--exclude-table` to omit large or transient
 objects from the dump. Both flags accept multiple values.
 
 ```bash
-cargo pg_migrator --mode offline \
+cargo pg_dbmigrator --mode offline \
     --source ... --target ... \
     --exclude-schema audit \
     --exclude-table public.large_log

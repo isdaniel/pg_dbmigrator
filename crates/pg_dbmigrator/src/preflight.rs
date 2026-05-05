@@ -114,9 +114,7 @@ pub async fn verify_source_logical_replication_ready(source_conn: &str) -> Resul
             "the source server has `wal_level = '{wal_level}'`. \
              Online migrations require `wal_level = 'logical'`. \
              Set it via `ALTER SYSTEM SET wal_level = 'logical';` \
-             and restart the source server (this GUC is not reloadable). \
-             hint: on Azure Flexible Server, set this via Portal -> \
-             Server Parameters -> wal_level, then restart."
+             and restart the source server (this GUC is not reloadable)."
         )));
     }
 
@@ -236,11 +234,7 @@ pub async fn ensure_pglogical_not_interfering(target_conn: &str) -> Result<()> {
              This is known to prevent native PostgreSQL logical-replication apply \
              workers from starting (the workers crash silently on launch). \
              Remove `pglogical` from `shared_preload_libraries` and restart the \
-             server before retrying.\n\
-             hint: on Azure Flexible Server, set this via Portal → Server Parameters \
-             → shared_preload_libraries, or via: \
-             `az postgres flexible-server parameter set --name shared_preload_libraries \
-             --value '<libraries-without-pglogical>'`"
+             server before retrying."
                 .to_string(),
         ));
     }

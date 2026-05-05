@@ -7,8 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 source "$ROOT/tests/integration/lib.sh"
 
-LOG_FILE="$(mktemp -t pg_migrator_sigint.XXXXXX.log)"
-DUMP_DIR="$(mktemp -d -t pg_migrator_sigint_dump.XXXXXX)"
+LOG_FILE="$(mktemp -t pg_dbmigrator_sigint.XXXXXX.log)"
+DUMP_DIR="$(mktemp -d -t pg_dbmigrator_sigint_dump.XXXXXX)"
 echo "==> log file: $LOG_FILE"
 echo "==> dump dir: $DUMP_DIR"
 
@@ -37,10 +37,10 @@ reset_target_schema
 build_example offline_migration_example
 
 echo "==> launching migrator in background"
-PG_MIGRATOR_SOURCE="$SOURCE_URL" \
-PG_MIGRATOR_TARGET="$TARGET_URL" \
-PG_MIGRATOR_DUMP_PATH="$DUMP_DIR/dump" \
-RUST_LOG="info,pg_migrator=info" \
+PG_DBMIGRATOR_SOURCE="$SOURCE_URL" \
+PG_DBMIGRATOR_TARGET="$TARGET_URL" \
+PG_DBMIGRATOR_DUMP_PATH="$DUMP_DIR/dump" \
+RUST_LOG="info,pg_dbmigrator=info" \
     stdbuf -oL -eL "$BIN" >"$LOG_FILE" 2>&1 &
 MIGRATOR_PID=$!
 echo "==> migrator pid: $MIGRATOR_PID"

@@ -1,8 +1,8 @@
-# Agent.md — pg_migrator Development Guide
+# Agent.md — pg_dbmigrator Development Guide
 
 > This document is intended for both AI coding agents and human contributors.
 > It captures the architecture, conventions, and non-negotiable rules for the
-> `pg_migrator` Rust PostgreSQL migration tool.
+> `pg_dbmigrator` Rust PostgreSQL migration tool.
 > **Read this file in full before modifying any source.**
 
 ---
@@ -26,7 +26,7 @@ re-used — `create_slot=false` is the critical bit — and the built-in apply
 worker streams WAL from the source's `confirmed_flush_lsn`.
 
 `pg_walstream` is now used **only** as a slot-creation helper inside
-[snapshot.rs](crates/pg_migrator/src/snapshot.rs). There is no longer an
+[snapshot.rs](crates/pg_dbmigrator/src/snapshot.rs). There is no longer an
 in-process apply path; the previous `OnlineApplyEngine` enum and
 `--apply-engine` CLI flag have been removed.
 
@@ -36,10 +36,10 @@ in-process apply path; the previous `OnlineApplyEngine` enum and
 
 ```
 Cargo.toml                          # workspace root, central versions/deps
-.cargo/config.toml                  # `cargo pg_migrator` alias
+.cargo/config.toml                  # `cargo pg_dbmigrator` alias
 crates/
-  pg_migrator/                      # library crate (package: pg_migrator)
-  pg_migrator-cli/                  # CLI crate (package: pg_migrator-cli, bin: pg_migrator)
+  pg_dbmigrator/                      # library crate (package: pg_dbmigrator)
+  pg_dbmigrator-cli/                  # CLI crate (package: pg_dbmigrator-cli, bin: pg_dbmigrator)
 examples/offline_migration/         # integration example for the library
 examples/online_migration/
 ```
@@ -54,25 +54,25 @@ examples/online_migration/
 
 | File                                                                       | Responsibility                                                              |
 | -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| [crates/pg_migrator/src/lib.rs](crates/pg_migrator/src/lib.rs)                   | Crate entry point, re-exports, `#![deny]`/`#![warn]` lints                  |
-| [crates/pg_migrator/src/config.rs](crates/pg_migrator/src/config.rs)             | `MigrationConfig` / `EndpointConfig` / `OnlineOptions` and validation       |
-| [crates/pg_migrator/src/error.rs](crates/pg_migrator/src/error.rs)               | `MigrationError` (`thiserror`) + `Result<T>` alias                          |
-| [crates/pg_migrator/src/dump.rs](crates/pg_migrator/src/dump.rs)                 | `pg_dump` wrapper, `CommandRunner` trait, pure argv builder                 |
-| [crates/pg_migrator/src/restore.rs](crates/pg_migrator/src/restore.rs)           | `pg_restore` / `psql` wrapper                                               |
-| [crates/pg_migrator/src/snapshot.rs](crates/pg_migrator/src/snapshot.rs)         | Replication slot creation + exported snapshot retrieval                     |
-| [crates/pg_migrator/src/native_apply.rs](crates/pg_migrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn` |
-| [crates/pg_migrator/src/orchestrator.rs](crates/pg_migrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
-| [crates/pg_migrator/src/progress.rs](crates/pg_migrator/src/progress.rs)         | `ProgressReporter` trait + Tracing/Collecting implementations               |
-| [crates/pg_migrator/src/preflight.rs](crates/pg_migrator/src/preflight.rs)       | Pre-migration checks (target empty, source `wal_level=logical`, slot/sender capacity) |
-| [crates/pg_migrator/src/sequences.rs](crates/pg_migrator/src/sequences.rs)       | Source→target sequence value sync at cutover (closes the PG logical-replication sequence gap) |
+| [crates/pg_dbmigrator/src/lib.rs](crates/pg_dbmigrator/src/lib.rs)                   | Crate entry point, re-exports, `#![deny]`/`#![warn]` lints                  |
+| [crates/pg_dbmigrator/src/config.rs](crates/pg_dbmigrator/src/config.rs)             | `MigrationConfig` / `EndpointConfig` / `OnlineOptions` and validation       |
+| [crates/pg_dbmigrator/src/error.rs](crates/pg_dbmigrator/src/error.rs)               | `MigrationError` (`thiserror`) + `Result<T>` alias                          |
+| [crates/pg_dbmigrator/src/dump.rs](crates/pg_dbmigrator/src/dump.rs)                 | `pg_dump` wrapper, `CommandRunner` trait, pure argv builder                 |
+| [crates/pg_dbmigrator/src/restore.rs](crates/pg_dbmigrator/src/restore.rs)           | `pg_restore` / `psql` wrapper                                               |
+| [crates/pg_dbmigrator/src/snapshot.rs](crates/pg_dbmigrator/src/snapshot.rs)         | Replication slot creation + exported snapshot retrieval                     |
+| [crates/pg_dbmigrator/src/native_apply.rs](crates/pg_dbmigrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn` |
+| [crates/pg_dbmigrator/src/orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
+| [crates/pg_dbmigrator/src/progress.rs](crates/pg_dbmigrator/src/progress.rs)         | `ProgressReporter` trait + Tracing/Collecting implementations               |
+| [crates/pg_dbmigrator/src/preflight.rs](crates/pg_dbmigrator/src/preflight.rs)       | Pre-migration checks (target empty, source `wal_level=logical`, slot/sender capacity) |
+| [crates/pg_dbmigrator/src/sequences.rs](crates/pg_dbmigrator/src/sequences.rs)       | Source→target sequence value sync at cutover (closes the PG logical-replication sequence gap) |
 
 ### Pipeline stages (`MigrationStage`)
 
 `Validate → PrepareSnapshot* → Dump → Restore → StreamApply* → Lag* → CaughtUp* → Cutover* → Complete`
 (stages marked `*` are Online-only). Any new stage must be added in **both**
-[progress.rs](crates/pg_migrator/src/progress.rs) (the enum) and
-[orchestrator.rs](crates/pg_migrator/src/orchestrator.rs) /
-[replicate.rs](crates/pg_migrator/src/replicate.rs) (the reporting site).
+[progress.rs](crates/pg_dbmigrator/src/progress.rs) (the enum) and
+[orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs) /
+[replicate.rs](crates/pg_dbmigrator/src/replicate.rs) (the reporting site).
 
 ### Online cutover model
 
@@ -89,14 +89,14 @@ DMS "Cut over" button:
    continuous bytes-behind read-out.
 3. When the lag drops at or below `CutoverConfig::lag_threshold_bytes`, a
    one-shot `CaughtUp` event is emitted.
-4. The CLI (`crates/pg_migrator-cli/src/main.rs`) installs a SIGINT handler that
+4. The CLI (`crates/pg_dbmigrator-cli/src/main.rs`) installs a SIGINT handler that
    calls `CutoverHandle::request()` on the first Ctrl+C. The apply loop
    sees the request on its next poll, runs `ALTER SUBSCRIPTION ... DISABLE`
    and (unless `--keep-subscription` is set) `DROP SUBSCRIPTION`, emits
    `Cutover`, and `Migrator::run` returns with
    `MigrationOutcome::cutover_triggered() == true`.
 5. A second SIGINT cancels via the `CancellationToken` (escape hatch). See
-   `classify_sigint` in `crates/pg_migrator-cli/src/main.rs`.
+   `classify_sigint` in `crates/pg_dbmigrator-cli/src/main.rs`.
 
 Cutover is **always operator-driven**: the apply loop never exits on
 `CaughtUp` alone. The `lag_threshold_bytes` knob is purely advisory —
@@ -110,7 +110,7 @@ the target's sequences stay frozen at whatever `pg_dump`/`pg_restore`
 baked in. Without intervention, the first INSERT after cutover can
 collide with rows the apply worker streamed from the source.
 
-[`sequences.rs`](crates/pg_migrator/src/sequences.rs) closes that gap:
+[`sequences.rs`](crates/pg_dbmigrator/src/sequences.rs) closes that gap:
 
 1. After the operator presses Ctrl+C and `run_native_apply` returns with
    `cutover_triggered = true`, the orchestrator calls
@@ -138,7 +138,7 @@ resulting `'...'::regclass` string literal parses cleanly.
 them to skip very large or transient tables (or schemas owned by
 background services) that should not be part of the cutover. Online
 mode still captures their changes via the slot if they are in the
-publication, so combine with a narrower `pg_migrator_pub` definition
+publication, so combine with a narrower `pg_dbmigrator_pub` definition
 for full coverage.
 
 ---
@@ -146,7 +146,7 @@ for full coverage.
 ## 2. Design Principles (mandatory reading)
 
 1. **Clean library / CLI separation**
-   - The library only returns `pg_migrator::Result<T>` (`MigrationError`).
+   - The library only returns `pg_dbmigrator::Result<T>` (`MigrationError`).
    - Only the CLI is allowed to use `anyhow`; it converts library errors into
      terminal output and exit codes.
    - **No** `unwrap()` / `expect()` / `panic!()` in production code paths.
@@ -172,7 +172,7 @@ for full coverage.
    - Cancellation is part of the success path; if you must return an error
      for it, use `MigrationError::Cancelled` so the upper layer can detect it.
      See the `is_cancellation` helper in
-     [replicate.rs](crates/pg_migrator/src/replicate.rs#L40).
+     [replicate.rs](crates/pg_dbmigrator/src/replicate.rs#L40).
 
 5. **Connection-string secrecy**
    - `EndpointConfig` keeps the original libpq URI verbatim. **Always** call
@@ -207,7 +207,7 @@ for full coverage.
 
 ### 3.1 Crate-level lints
 
-[lib.rs](crates/pg_migrator/src/lib.rs#L42-L43) sets:
+[lib.rs](crates/pg_dbmigrator/src/lib.rs#L42-L43) sets:
 
 ```rust
 #![deny(rust_2018_idioms)]
@@ -220,12 +220,12 @@ When adding a new `pub` type:
 - If the type contains a non-`Debug` member (e.g. `LogicalReplicationStream`),
   attach `#[allow(missing_debug_implementations)]` and explain why in a doc
   comment (see
-  [snapshot.rs](crates/pg_migrator/src/snapshot.rs#L26-L29)).
+  [snapshot.rs](crates/pg_dbmigrator/src/snapshot.rs#L26-L29)).
 
 ### 3.2 Error handling
 
 - Library errors always go through
-  [`MigrationError`](crates/pg_migrator/src/error.rs#L17):
+  [`MigrationError`](crates/pg_dbmigrator/src/error.rs#L17):
   - String-bearing variants must be built via the helpers
     `MigrationError::config(...)`, `::external(...)`, `::apply(...)`. Do not
     construct the enum directly.
@@ -257,7 +257,7 @@ When adding a new `pub` type:
 
 - One responsibility per module. Each file starts with a `//!` doc comment
   describing **why the module exists** and **what it deliberately does not
-  do**. See [apply.rs](crates/pg_migrator/src/apply.rs#L1-L15) for the pattern.
+  do**. See [apply.rs](crates/pg_dbmigrator/src/apply.rs#L1-L15) for the pattern.
 - File ordering: `use` → public types → public functions → private helpers
   → `#[cfg(test)] mod tests`.
 - Do not introduce `mod.rs`-style folders; keep the flat `lib.rs` + sibling
@@ -268,10 +268,10 @@ When adding a new `pub` type:
 - Every `pub` item has a `///` comment that covers purpose, required call
   ordering, and edge cases.
 - Configuration fields are documented **per field** (see
-  [config.rs](crates/pg_migrator/src/config.rs#L11-L33)).
+  [config.rs](crates/pg_dbmigrator/src/config.rs#L11-L33)).
 - Crate- and module-level docs include an `# Examples` block, marked
   `no_run` so doc-tests do not actually connect to PostgreSQL (see
-  [lib.rs](crates/pg_migrator/src/lib.rs#L19-L37)).
+  [lib.rs](crates/pg_dbmigrator/src/lib.rs#L19-L37)).
 
 ---
 
@@ -284,9 +284,9 @@ When adding a new `pub` type:
   `build_args_includes_jobs_only_for_directory_format`.
 - Do not depend on a real PostgreSQL instance:
   - Use `RecordingRunner` for dump/restore tests (see
-    [orchestrator.rs](crates/pg_migrator/src/orchestrator.rs#L246-L276)).
+    [orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs#L246-L276)).
   - Use `CollectingReporter` for progress tests
-    ([progress.rs](crates/pg_migrator/src/progress.rs#L83)).
+    ([progress.rs](crates/pg_dbmigrator/src/progress.rs#L83)).
   - Use `statement_for(&event)` for SQL translation assertions.
 - Modifying any pure function (`build_pg_dump_args`,
   `build_pg_restore_args`, `statement_for`, `ensure_replication_qs`)
@@ -301,10 +301,10 @@ When adding a new `pub` type:
 cargo test --workspace
 
 # Library only
-cargo test -p pg_migrator
+cargo test -p pg_dbmigrator
 
 # With logs
-RUST_LOG=debug cargo test -p pg_migrator -- --nocapture
+RUST_LOG=debug cargo test -p pg_dbmigrator -- --nocapture
 ```
 
 > `cargo test --workspace` must pass **without** a running PostgreSQL.
@@ -326,7 +326,7 @@ When you receive a new requirement, work in this order:
    `Migrator::run_offline` / `run_online` and emit progress events via
    `self.report(stage, message)`.
 5. **Mirror it in the CLI** — add `#[arg(...)]` in
-   [args.rs](crates/pg_migrator-cli/src/args.rs) and map it in `into_config`. Use
+   [args.rs](crates/pg_dbmigrator-cli/src/args.rs) and map it in `into_config`. Use
    kebab-case for flag names.
 6. **Update README + examples** if user-visible behaviour changes.
 7. **Run lint and tests**:
@@ -361,7 +361,7 @@ When you receive a new requirement, work in this order:
   error message must go through `redacted()`.
 - `pg_dump` / `pg_restore` are external processes. We pass the password via
   the `PGPASSWORD` environment variable (see
-  [dump.rs](crates/pg_migrator/src/dump.rs#L165-L172)). **Do not** put it in
+  [dump.rs](crates/pg_dbmigrator/src/dump.rs#L165-L172)). **Do not** put it in
   argv where `ps` could expose it.
 - SQL injection surface: `apply::statement_for` uses quoted identifiers
   (`quote_ident`) and parameter placeholders (`$1`, `$2`, …). **Do not**

@@ -48,7 +48,7 @@ cleanup_between_tests() {
 DO \$\$
 DECLARE r record;
 BEGIN
-    FOR r IN SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'pg_migrator%' LOOP
+    FOR r IN SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'pg_dbmigrator%' LOOP
         EXECUTE format('SELECT pg_drop_replication_slot(%L)', r.slot_name);
     END LOOP;
 END
@@ -59,7 +59,7 @@ END
 DO \$\$
 DECLARE r record;
 BEGIN
-    FOR r IN SELECT subname FROM pg_subscription WHERE subname LIKE 'pg_migrator%' LOOP
+    FOR r IN SELECT subname FROM pg_subscription WHERE subname LIKE 'pg_dbmigrator%' LOOP
         EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', r.subname);
         EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', r.subname);
         EXECUTE format('DROP SUBSCRIPTION %I', r.subname);

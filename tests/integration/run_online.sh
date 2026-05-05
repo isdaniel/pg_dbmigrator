@@ -19,7 +19,7 @@ INSERT_END=100500
 DELETE_END=1000
 EXPECTED_TOTAL=$((500 + (INSERT_END - 500) - DELETE_END))   # = 99500
 
-LOG_FILE="$(mktemp -t pg_migrator_online.XXXXXX.log)"
+LOG_FILE="$(mktemp -t pg_dbmigrator_online.XXXXXX.log)"
 echo "==> log file: $LOG_FILE"
 
 trap 'stop_migrator' EXIT

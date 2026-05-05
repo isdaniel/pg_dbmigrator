@@ -1,5 +1,5 @@
 [package]
-name = "pg_migrator"
+name = "pg_dbmigrator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ description = "Library for migrating PostgreSQL databases (offline dump/restore 
 repository.workspace = true
 
 [lib]
-name = "pg_migrator"
+name = "pg_dbmigrator"
 path = "src/lib.rs"
 
 [dependencies]

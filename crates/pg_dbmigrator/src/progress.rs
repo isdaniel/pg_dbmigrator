@@ -91,11 +91,6 @@ impl ProgressReporter for TracingReporter {
 /// [`ProgressReporter`] that emits one NDJSON record per event to an async
 /// writer (defaulting to `stdout`).
 ///
-/// Each line is a single JSON object matching [`ProgressEvent`]'s
-/// serde representation, terminated by `\n`. This is the interchange
-/// format external tooling (CI dashboards, k8s operators, the Azure DMS
-/// status page) should consume.
-///
 /// Errors writing to the underlying sink are demoted to a `warn!` so a
 /// broken pipe on stdout never aborts the migration mid-way.
 #[allow(missing_debug_implementations)]

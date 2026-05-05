@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/pg_migrator",
-    "crates/pg_migrator-cli",
+    "crates/pg_dbmigrator",
+    "crates/pg_dbmigrator-cli",
     "examples/offline_migration",
     "examples/online_migration",
 ]
@@ -12,8 +12,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["danielshih"]
-repository = "https://github.com/isdaniel/pg_migrator"
-description = "PostgreSQL migration tool (offline dump/restore + online logical replication)"
+repository = "https://github.com/isdaniel/pg_dbmigrator"
+description = "PostgreSQL database migration tool (offline dump/restore + online logical replication)"
 
 [workspace.dependencies]
 # Core async runtime + helpers

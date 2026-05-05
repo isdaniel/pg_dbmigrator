@@ -13,7 +13,7 @@ use crate::error::{MigrationError, Result};
 
 /// Restore phase, mapped to `pg_restore --section=<value>`.
 ///
-/// The standard pgcopydb / pg_dump-best-practice ordering is
+/// The standard pg_dump-best-practice ordering is
 /// `PreData` (CREATE TABLE / TYPE / FUNCTION DDL with no indexes) →
 /// `Data` (COPY of every table) → `PostData` (PRIMARY KEY, CHECK,
 /// FOREIGN KEY, INDEX, TRIGGER). Splitting the restore lets the bulk
@@ -57,9 +57,7 @@ pub enum RestoreErrorCategory {
     /// rarely a data-loss issue.
     Duplicate,
     /// `permission denied`, `must be owner`, `must be superuser`,
-    /// `role "X" does not exist`. On managed Postgres (Azure / AWS /
-    /// GCP) these are typically inevitable: the source's `OWNER TO
-    /// rdsadmin` / `GRANT ... TO azure_pg_admin` lines have no analogue
+    /// `role "X" does not exist`. On managed Postgres (Azure / AWS / GCP) these are typically inevitable: the source's `OWNER TO rdsadmin` / `GRANT ... TO azure_pg_admin` lines have no analogue
     /// on the target. User data is unaffected.
     Privilege,
     /// Extension internal state (`COMMENT ON EXTENSION`,

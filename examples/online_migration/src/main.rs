@@ -10,7 +10,7 @@
 //!    LSN) so the operator can decide when to cut over.
 //! 5. On SIGINT (Ctrl+C) the apply loop performs a graceful cutover —
 //!    `ALTER SUBSCRIPTION ... DISABLE` and (unless
-//!    `PG_MIGRATOR_KEEP_SUBSCRIPTION=1`) `DROP SUBSCRIPTION`. A second
+//!    `PG_DBMIGRATOR_KEEP_SUBSCRIPTION=1`) `DROP SUBSCRIPTION`. A second
 //!    Ctrl+C aborts immediately as an escape hatch.
 //!
 //! ## `lag_threshold_bytes` semantics
@@ -38,15 +38,15 @@
 //!
 //! Usage:
 //! ```bash
-//! PG_MIGRATOR_SOURCE="postgres://user:pw@src/db" \
-//!     PG_MIGRATOR_TARGET="postgres://user:pw@dst/db" \
+//! PG_DBMIGRATOR_SOURCE="postgres://user:pw@src/db" \
+//!     PG_DBMIGRATOR_TARGET="postgres://user:pw@dst/db" \
 //!     cargo run -p online_migration_example
 //! ```
 //!
 //! The source must have `wal_level=logical` and a publication that the slot
-//! will use (default name: `pg_migrator_pub`). For example:
+//! will use (default name: `pg_dbmigrator_pub`). For example:
 //! ```sql
-//! CREATE PUBLICATION pg_migrator_pub FOR ALL TABLES;
+//! CREATE PUBLICATION pg_dbmigrator_pub FOR ALL TABLES;
 //! ```
 
 use std::env;
@@ -54,7 +54,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pg_migrator::{
+use pg_dbmigrator::{
     config::DumpScope, CutoverConfig, EndpointConfig, MigrationConfig, MigrationMode, Migrator,
     OnlineOptions, ReplicationApplyConfig,
 };
@@ -67,45 +67,45 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,pg_migrator=info,pg_walstream=info")),
+                .unwrap_or_else(|_| EnvFilter::new("info,pg_dbmigrator=info,pg_walstream=info")),
         )
         .with_target(false)
         .init();
 
-    let source = env::var("PG_MIGRATOR_SOURCE").context("PG_MIGRATOR_SOURCE must be set")?;
-    let target = env::var("PG_MIGRATOR_TARGET").context("PG_MIGRATOR_TARGET must be set")?;
+    let source = env::var("PG_DBMIGRATOR_SOURCE").context("PG_DBMIGRATOR_SOURCE must be set")?;
+    let target = env::var("PG_DBMIGRATOR_TARGET").context("PG_DBMIGRATOR_TARGET must be set")?;
 
     let online = OnlineOptions {
-        slot_name: env::var("PG_MIGRATOR_SLOT_NAME").unwrap_or_else(|_| "pg_migrator_slot".into()),
-        publication: env::var("PG_MIGRATOR_PUBLICATION")
-            .unwrap_or_else(|_| "pg_migrator_pub".into()),
+        slot_name: env::var("PG_DBMIGRATOR_SLOT_NAME").unwrap_or_else(|_| "pg_dbmigrator_slot".into()),
+        publication: env::var("PG_DBMIGRATOR_PUBLICATION")
+            .unwrap_or_else(|_| "pg_dbmigrator_pub".into()),
         protocol_version: 2,
-        subscription_name: env::var("PG_MIGRATOR_SUBSCRIPTION_NAME")
-            .unwrap_or_else(|_| "pg_migrator_sub".into()),
+        subscription_name: env::var("PG_DBMIGRATOR_SUBSCRIPTION_NAME")
+            .unwrap_or_else(|_| "pg_dbmigrator_sub".into()),
         // Set this when the target's apply worker reaches the source via a
         // different address than the migrator (e.g. Docker service name vs.
-        // host loopback). Defaults to `PG_MIGRATOR_SOURCE`.
-        subscription_source_conn: env::var("PG_MIGRATOR_SUBSCRIPTION_SOURCE").ok(),
-        drop_subscription_on_cutover: !env_flag("PG_MIGRATOR_KEEP_SUBSCRIPTION"),
-        force_clean: env_flag("PG_MIGRATOR_FORCE_CLEAN"),
-        sync_sequences_on_cutover: !env_flag("PG_MIGRATOR_NO_SEQUENCE_SYNC"),
+        // host loopback). Defaults to `PG_DBMIGRATOR_SOURCE`.
+        subscription_source_conn: env::var("PG_DBMIGRATOR_SUBSCRIPTION_SOURCE").ok(),
+        drop_subscription_on_cutover: !env_flag("PG_DBMIGRATOR_KEEP_SUBSCRIPTION"),
+        force_clean: env_flag("PG_DBMIGRATOR_FORCE_CLEAN"),
+        sync_sequences_on_cutover: !env_flag("PG_DBMIGRATOR_NO_SEQUENCE_SYNC"),
         apply: ReplicationApplyConfig {
-            feedback_interval: Duration::from_secs(env_secs("PG_MIGRATOR_FEEDBACK_SECS", 5)),
+            feedback_interval: Duration::from_secs(env_secs("PG_DBMIGRATOR_FEEDBACK_SECS", 5)),
             connection_timeout: Duration::from_secs(15),
             health_check_interval: Duration::from_secs(30),
-            max_runtime_seconds: env::var("PG_MIGRATOR_MAX_RUNTIME_SECS")
+            max_runtime_seconds: env::var("PG_DBMIGRATOR_MAX_RUNTIME_SECS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok()),
         },
         cutover: CutoverConfig {
-            poll_interval: Duration::from_secs(env_secs("PG_MIGRATOR_POLL_SECS", 5)),
+            poll_interval: Duration::from_secs(env_secs("PG_DBMIGRATOR_POLL_SECS", 5)),
             fast_poll_interval: Duration::from_millis(
-                env::var("PG_MIGRATOR_FAST_POLL_MS")
+                env::var("PG_DBMIGRATOR_FAST_POLL_MS")
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(500),
             ),
-            lag_threshold_bytes: env::var("PG_MIGRATOR_LAG_THRESHOLD_BYTES")
+            lag_threshold_bytes: env::var("PG_DBMIGRATOR_LAG_THRESHOLD_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(8 * 1024),
@@ -120,9 +120,9 @@ async fn main() -> Result<()> {
         drop_target_first: true,
         jobs: 4,
         online,
-        resume: env_flag("PG_MIGRATOR_RESUME"),
-        resume_file: env::var("PG_MIGRATOR_RESUME_FILE").ok().map(PathBuf::from),
-        dump_path: env::var("PG_MIGRATOR_DUMP_PATH").ok().map(PathBuf::from),
+        resume: env_flag("PG_DBMIGRATOR_RESUME"),
+        resume_file: env::var("PG_DBMIGRATOR_RESUME_FILE").ok().map(PathBuf::from),
+        dump_path: env::var("PG_DBMIGRATOR_DUMP_PATH").ok().map(PathBuf::from),
         ..MigrationConfig::default()
     };
 

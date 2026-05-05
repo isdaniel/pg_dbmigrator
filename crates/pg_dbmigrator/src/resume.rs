@@ -42,8 +42,8 @@ pub const RESUME_SCHEMA_VERSION: u32 = 1;
 /// Stages that can be marked complete on a [`ResumeToken`].
 ///
 /// Restore is treated as one atomic unit even when `split_sections` is
-/// enabled — partial section completion would require pgcopydb-style
-/// per-table tracking which is out of scope for this token.
+/// enabled — partial section completion would require per-table tracking
+/// which is out of scope for this token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletedStage {

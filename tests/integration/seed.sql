@@ -29,5 +29,5 @@ SELECT 'event-' || g
 FROM generate_series(1, 100) g;
 
 -- Publication required for online mode. Library does not auto-create it.
-DROP PUBLICATION IF EXISTS pg_migrator_pub;
-CREATE PUBLICATION pg_migrator_pub FOR ALL TABLES;
+DROP PUBLICATION IF EXISTS pg_dbmigrator_pub;
+CREATE PUBLICATION pg_dbmigrator_pub FOR ALL TABLES;

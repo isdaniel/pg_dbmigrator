@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Offline resume token test — verifies that a second run with
-# PG_MIGRATOR_RESUME=1 skips the previously-completed pg_dump and
+# PG_DBMIGRATOR_RESUME=1 skips the previously-completed pg_dump and
 # pg_restore stages.
 set -euo pipefail
 
@@ -8,11 +8,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 source "$ROOT/tests/integration/lib.sh"
 
-DUMP_DIR="$(mktemp -d -t pg_migrator_resume_dump.XXXXXX)"
+DUMP_DIR="$(mktemp -d -t pg_dbmigrator_resume_dump.XXXXXX)"
 DUMP_PATH="$DUMP_DIR/dump"
 RESUME_FILE="$DUMP_DIR/dump.resume.json"
-LOG1="$(mktemp -t pg_migrator_resume_run1.XXXXXX.log)"
-LOG2="$(mktemp -t pg_migrator_resume_run2.XXXXXX.log)"
+LOG1="$(mktemp -t pg_dbmigrator_resume_run1.XXXXXX.log)"
+LOG2="$(mktemp -t pg_dbmigrator_resume_run2.XXXXXX.log)"
 echo "==> dump dir: $DUMP_DIR"
 echo "==> log #1: $LOG1"
 echo "==> log #2: $LOG2"
@@ -26,10 +26,10 @@ seed_source
 reset_target_schema
 
 echo "==> RUN #1: full migration (no resume) — also writes resume token"
-PG_MIGRATOR_SOURCE="$SOURCE_URL" \
-PG_MIGRATOR_TARGET="$TARGET_URL" \
-PG_MIGRATOR_DUMP_PATH="$DUMP_PATH" \
-RUST_LOG="info,pg_migrator=info" \
+PG_DBMIGRATOR_SOURCE="$SOURCE_URL" \
+PG_DBMIGRATOR_TARGET="$TARGET_URL" \
+PG_DBMIGRATOR_DUMP_PATH="$DUMP_PATH" \
+RUST_LOG="info,pg_dbmigrator=info" \
     cargo run --quiet -p offline_migration_example >"$LOG1" 2>&1
 
 if ! grep -q "starting pg_dump" "$LOG1"; then
@@ -63,11 +63,11 @@ echo "==> wiping target schema before RUN #2"
 reset_target_schema
 
 echo "==> RUN #2: with --resume, must skip both stages"
-PG_MIGRATOR_SOURCE="$SOURCE_URL" \
-PG_MIGRATOR_TARGET="$TARGET_URL" \
-PG_MIGRATOR_DUMP_PATH="$DUMP_PATH" \
-PG_MIGRATOR_RESUME=1 \
-RUST_LOG="info,pg_migrator=info" \
+PG_DBMIGRATOR_SOURCE="$SOURCE_URL" \
+PG_DBMIGRATOR_TARGET="$TARGET_URL" \
+PG_DBMIGRATOR_DUMP_PATH="$DUMP_PATH" \
+PG_DBMIGRATOR_RESUME=1 \
+RUST_LOG="info,pg_dbmigrator=info" \
     cargo run --quiet -p offline_migration_example >"$LOG2" 2>&1
 
 if ! grep -q "skipped (resume): pg_dump already complete" "$LOG2"; then

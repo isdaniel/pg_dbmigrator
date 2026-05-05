@@ -31,7 +31,7 @@ INITIAL_EVENTS=100
 STREAMED_EVENTS=200
 EXPECTED_EVENTS=$((INITIAL_EVENTS + STREAMED_EVENTS))   # 300
 
-LOG_FILE="$(mktemp -t pg_migrator_seq_sync.XXXXXX.log)"
+LOG_FILE="$(mktemp -t pg_dbmigrator_seq_sync.XXXXXX.log)"
 echo "==> log file: $LOG_FILE"
 
 trap 'stop_migrator' EXIT

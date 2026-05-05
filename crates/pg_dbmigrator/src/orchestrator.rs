@@ -323,8 +323,7 @@ impl Migrator {
         // `last_value`s match the source. PostgreSQL logical replication
         // does NOT replay nextval(), so without this step the first
         // post-cutover INSERT … DEFAULT nextval(...) would collide with
-        // a row already replicated by the apply worker. Equivalent to
-        // pgcopydb's `copy sequences` step.
+        // a row already replicated by the apply worker.
         if stats.cutover_triggered && self.config.online.sync_sequences_on_cutover {
             self.report(
                 MigrationStage::Cutover,
@@ -609,7 +608,7 @@ mod tests {
         let migrator = Migrator::new(baseline_config())
             .with_runner(runner.clone())
             .with_reporter(reporter.clone())
-            .with_dump_path(PathBuf::from("/tmp/pg_migrator_test_dump"));
+            .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_test_dump"));
 
         migrator
             .run(CancellationToken::new())
@@ -644,7 +643,7 @@ mod tests {
         let migrator = Migrator::new(cfg)
             .with_runner(runner.clone())
             .with_reporter(reporter)
-            .with_dump_path(PathBuf::from("/tmp/pg_migrator_split_dump"));
+            .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_split_dump"));
 
         migrator
             .run(CancellationToken::new())

@@ -8,8 +8,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 source "$ROOT/tests/integration/lib.sh"
 
-LOG_FILE="$(mktemp -t pg_migrator_offline_split.XXXXXX.log)"
-DUMP_DIR="$(mktemp -d -t pg_migrator_split_dump.XXXXXX)"
+LOG_FILE="$(mktemp -t pg_dbmigrator_offline_split.XXXXXX.log)"
+DUMP_DIR="$(mktemp -d -t pg_dbmigrator_split_dump.XXXXXX)"
 echo "==> log file: $LOG_FILE"
 echo "==> dump dir: $DUMP_DIR"
 
@@ -29,12 +29,12 @@ psql_exec "$SOURCE_URL" "
 reset_target_schema
 
 echo "==> running offline_migration_example with split-sections"
-PG_MIGRATOR_SOURCE="$SOURCE_URL" \
-PG_MIGRATOR_TARGET="$TARGET_URL" \
-PG_MIGRATOR_SPLIT_SECTIONS=1 \
-PG_MIGRATOR_DUMP_PATH="$DUMP_DIR/dump" \
+PG_DBMIGRATOR_SOURCE="$SOURCE_URL" \
+PG_DBMIGRATOR_TARGET="$TARGET_URL" \
+PG_DBMIGRATOR_SPLIT_SECTIONS=1 \
+PG_DBMIGRATOR_DUMP_PATH="$DUMP_DIR/dump" \
 NO_COLOR=1 \
-RUST_LOG="info,pg_migrator=info" \
+RUST_LOG="info,pg_dbmigrator=info" \
     cargo run --quiet -p offline_migration_example >"$LOG_FILE" 2>&1
 
 echo "==> checking section ordering in log"

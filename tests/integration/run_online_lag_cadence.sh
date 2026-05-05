@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 source "$ROOT/tests/integration/lib.sh"
 
-LOG_FILE="$(mktemp -t pg_migrator_lag_cadence.XXXXXX.log)"
+LOG_FILE="$(mktemp -t pg_dbmigrator_lag_cadence.XXXXXX.log)"
 echo "==> log file: $LOG_FILE"
 
 trap 'stop_migrator' EXIT
@@ -20,9 +20,9 @@ setup_online_test
 build_example online_migration_example
 
 echo "==> launching migrator with slow=10s fast=200ms threshold=64"
-export PG_MIGRATOR_POLL_SECS=10
-export PG_MIGRATOR_FAST_POLL_MS=200
-export PG_MIGRATOR_MAX_RUNTIME_SECS=300
+export PG_DBMIGRATOR_POLL_SECS=10
+export PG_DBMIGRATOR_FAST_POLL_MS=200
+export PG_DBMIGRATOR_MAX_RUNTIME_SECS=300
 launch_online_migrator "$LOG_FILE"
 
 echo "==> waiting for FIRST 'replication lag' heartbeat"

@@ -21,8 +21,8 @@ psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 55433 -U migrator -d appdb \
     -c "DROP SCHEMA IF EXISTS app CASCADE;" >/dev/null
 
 echo "==> running offline_migration_example"
-PG_MIGRATOR_SOURCE="$SOURCE_URL" \
-PG_MIGRATOR_TARGET="$TARGET_URL" \
+PG_DBMIGRATOR_SOURCE="$SOURCE_URL" \
+PG_DBMIGRATOR_TARGET="$TARGET_URL" \
     cargo run --quiet -p offline_migration_example
 
 assert_data_equal 500

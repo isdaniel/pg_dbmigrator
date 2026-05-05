@@ -9,8 +9,8 @@ source "$ROOT/tests/integration/lib.sh"
 
 SUSTAIN_SECS="${SUSTAIN_SECS:-60}"
 
-LOG_FILE="$(mktemp -t pg_migrator_online_sustained.XXXXXX.log)"
-TICK_FILE="$(mktemp -t pg_migrator_mut_tick.XXXXXX)"
+LOG_FILE="$(mktemp -t pg_dbmigrator_online_sustained.XXXXXX.log)"
+TICK_FILE="$(mktemp -t pg_dbmigrator_mut_tick.XXXXXX)"
 echo "==> log file: $LOG_FILE"
 echo "==> tick file: $TICK_FILE"
 echo "==> sustained mutation window: ${SUSTAIN_SECS}s"
@@ -28,7 +28,7 @@ wait_for_pg "$TARGET_URL" "target"
 setup_online_test
 build_example online_migration_example
 
-export PG_MIGRATOR_MAX_RUNTIME_SECS=1200
+export PG_DBMIGRATOR_MAX_RUNTIME_SECS=1200
 launch_online_migrator "$LOG_FILE"
 
 echo "==> waiting for pg_dump to start (slot is live)"

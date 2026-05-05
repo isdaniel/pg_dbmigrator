@@ -4,26 +4,26 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
-use pg_migrator::config::{default_jobs, DumpScope};
-use pg_migrator::{
+use pg_dbmigrator::config::{default_jobs, DumpScope};
+use pg_dbmigrator::{
     CutoverConfig, EndpointConfig, MigrationConfig, MigrationMode, OnlineOptions,
     ReplicationApplyConfig,
 };
 
-/// pg_migrator — PostgreSQL → PostgreSQL migration tool.
+/// pg_dbmigrator — PostgreSQL → PostgreSQL database migration tool.
 #[derive(Debug, Parser)]
-#[command(name = "pg_migrator", version, about)]
+#[command(name = "pg_dbmigrator", version, about)]
 pub struct Cli {
     /// Migration mode.
     #[arg(long, value_enum, default_value_t = ModeArg::Offline)]
     pub mode: ModeArg,
 
     /// Source connection string (libpq URI).
-    #[arg(long, env = "PG_MIGRATOR_SOURCE")]
+    #[arg(long, env = "PG_DBMIGRATOR_SOURCE")]
     pub source: String,
 
     /// Target connection string (libpq URI).
-    #[arg(long, env = "PG_MIGRATOR_TARGET")]
+    #[arg(long, env = "PG_DBMIGRATOR_TARGET")]
     pub target: String,
 
     /// What to dump (schema, data, or all).
@@ -58,15 +58,15 @@ pub struct Cli {
     pub exclude_tables: Vec<String>,
 
     /// Replication slot name (online mode only).
-    #[arg(long, default_value = "pg_migrator_slot")]
+    #[arg(long, default_value = "pg_dbmigrator_slot")]
     pub slot_name: String,
 
     /// Publication name (online mode only).
-    #[arg(long, default_value = "pg_migrator_pub")]
+    #[arg(long, default_value = "pg_dbmigrator_pub")]
     pub publication: String,
 
     /// Subscription name created on the target. Online mode only.
-    #[arg(long, default_value = "pg_migrator_sub")]
+    #[arg(long, default_value = "pg_dbmigrator_sub")]
     pub subscription_name: String,
 
     /// Override for the source URI written into
@@ -198,9 +198,9 @@ pub struct Cli {
     pub verbose: bool,
 
     /// Emit machine-readable NDJSON progress events to stdout (one
-    /// [`pg_migrator::ProgressEvent`] per line). Human-readable tracing
+    /// [`pg_dbmigrator::ProgressEvent`] per line). Human-readable tracing
     /// logs continue to go to stderr. Pair with
-    /// `RUST_LOG=warn,pg_migrator=warn` to silence stderr for clean piping.
+    /// `RUST_LOG=warn,pg_dbmigrator=warn` to silence stderr for clean piping.
     #[arg(long)]
     pub json: bool,
 }
@@ -241,7 +241,7 @@ impl From<DumpScopeArg> for DumpScope {
 
 impl Cli {
     /// Convert CLI args into the library [`MigrationConfig`].
-    pub fn into_config(self) -> Result<MigrationConfig, pg_migrator::MigrationError> {
+    pub fn into_config(self) -> Result<MigrationConfig, pg_dbmigrator::MigrationError> {
         let source = EndpointConfig::parse(&self.source)?;
         let target = EndpointConfig::parse(&self.target)?;
 

@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 export SOURCE_URL="postgres://migrator:migrator@127.0.0.1:55432/appdb"
 export TARGET_URL="postgres://migrator:migrator@127.0.0.1:55433/appdb"
-export SUBSCRIPTION_SOURCE_URL="postgres://migrator:migrator@pg_migrator_source:5432/appdb"
+export SUBSCRIPTION_SOURCE_URL="postgres://migrator:migrator@pg_dbmigrator_source:5432/appdb"
 export PGPASSWORD=migrator
 
 PSQL_BASE=(psql -v ON_ERROR_STOP=1 -X -A -t)
@@ -258,28 +258,28 @@ seed_source() {
         -f "$ROOT/tests/integration/seed.sql" >/dev/null
 }
 
-# drop_replication_slots — drop all pg_migrator% replication slots on source.
+# drop_replication_slots — drop all pg_dbmigrator% replication slots on source.
 drop_replication_slots() {
     echo "==> dropping any leftover replication slots"
     psql_exec "$SOURCE_URL" "
 DO \$\$
 DECLARE r record;
 BEGIN
-    FOR r IN SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'pg_migrator%' LOOP
+    FOR r IN SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'pg_dbmigrator%' LOOP
         EXECUTE format('SELECT pg_drop_replication_slot(%L)', r.slot_name);
     END LOOP;
 END
 \$\$;"
 }
 
-# drop_subscriptions — drop all pg_migrator% subscriptions on target.
+# drop_subscriptions — drop all pg_dbmigrator% subscriptions on target.
 drop_subscriptions() {
     echo "==> dropping any leftover subscriptions on target"
     psql_exec "$TARGET_URL" "
 DO \$\$
 DECLARE r record;
 BEGIN
-    FOR r IN SELECT subname FROM pg_subscription WHERE subname LIKE 'pg_migrator%' LOOP
+    FOR r IN SELECT subname FROM pg_subscription WHERE subname LIKE 'pg_dbmigrator%' LOOP
         EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', r.subname);
         EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', r.subname);
         EXECUTE format('DROP SUBSCRIPTION %I', r.subname);
@@ -318,14 +318,14 @@ launch_online_migrator() {
     local logfile="$1"
     shift
     env \
-        PG_MIGRATOR_SOURCE="$SOURCE_URL" \
-        PG_MIGRATOR_TARGET="$TARGET_URL" \
-        PG_MIGRATOR_SUBSCRIPTION_SOURCE="$SUBSCRIPTION_SOURCE_URL" \
-        PG_MIGRATOR_LAG_THRESHOLD_BYTES="${PG_MIGRATOR_LAG_THRESHOLD_BYTES:-64}" \
-        PG_MIGRATOR_POLL_SECS="${PG_MIGRATOR_POLL_SECS:-1}" \
-        PG_MIGRATOR_FEEDBACK_SECS="${PG_MIGRATOR_FEEDBACK_SECS:-1}" \
-        PG_MIGRATOR_MAX_RUNTIME_SECS="${PG_MIGRATOR_MAX_RUNTIME_SECS:-900}" \
-        RUST_LOG="${RUST_LOG:-info,pg_migrator=info,pg_walstream=warn}" \
+        PG_DBMIGRATOR_SOURCE="$SOURCE_URL" \
+        PG_DBMIGRATOR_TARGET="$TARGET_URL" \
+        PG_DBMIGRATOR_SUBSCRIPTION_SOURCE="$SUBSCRIPTION_SOURCE_URL" \
+        PG_DBMIGRATOR_LAG_THRESHOLD_BYTES="${PG_DBMIGRATOR_LAG_THRESHOLD_BYTES:-64}" \
+        PG_DBMIGRATOR_POLL_SECS="${PG_DBMIGRATOR_POLL_SECS:-1}" \
+        PG_DBMIGRATOR_FEEDBACK_SECS="${PG_DBMIGRATOR_FEEDBACK_SECS:-1}" \
+        PG_DBMIGRATOR_MAX_RUNTIME_SECS="${PG_DBMIGRATOR_MAX_RUNTIME_SECS:-900}" \
+        RUST_LOG="${RUST_LOG:-info,pg_dbmigrator=info,pg_walstream=warn}" \
         "$@" \
         stdbuf -oL -eL "$BIN" >"$logfile" 2>&1 &
     MIGRATOR_PID=$!

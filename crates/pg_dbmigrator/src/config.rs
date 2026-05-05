@@ -50,7 +50,7 @@ pub struct MigrationConfig {
     #[serde(default)]
     pub allow_restore_errors: bool,
     /// Pass `--no-publications` to `pg_dump`. Default `true`. Source-side
-    /// publications (e.g. our own `pg_migrator_pub`) are migration scaffolding;
+    /// publications (e.g. our own `pg_dbmigrator_pub`) are migration scaffolding;
     /// recreating them on the target produces noise such as
     /// `wal_level is insufficient to publish logical changes` warnings.
     #[serde(default = "default_true")]
@@ -344,7 +344,6 @@ pub struct OnlineOptions {
     /// post-cutover `INSERT … DEFAULT nextval(...)` will produce a
     /// duplicate-key violation. Disable only if you have your own
     /// out-of-band sequence sync (e.g. application-level UUIDs).
-    /// Equivalent to `pgcopydb copy sequences`.
     #[serde(default = "default_true")]
     pub sync_sequences_on_cutover: bool,
     /// Configuration for the WAL apply worker.
@@ -355,14 +354,14 @@ pub struct OnlineOptions {
 }
 
 fn default_subscription_name() -> String {
-    "pg_migrator_sub".to_string()
+    "pg_dbmigrator_sub".to_string()
 }
 
 impl Default for OnlineOptions {
     fn default() -> Self {
         Self {
-            slot_name: "pg_migrator_slot".to_string(),
-            publication: "pg_migrator_pub".to_string(),
+            slot_name: "pg_dbmigrator_slot".to_string(),
+            publication: "pg_dbmigrator_pub".to_string(),
             protocol_version: 2,
             subscription_name: default_subscription_name(),
             subscription_source_conn: None,
@@ -622,7 +621,7 @@ mod tests {
     #[test]
     fn online_options_default_subscription_name() {
         let opts = OnlineOptions::default();
-        assert_eq!(opts.subscription_name, "pg_migrator_sub");
+        assert_eq!(opts.subscription_name, "pg_dbmigrator_sub");
         assert!(opts.drop_subscription_on_cutover);
     }
 

@@ -12,8 +12,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 source "$ROOT/tests/integration/lib.sh"
 
-LOG_FILE="$(mktemp -t pg_migrator_online_updates.XXXXXX.log)"
-TICK_FILE="$(mktemp -t pg_migrator_mut_tick.XXXXXX)"
+LOG_FILE="$(mktemp -t pg_dbmigrator_online_updates.XXXXXX.log)"
+TICK_FILE="$(mktemp -t pg_dbmigrator_mut_tick.XXXXXX)"
 echo "==> log file: $LOG_FILE"
 echo "==> tick file: $TICK_FILE"
 

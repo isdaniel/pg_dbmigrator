@@ -7,7 +7,7 @@
 #   4. Continue mutations for 5s while apply is live.
 #   5. SIGINT → graceful cutover (first run exits cleanly).
 #   6. Verify the resume token exists with dump+restore marked complete.
-#   7. Resume: relaunch with PG_MIGRATOR_RESUME=1.
+#   7. Resume: relaunch with PG_DBMIGRATOR_RESUME=1.
 #   8. Wait for apply phase to restart.
 #   9. Stop mutations, wait for target == source content.
 #  10. SIGINT → graceful cutover.
@@ -18,11 +18,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 source "$ROOT/tests/integration/lib.sh"
 
-DUMP_DIR="$(mktemp -d -t pg_migrator_cancel_resume.XXXXXX)"
+DUMP_DIR="$(mktemp -d -t pg_dbmigrator_cancel_resume.XXXXXX)"
 DUMP_PATH="$DUMP_DIR/dump"
-LOG1="$(mktemp -t pg_migrator_cr_run1.XXXXXX.log)"
-LOG2="$(mktemp -t pg_migrator_cr_run2.XXXXXX.log)"
-TICK_FILE="$(mktemp -t pg_migrator_cr_tick.XXXXXX)"
+LOG1="$(mktemp -t pg_dbmigrator_cr_run1.XXXXXX.log)"
+LOG2="$(mktemp -t pg_dbmigrator_cr_run2.XXXXXX.log)"
+TICK_FILE="$(mktemp -t pg_dbmigrator_cr_tick.XXXXXX)"
 echo "==> dump dir: $DUMP_DIR"
 echo "==> log #1: $LOG1"
 echo "==> log #2: $LOG2"
@@ -45,7 +45,7 @@ build_example online_migration_example
 # RUN #1: initial migration — will be cancelled mid-apply
 # ═══════════════════════════════════════════════════════════════════════════
 echo "==> RUN #1: launching migrator (initial run, pinned dump path)"
-export PG_MIGRATOR_DUMP_PATH="$DUMP_PATH"
+export PG_DBMIGRATOR_DUMP_PATH="$DUMP_PATH"
 launch_online_migrator "$LOG1"
 
 echo "==> waiting for pg_dump to start (slot is live)"
@@ -88,7 +88,7 @@ echo "==> resume token has dump+restore marked complete"
 # RUN #2: resume — skip dump+restore, jump to apply
 # ═══════════════════════════════════════════════════════════════════════════
 echo "==> RUN #2: launching migrator with RESUME=1"
-launch_online_migrator "$LOG2" PG_MIGRATOR_RESUME=1
+launch_online_migrator "$LOG2" PG_DBMIGRATOR_RESUME=1
 
 echo "==> waiting for apply phase in run #2"
 APPLY2_LINE=$(wait_for_log_match "$LOG2" "replication lag" 0 180)

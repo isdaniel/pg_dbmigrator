@@ -1,3 +1,3 @@
 [alias]
-# Run the CLI from the workspace root: `cargo pg_migrator -- --mode offline ...`
-pg_migrator = "run --bin pg_migrator --"
+# Run the CLI from the workspace root: `cargo pg_dbmigrator -- --mode offline ...`
+pg_dbmigrator = "run --bin pg_dbmigrator --"

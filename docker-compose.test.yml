@@ -1,7 +1,7 @@
 services:
   source-db:
     image: postgres:17-alpine
-    container_name: pg_migrator_source
+    container_name: pg_dbmigrator_source
     environment:
       POSTGRES_USER: migrator
       POSTGRES_PASSWORD: migrator
@@ -22,7 +22,7 @@ services:
 
   target-db:
     image: postgres:17-alpine
-    container_name: pg_migrator_target
+    container_name: pg_dbmigrator_target
     environment:
       POSTGRES_USER: migrator
       POSTGRES_PASSWORD: migrator

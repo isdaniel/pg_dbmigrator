@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use args::Cli;
 use clap::Parser;
-use pg_migrator::{
+use pg_dbmigrator::{
     progress::{JsonReporter, ProgressReporter, TracingReporter},
     CutoverHandle, MigrationMode, Migrator,
 };
@@ -101,7 +101,7 @@ fn spawn_signal_handler(mode: MigrationMode, handle: CutoverHandle, cancel: Canc
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,pg_migrator=info,pg_walstream=info"));
+        .unwrap_or_else(|_| EnvFilter::new("info,pg_dbmigrator=info,pg_walstream=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

@@ -1028,7 +1028,7 @@ name = "offline_migration_example"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "pg_migrator",
+ "pg_dbmigrator",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1052,7 +1052,7 @@ name = "online_migration_example"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "pg_migrator",
+ "pg_dbmigrator",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1101,7 +1101,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pg_migrator"
+name = "pg_dbmigrator"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1126,12 +1126,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_migrator-cli"
+name = "pg_dbmigrator-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "pg_migrator",
+ "pg_dbmigrator",
  "tokio",
  "tokio-util",
  "tracing",
