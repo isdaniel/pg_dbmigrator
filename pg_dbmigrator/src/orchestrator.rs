@@ -869,10 +869,11 @@ mod tests {
             called: AtomicBool::new(false),
         });
         let reporter = Arc::new(CollectingReporter::new());
+        let temp_dir = tempfile::tempdir().unwrap();
         let migrator = Migrator::new(baseline_config())
             .with_runner(runner)
             .with_reporter(reporter)
-            .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_cancel_test"));
+            .with_dump_path(temp_dir.path().join("cancel_test"));
 
         let err = migrator.run(cancel).await.unwrap_err();
         assert!(matches!(err, MigrationError::Cancelled));

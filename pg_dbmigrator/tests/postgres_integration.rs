@@ -33,14 +33,16 @@ macro_rules! skip_without_pg {
 
 // ─── tls::connect_with_sslmode ────────────────────────────────────────────────
 
+fn append_sslmode_disable(raw: &str) -> String {
+    let mut parsed = url::Url::parse(raw).expect("valid URL");
+    parsed.query_pairs_mut().append_pair("sslmode", "disable");
+    parsed.to_string()
+}
+
 #[tokio::test]
 async fn connect_source_with_sslmode_disable() {
     let url = skip_without_pg!(source_url());
-    let conn_str = if url.contains('?') {
-        format!("{url}&sslmode=disable")
-    } else {
-        format!("{url}?sslmode=disable")
-    };
+    let conn_str = append_sslmode_disable(&url);
     let client = connect_with_sslmode(&conn_str).await.unwrap();
     let row = client.query_one("SELECT 1 AS x", &[]).await.unwrap();
     let x: i32 = row.get(0);
@@ -50,11 +52,7 @@ async fn connect_source_with_sslmode_disable() {
 #[tokio::test]
 async fn connect_target_with_sslmode_disable() {
     let url = skip_without_pg!(target_url());
-    let conn_str = if url.contains('?') {
-        format!("{url}&sslmode=disable")
-    } else {
-        format!("{url}?sslmode=disable")
-    };
+    let conn_str = append_sslmode_disable(&url);
     let client = connect_with_sslmode(&conn_str).await.unwrap();
     let row = client.query_one("SELECT version()", &[]).await.unwrap();
     let ver: String = row.get(0);
