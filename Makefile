@@ -22,7 +22,7 @@ deps-bump-dry:
 
 check:
 	cargo check
-#	cargo clippy -- -D warnings
+	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 build:
 	cargo build
@@ -39,7 +39,7 @@ test:
 doc-check:
 	cargo doc --no-deps --all-features
 
-before-git-push: check build format audit test doc-check
+before-git-push: check build format audit test doc-check 
 
 integration:
 	bash tests/integration/run_all.sh all

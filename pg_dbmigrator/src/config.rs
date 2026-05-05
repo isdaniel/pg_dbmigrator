@@ -676,4 +676,249 @@ mod tests {
         assert!(cfg.exclude_schemas.is_empty());
         assert!(cfg.exclude_tables.is_empty());
     }
+
+    #[test]
+    fn default_jobs_returns_value_in_valid_range() {
+        let j = default_jobs();
+        assert!((1..=8).contains(&j));
+    }
+
+    #[test]
+    fn migration_config_default_performance_fields() {
+        let cfg = MigrationConfig::default();
+        assert!(cfg.split_sections);
+        assert_eq!(cfg.dump_compress, Some("lz4:1".to_string()));
+        assert!(cfg.no_sync);
+        assert!(cfg.no_comments);
+        assert!(cfg.no_security_labels);
+        assert!(!cfg.no_table_access_method);
+        assert!(cfg.no_publications);
+        assert!(cfg.no_subscriptions);
+    }
+
+    #[test]
+    fn validate_rejects_empty_source() {
+        let cfg = MigrationConfig {
+            source: EndpointConfig::default(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            ..MigrationConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("source connection string is empty"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_target() {
+        let cfg = MigrationConfig {
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::default(),
+            ..MigrationConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("target connection string is empty"));
+    }
+
+    #[test]
+    fn validate_rejects_resume_without_dump_path() {
+        let cfg = MigrationConfig {
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            resume: true,
+            dump_path: None,
+            ..MigrationConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("--resume requires --dump-path"));
+    }
+
+    #[test]
+    fn validate_accepts_valid_offline_config() {
+        let cfg = MigrationConfig {
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            ..MigrationConfig::default()
+        };
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_online_propagates_online_options_error() {
+        let cfg = MigrationConfig {
+            mode: MigrationMode::Online,
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            online: OnlineOptions {
+                slot_name: String::new(),
+                ..OnlineOptions::default()
+            },
+            ..MigrationConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("slot_name"));
+    }
+
+    #[test]
+    fn cutover_config_rejects_zero_fast_poll_interval() {
+        let c = CutoverConfig {
+            fast_poll_interval: Duration::from_secs(0),
+            ..CutoverConfig::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("fast_poll_interval"));
+    }
+
+    #[test]
+    fn migration_config_serde_roundtrip() {
+        let cfg = MigrationConfig {
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            ..MigrationConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: MigrationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg2.jobs, cfg.jobs);
+        assert_eq!(cfg2.split_sections, cfg.split_sections);
+        assert_eq!(cfg2.dump_compress, cfg.dump_compress);
+        assert_eq!(cfg2.no_sync, cfg.no_sync);
+        assert_eq!(cfg2.mode as u8, cfg.mode as u8);
+    }
+
+    #[test]
+    fn endpoint_config_parses_query_params() {
+        let ep =
+            EndpointConfig::parse("postgresql://u:p@h:5432/db?sslmode=require&application_name=x")
+                .unwrap();
+        assert_eq!(ep.database, "db");
+        assert!(ep.connection_string.contains("sslmode=require"));
+    }
+
+    #[test]
+    fn replication_apply_config_defaults() {
+        let c = ReplicationApplyConfig::default();
+        assert_eq!(c.feedback_interval, Duration::from_secs(10));
+        assert_eq!(c.connection_timeout, Duration::from_secs(30));
+        assert_eq!(c.health_check_interval, Duration::from_secs(60));
+        assert!(c.max_runtime_seconds.is_none());
+    }
+
+    #[test]
+    fn online_options_protocol_version_boundary() {
+        let opts_zero = OnlineOptions {
+            protocol_version: 0,
+            ..OnlineOptions::default()
+        };
+        assert!(opts_zero.validate().is_err());
+
+        let opts_five = OnlineOptions {
+            protocol_version: 5,
+            ..OnlineOptions::default()
+        };
+        assert!(opts_five.validate().is_err());
+
+        let opts_four = OnlineOptions {
+            protocol_version: 4,
+            ..OnlineOptions::default()
+        };
+        assert!(opts_four.validate().is_ok());
+
+        let opts_one = OnlineOptions {
+            protocol_version: 1,
+            ..OnlineOptions::default()
+        };
+        assert!(opts_one.validate().is_ok());
+    }
+
+    #[test]
+    fn migration_config_deserializes_with_defaults_for_missing_fields() {
+        let json = r#"{
+            "mode": "Offline",
+            "source": {"connection_string":"postgres://u@s/db","host":"s","port":5432,"database":"db","user":"u","password":""},
+            "target": {"connection_string":"postgres://u@t/db","host":"t","port":5432,"database":"db","user":"u","password":""},
+            "dump_scope": "All",
+            "drop_target_first": false,
+            "jobs": 4,
+            "schemas": [],
+            "tables": [],
+            "online": {
+                "slot_name": "slot",
+                "publication": "pub",
+                "protocol_version": 2,
+                "subscription_name": "sub",
+                "drop_subscription_on_cutover": true,
+                "force_clean": false,
+                "sync_sequences_on_cutover": true,
+                "apply": {"feedback_interval":10,"connection_timeout":30,"health_check_interval":60,"max_runtime_seconds":null},
+                "cutover": {"poll_interval":5,"fast_poll_interval":1,"lag_threshold_bytes":8192}
+            },
+            "allow_restore_errors": false,
+            "verbose": false,
+            "resume": false
+        }"#;
+        let cfg: MigrationConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.no_publications);
+        assert!(cfg.no_subscriptions);
+        assert!(cfg.split_sections);
+        assert_eq!(cfg.dump_compress, Some("lz4:1".to_string()));
+        assert!(cfg.no_sync);
+        assert!(cfg.no_comments);
+        assert!(cfg.no_security_labels);
+        assert!(!cfg.no_table_access_method);
+        assert!(cfg.exclude_schemas.is_empty());
+        assert!(cfg.exclude_tables.is_empty());
+    }
+
+    #[test]
+    fn migration_config_serialize_with_none_compress() {
+        let cfg = MigrationConfig {
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            dump_compress: None,
+            ..MigrationConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"dump_compress\":null"));
+        let cfg2: MigrationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg2.dump_compress, None);
+    }
+
+    #[test]
+    fn endpoint_config_parse_url_encoded_password() {
+        let ep = EndpointConfig::parse("postgresql://user:p%40ss%23w0rd@host/db").unwrap();
+        assert_eq!(ep.password, "p%40ss%23w0rd");
+        assert_eq!(ep.user, "user");
+        assert_eq!(ep.host, "host");
+    }
+
+    #[test]
+    fn endpoint_config_default_has_empty_fields() {
+        let ep = EndpointConfig::default();
+        assert!(ep.connection_string.is_empty());
+        assert!(ep.host.is_empty());
+        assert_eq!(ep.port, 0);
+        assert!(ep.database.is_empty());
+        assert!(ep.user.is_empty());
+        assert!(ep.password.is_empty());
+    }
+
+    #[test]
+    fn online_options_default_force_clean_is_false() {
+        let opts = OnlineOptions::default();
+        assert!(!opts.force_clean);
+        assert!(opts.subscription_source_conn.is_none());
+    }
+
+    #[test]
+    fn validate_accepts_valid_online_config() {
+        let cfg = MigrationConfig {
+            mode: MigrationMode::Online,
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            ..MigrationConfig::default()
+        };
+        cfg.validate().unwrap();
+    }
 }

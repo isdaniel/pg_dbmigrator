@@ -10,7 +10,7 @@ name = "offline_migration_example"
 path = "src/main.rs"
 
 [dependencies]
-pg_dbmigrator = { path = "../../crates/pg_dbmigrator" }
+pg_dbmigrator = { path = "../../pg_dbmigrator" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

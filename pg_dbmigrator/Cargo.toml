@@ -4,12 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Library for migrating PostgreSQL databases (offline dump/restore + online logical replication)"
+description = "PostgreSQL database migration tool and library (offline dump/restore + online logical replication)"
 repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["database", "command-line-utilities"]
 
 [lib]
 name = "pg_dbmigrator"
 path = "src/lib.rs"
+
+[[bin]]
+name = "pg_dbmigrator"
+path = "src/bin/pg_dbmigrator/main.rs"
 
 [dependencies]
 tokio = { workspace = true }
@@ -17,6 +24,7 @@ tokio-util = { workspace = true }
 tokio-postgres = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,6 +36,8 @@ pg_walstream = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
