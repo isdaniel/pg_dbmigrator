@@ -16,7 +16,7 @@
 #   3. Wait for first 'ready for cutover'.
 #   4. INSERT 200 more rows via DEFAULT nextval — sequence advances on
 #      source from 100 to 300.
-#   5. Wait for second 'ready for cutover' AND target row count == 300.
+#   5. Wait for target row count == 300 AND replication lag == 0 bytes.
 #   6. SIGINT → cutover (this triggers the sequence sync step).
 #   7. On the target, run `INSERT ... DEFAULT` — assert it succeeds and
 #      produces id >= 301 (NO collision with replicated row 300).
@@ -64,13 +64,21 @@ if [[ "$src_seq_before" != "$EXPECTED_EVENTS" ]]; then
 fi
 
 # ── Phase 3: wait for stream to catch up & target rows to land ───────────
-echo "==> waiting for SECOND 'ready for cutover'"
-SECOND_LINE=$(wait_for_log_match "$LOG_FILE" "ready for cutover" "$FIRST_LINE" 600)
-echo "==> got second 'ready for cutover' on line $SECOND_LINE"
-
+# Wait for target row count first — this is the authoritative signal that
+# all 200 inserts have been replicated. We cannot reliably wait for a second
+# "ready for cutover" transition because the LagSampler only emits it on a
+# JustCaughtUp edge (FellBehind→CaughtUp). With a 1s poll interval the
+# apply worker can consume all rows between polls, so the lag spike is never
+# observed and the transition never fires.
 echo "==> waiting for target.app.events to reach $EXPECTED_EVENTS rows"
 wait_for_table_count "$TARGET_URL" "app.events" "$EXPECTED_EVENTS" 300 >/dev/null
 echo "==> target reached $EXPECTED_EVENTS events"
+
+# Now wait for a heartbeat confirming lag=0 — proves the apply worker has
+# fully caught up, not just that rows landed (could still be mid-batch).
+echo "==> waiting for replication lag 0 heartbeat after inserts landed"
+CAUGHT_UP_LINE=$(wait_for_log_match "$LOG_FILE" "replication lag 0 bytes" "$FIRST_LINE" 120)
+echo "==> confirmed lag=0 on line $CAUGHT_UP_LINE"
 
 # ── Phase 4: confirm target sequence is BEHIND before cutover ────────────
 # (Sanity check: this proves we're actually testing the sync step.)

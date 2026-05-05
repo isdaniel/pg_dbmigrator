@@ -76,7 +76,8 @@ async fn main() -> Result<()> {
     let target = env::var("PG_DBMIGRATOR_TARGET").context("PG_DBMIGRATOR_TARGET must be set")?;
 
     let online = OnlineOptions {
-        slot_name: env::var("PG_DBMIGRATOR_SLOT_NAME").unwrap_or_else(|_| "pg_dbmigrator_slot".into()),
+        slot_name: env::var("PG_DBMIGRATOR_SLOT_NAME")
+            .unwrap_or_else(|_| "pg_dbmigrator_slot".into()),
         publication: env::var("PG_DBMIGRATOR_PUBLICATION")
             .unwrap_or_else(|_| "pg_dbmigrator_pub".into()),
         protocol_version: 2,
@@ -121,7 +122,9 @@ async fn main() -> Result<()> {
         jobs: 4,
         online,
         resume: env_flag("PG_DBMIGRATOR_RESUME"),
-        resume_file: env::var("PG_DBMIGRATOR_RESUME_FILE").ok().map(PathBuf::from),
+        resume_file: env::var("PG_DBMIGRATOR_RESUME_FILE")
+            .ok()
+            .map(PathBuf::from),
         dump_path: env::var("PG_DBMIGRATOR_DUMP_PATH").ok().map(PathBuf::from),
         ..MigrationConfig::default()
     };

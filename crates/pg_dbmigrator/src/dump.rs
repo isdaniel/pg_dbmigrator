@@ -71,6 +71,15 @@ pub struct DumpRequest {
     /// transient artefact consumed by `pg_restore` immediately afterwards —
     /// fsyncing every output file on close is pure I/O overhead.
     pub no_sync: bool,
+    /// Pass `--no-comments` to `pg_dump`. Default `true`. Skips COMMENT ON
+    /// statements that are rarely needed on the migration target.
+    pub no_comments: bool,
+    /// Pass `--no-security-labels` to `pg_dump`. Default `true`. Skips
+    /// SE-Linux security labels that are typically irrelevant on the target.
+    pub no_security_labels: bool,
+    /// Pass `--no-table-access-method` to `pg_dump`. Default `false`.
+    /// PG 15+ — omits `USING <am>` clauses from CREATE TABLE.
+    pub no_table_access_method: bool,
 }
 
 /// `pg_dump` archive format.
@@ -159,6 +168,15 @@ pub fn build_pg_dump_args(req: &DumpRequest) -> Vec<String> {
     }
     if req.no_sync {
         args.push("--no-sync".into());
+    }
+    if req.no_comments {
+        args.push("--no-comments".into());
+    }
+    if req.no_security_labels {
+        args.push("--no-security-labels".into());
+    }
+    if req.no_table_access_method {
+        args.push("--no-table-access-method".into());
     }
 
     args
@@ -403,6 +421,9 @@ mod tests {
             no_subscriptions: true,
             compress: None,
             no_sync: true,
+            no_comments: true,
+            no_security_labels: true,
+            no_table_access_method: false,
         }
     }
 
@@ -523,6 +544,48 @@ mod tests {
     fn build_args_omits_compress_when_unset() {
         let args = build_pg_dump_args(&base_request());
         assert!(!args.iter().any(|a| a.starts_with("--compress=")));
+    }
+
+    #[test]
+    fn build_args_includes_no_comments_by_default() {
+        let args = build_pg_dump_args(&base_request());
+        assert!(args.iter().any(|a| a == "--no-comments"));
+    }
+
+    #[test]
+    fn build_args_omits_no_comments_when_disabled() {
+        let mut req = base_request();
+        req.no_comments = false;
+        let args = build_pg_dump_args(&req);
+        assert!(!args.iter().any(|a| a == "--no-comments"));
+    }
+
+    #[test]
+    fn build_args_includes_no_security_labels_by_default() {
+        let args = build_pg_dump_args(&base_request());
+        assert!(args.iter().any(|a| a == "--no-security-labels"));
+    }
+
+    #[test]
+    fn build_args_omits_no_security_labels_when_disabled() {
+        let mut req = base_request();
+        req.no_security_labels = false;
+        let args = build_pg_dump_args(&req);
+        assert!(!args.iter().any(|a| a == "--no-security-labels"));
+    }
+
+    #[test]
+    fn build_args_omits_no_table_access_method_by_default() {
+        let args = build_pg_dump_args(&base_request());
+        assert!(!args.iter().any(|a| a == "--no-table-access-method"));
+    }
+
+    #[test]
+    fn build_args_includes_no_table_access_method_when_enabled() {
+        let mut req = base_request();
+        req.no_table_access_method = true;
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--no-table-access-method"));
     }
 
     /// Simple [`CommandRunner`] used in tests to assert on the command line

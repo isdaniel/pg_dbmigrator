@@ -66,18 +66,17 @@ pub struct MigrationConfig {
     /// then rebuilds every index in parallel against fully-loaded tables.
     /// On schemas with many secondary indexes this is typically 30–60 %
     /// faster than the default. Requires a directory- or custom-format
-    /// dump (i.e. not [`crate::dump::DumpFormat::Plain`]). Default
-    /// `false` so the legacy single-call behaviour is preserved.
-    #[serde(default)]
+    /// dump (i.e. not [`crate::dump::DumpFormat::Plain`]). Default `true`.
+    #[serde(default = "default_true")]
     pub split_sections: bool,
     /// Optional `--compress=<spec>` value forwarded to `pg_dump`. PG 16+
     /// accepts `gzip:N`, `lz4:N`, `zstd:N`, or `none`; older versions
     /// accept `0..=9`. Trades a small amount of source-side CPU for a 3–10×
     /// reduction in archive size — a clear win whenever the source ↔
-    /// migrator hop crosses a region or VPN boundary. `None` leaves
-    /// `pg_dump`'s built-in default in place. Default `None` to keep
-    /// behaviour predictable across heterogeneous-PG-version sources.
-    #[serde(default)]
+    /// migrator hop crosses a region or VPN boundary. Default `lz4:1`
+    /// (negligible CPU overhead, 3–5× size reduction on typical data).
+    /// Pass `--dump-compress none` to disable.
+    #[serde(default = "default_compress")]
     pub dump_compress: Option<String>,
     /// Pass `--no-sync` to `pg_dump`. Default `true`. The dump archive
     /// is a transient artefact — fsyncing every output file is pure I/O
@@ -87,6 +86,27 @@ pub struct MigrationConfig {
     /// exists for `pg_restore`.)
     #[serde(default = "default_true")]
     pub no_sync: bool,
+    /// Pass `--no-comments` to `pg_dump`. Default `true`. COMMENT ON
+    /// statements are rarely needed on the target and add both dump
+    /// size and restore time — skipping them is a free performance win
+    /// for the common migration case. Set to `false` only when the
+    /// target must carry over all user-defined comments from the source.
+    #[serde(default = "default_true")]
+    pub no_comments: bool,
+    /// Pass `--no-security-labels` to `pg_dump`. Default `true`.
+    /// Security labels (SE-Linux row-level security labels) are almost
+    /// never relevant on the migration target and can add overhead.
+    /// Set to `false` only when the target uses SE-Linux label-based
+    /// access control identical to the source's.
+    #[serde(default = "default_true")]
+    pub no_security_labels: bool,
+    /// Pass `--no-table-access-method` to `pg_dump`. Default `false`.
+    /// PG 15+ supports this flag — it omits `USING <access_method>`
+    /// clauses from CREATE TABLE statements. Useful when the target
+    /// does not have the same access method extensions installed.
+    /// Leave `false` unless you know the target lacks the source's AMs.
+    #[serde(default)]
+    pub no_table_access_method: bool,
     /// If `true`, attempt to resume a previous run by reading the
     /// resume token at [`Self::resume_file`] (default
     /// `<dump_path>.resume.json`). Stages already marked complete in the
@@ -113,6 +133,10 @@ pub struct MigrationConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_compress() -> Option<String> {
+    Some("lz4:1".into())
 }
 
 /// Pick a sensible default for `pg_dump --jobs` / `pg_restore --jobs`.
@@ -147,9 +171,12 @@ impl Default for MigrationConfig {
             allow_restore_errors: false,
             no_publications: true,
             no_subscriptions: true,
-            split_sections: false,
-            dump_compress: None,
+            split_sections: true,
+            dump_compress: default_compress(),
             no_sync: true,
+            no_comments: true,
+            no_security_labels: true,
+            no_table_access_method: false,
             resume: false,
             resume_file: None,
             dump_path: None,

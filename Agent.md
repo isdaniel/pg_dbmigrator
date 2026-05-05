@@ -55,12 +55,12 @@ examples/online_migration/
 | File                                                                       | Responsibility                                                              |
 | -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | [crates/pg_dbmigrator/src/lib.rs](crates/pg_dbmigrator/src/lib.rs)                   | Crate entry point, re-exports, `#![deny]`/`#![warn]` lints                  |
-| [crates/pg_dbmigrator/src/config.rs](crates/pg_dbmigrator/src/config.rs)             | `MigrationConfig` / `EndpointConfig` / `OnlineOptions` and validation       |
+| [crates/pg_dbmigrator/src/config.rs](crates/pg_dbmigrator/src/config.rs)             | `MigrationConfig` / `EndpointConfig` / `OnlineOptions` and validation. Performance defaults: `split_sections`, `dump_compress`, `no_sync`, `no_comments`, `no_security_labels` |
 | [crates/pg_dbmigrator/src/error.rs](crates/pg_dbmigrator/src/error.rs)               | `MigrationError` (`thiserror`) + `Result<T>` alias                          |
 | [crates/pg_dbmigrator/src/dump.rs](crates/pg_dbmigrator/src/dump.rs)                 | `pg_dump` wrapper, `CommandRunner` trait, pure argv builder                 |
 | [crates/pg_dbmigrator/src/restore.rs](crates/pg_dbmigrator/src/restore.rs)           | `pg_restore` / `psql` wrapper                                               |
 | [crates/pg_dbmigrator/src/snapshot.rs](crates/pg_dbmigrator/src/snapshot.rs)         | Replication slot creation + exported snapshot retrieval                     |
-| [crates/pg_dbmigrator/src/native_apply.rs](crates/pg_dbmigrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn` |
+| [crates/pg_dbmigrator/src/native_apply.rs](crates/pg_dbmigrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn`, `wait_for_slot_inactive`, `disable_target_subscription` |
 | [crates/pg_dbmigrator/src/orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
 | [crates/pg_dbmigrator/src/progress.rs](crates/pg_dbmigrator/src/progress.rs)         | `ProgressReporter` trait + Tracing/Collecting implementations               |
 | [crates/pg_dbmigrator/src/preflight.rs](crates/pg_dbmigrator/src/preflight.rs)       | Pre-migration checks (target empty, source `wal_level=logical`, slot/sender capacity) |
@@ -72,7 +72,7 @@ examples/online_migration/
 (stages marked `*` are Online-only). Any new stage must be added in **both**
 [progress.rs](crates/pg_dbmigrator/src/progress.rs) (the enum) and
 [orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs) /
-[replicate.rs](crates/pg_dbmigrator/src/replicate.rs) (the reporting site).
+[native_apply.rs](crates/pg_dbmigrator/src/native_apply.rs) (the reporting site).
 
 ### Online cutover model
 
@@ -102,6 +102,28 @@ Cutover is **always operator-driven**: the apply loop never exits on
 `CaughtUp` alone. The `lag_threshold_bytes` knob is purely advisory —
 it controls when the one-shot `CaughtUp` event fires, never whether the
 loop terminates.
+
+### Online resume flow (cancel + resume)
+
+When the migrator is interrupted (SIGTERM / crash) during the apply phase
+and restarted with `--resume`:
+
+1. The orchestrator loads the resume token (dump+restore already marked
+   complete) and **skips** dump+restore entirely.
+2. Instead of dropping the existing subscription (which would lose the
+   replication origin and cause duplicate-key violations on replay), it
+   calls `disable_target_subscription` — issuing `ALTER SUBSCRIPTION ... DISABLE`
+   on the target so the old apply worker releases the slot.
+3. `wait_for_slot_inactive` polls `pg_replication_slots.active` on the
+   source until the slot is free (30 s timeout with 500 ms polling).
+4. `run_native_apply` detects the subscription already exists and
+   re-enables it in place (`ALTER SUBSCRIPTION ... ENABLE`), preserving
+   the replication origin. The apply worker resumes from the slot's
+   `confirmed_flush_lsn` — no data loss, no conflicts.
+
+This flow supports **multiple consecutive cancel+resume cycles** without
+data loss. Key invariant: the slot on the source is never dropped during
+a cancel — only the subscription's apply worker is stopped.
 
 ### Sequence sync at cutover (online only)
 
@@ -141,6 +163,49 @@ mode still captures their changes via the slot if they are in the
 publication, so combine with a narrower `pg_dbmigrator_pub` definition
 for full coverage.
 
+### Performance defaults
+
+The migrator ships with aggressive-but-safe performance defaults that
+reduce total migration time by 30–60 % compared to vanilla `pg_dump`/
+`pg_restore` without any user tuning:
+
+| Default                  | Effect                                              | Override                   |
+| ------------------------ | --------------------------------------------------- | -------------------------- |
+| `split_sections = true`  | Index-free COPY + parallel index rebuild            | `--no-split-sections`      |
+| `dump_compress = lz4:1`  | 3–5× dump size reduction, negligible CPU overhead   | `--dump-compress none`     |
+| `no_sync = true`         | Skip fsync on transient dump archive                | `--keep-sync`              |
+| `no_comments = true`     | Skip `COMMENT ON` — rarely needed post-migration    | `--keep-comments`          |
+| `no_security_labels = true` | Skip SE-Linux labels                             | `--keep-security-labels`   |
+| `no_publications = true` | Skip publication DDL from source                    | `--keep-publications`      |
+| `no_subscriptions = true`| Skip subscription DDL from source                   | `--keep-subscriptions`     |
+| `jobs = min(cpu_count, 8)` | Parallel dump/restore up to 8 workers            | `--jobs N`                 |
+
+Optional opt-in flags:
+- `--no-table-access-method` (PG 15+) — omit `USING <am>` from CREATE TABLE
+- `--dump-compress zstd:3` — better ratio than lz4, slightly more CPU
+
+### Integration test coverage
+
+All integration tests live in `tests/integration/` as **shell scripts** (not
+Rust integration tests). This is deliberate — the tests exercise the full
+binary end-to-end against Docker-composed PostgreSQL 17 instances (source on
+`:55432`, target on `:55433`). The Rust library contains only pure unit tests
+that never require a running database.
+
+| Script                              | Scenario                                                                                       |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `run_offline.sh`                    | Simple offline dump → restore                                                                  |
+| `run_offline_split_sections.sh`     | Offline with `--split-sections` (pre-data/data/post-data)                                      |
+| `run_offline_resume.sh`             | Offline cancel + resume (resume token skips completed stages)                                  |
+| `run_offline_sigint_cancel.sh`      | SIGINT mid-pg_dump → fast cancellation                                                         |
+| `run_online.sh`                     | Full online: seed → dump → restore → apply → two CaughtUp transitions → cutover               |
+| `run_online_updates.sh`             | Online with UPDATE/DELETE/INSERT during dump+restore window, cutover, data equality check       |
+| `run_online_sustained.sh`           | 60s sustained mutations during apply, pre-cutover equality gate, post-cutover stability        |
+| `run_online_lag_cadence.sh`         | Adaptive fast/slow poll cadence near catch-up                                                  |
+| `run_online_cancel_resume.sh`       | Cancel mid-apply (SIGTERM) + resume (skip dump/restore, re-attach slot, data equality)         |
+| `run_online_multi_resume_sustained.sh` | 2× cancel+resume + 30s sustained mutations + pre-cutover equality + cutover                 |
+| `run_online_sequence_sync.sh`       | Sequence sync at cutover (no post-cutover PK collision)                                        |
+
 ---
 
 ## 2. Design Principles (mandatory reading)
@@ -156,7 +221,7 @@ for full coverage.
    - Anything that spawns a process or opens a socket must sit behind a
      trait (e.g. `CommandRunner`, `ProgressReporter`).
    - Pure functions (`build_pg_dump_args`, `build_pg_restore_args`,
-     `ensure_replication_qs`, `statement_for`) **must not** perform I/O so
+     `make_create_subscription_sql`, `parse_pg_lsn`) **must not** perform I/O so
      that unit tests can validate them without PostgreSQL.
 
 3. **Configuration as data**
@@ -171,8 +236,6 @@ for full coverage.
      checks `cancel.is_cancelled()` before each loop iteration.
    - Cancellation is part of the success path; if you must return an error
      for it, use `MigrationError::Cancelled` so the upper layer can detect it.
-     See the `is_cancellation` helper in
-     [replicate.rs](crates/pg_dbmigrator/src/replicate.rs#L40).
 
 5. **Connection-string secrecy**
    - `EndpointConfig` keeps the original libpq URI verbatim. **Always** call
@@ -257,7 +320,7 @@ When adding a new `pub` type:
 
 - One responsibility per module. Each file starts with a `//!` doc comment
   describing **why the module exists** and **what it deliberately does not
-  do**. See [apply.rs](crates/pg_dbmigrator/src/apply.rs#L1-L15) for the pattern.
+  do**. See [native_apply.rs](crates/pg_dbmigrator/src/native_apply.rs#L1-L19) for the pattern.
 - File ordering: `use` → public types → public functions → private helpers
   → `#[cfg(test)] mod tests`.
 - Do not introduce `mod.rs`-style folders; keep the flat `lib.rs` + sibling
@@ -287,11 +350,11 @@ When adding a new `pub` type:
     [orchestrator.rs](crates/pg_dbmigrator/src/orchestrator.rs#L246-L276)).
   - Use `CollectingReporter` for progress tests
     ([progress.rs](crates/pg_dbmigrator/src/progress.rs#L83)).
-  - Use `statement_for(&event)` for SQL translation assertions.
+  - Use `StaticLagProvider` for lag-loop cadence tests.
 - Modifying any pure function (`build_pg_dump_args`,
-  `build_pg_restore_args`, `statement_for`, `ensure_replication_qs`)
+  `build_pg_restore_args`, `make_create_subscription_sql`, `parse_pg_lsn`)
   **requires** updating or adding the corresponding tests in the same PR.
-- Integration scenarios live in [examples/](examples/); they double as docs
+- Integration scenarios live in `tests/integration/` as shell scripts;
   and smoke tests and may connect to a real database.
 
 ### Test commands
@@ -310,6 +373,19 @@ RUST_LOG=debug cargo test -p pg_dbmigrator -- --nocapture
 > `cargo test --workspace` must pass **without** a running PostgreSQL.
 > If a new test genuinely needs a live database, move it under examples/
 > or mark it `#[ignore]`.
+
+### CI pipeline
+
+`.github/workflows/ci.yml` runs on every push/PR:
+
+1. **build-and-unit-test** — fmt, clippy, build, `cargo test --workspace`
+2. **integration-offline** (+ split-sections, resume, SIGINT cancel variants)
+3. **integration-online** (+ updates, sustained, lag-cadence, cancel-resume, multi-resume, sequence-sync)
+4. **publish** — gated on tag `v*.*.*`, publishes `pg_dbmigrator` then `pg_dbmigrator-cli` to crates.io
+
+All integration jobs use `.github/actions/setup-integration` which starts
+the Docker Compose stack (`docker-compose.test.yml`: source PG 17 on `:55432`,
+target PG 17 on `:55433`) and installs PostgreSQL client tools.
 
 ---
 
@@ -363,9 +439,9 @@ When you receive a new requirement, work in this order:
   the `PGPASSWORD` environment variable (see
   [dump.rs](crates/pg_dbmigrator/src/dump.rs#L165-L172)). **Do not** put it in
   argv where `ps` could expose it.
-- SQL injection surface: `apply::statement_for` uses quoted identifiers
-  (`quote_ident`) and parameter placeholders (`$1`, `$2`, …). **Do not**
-  switch to string concatenation for values.
+- SQL injection surface: `native_apply` and `sequences` use `quote_ident`
+  / `quote_literal` from `pg_walstream` for identifiers and string
+  literals. **Do not** switch to string concatenation for values.
 - Cancellation means the user wants to stop. After cancel, do not send
   feedback, write files, or take other actions that could leave partial
   state behind.

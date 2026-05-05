@@ -5,10 +5,11 @@
 #   2. Launch migrator (first run) with pinned dump path.
 #   3. Wait for apply phase, start mutation loop.
 #   4. Continue mutations for 5s while apply is live.
-#   5. SIGINT → graceful cutover (first run exits cleanly).
+#   5. SIGTERM → hard kill (simulates crash/interruption mid-apply).
 #   6. Verify the resume token exists with dump+restore marked complete.
 #   7. Resume: relaunch with PG_DBMIGRATOR_RESUME=1.
-#   8. Wait for apply phase to restart.
+#   8. Wait for apply phase to restart (resume picks up from the slot's
+#      confirmed position — no data loss, no conflicts).
 #   9. Stop mutations, wait for target == source content.
 #  10. SIGINT → graceful cutover.
 #  11. Assert source == target (row count + content hash).
@@ -62,9 +63,16 @@ echo "==> apply phase started on line $APPLY_LINE"
 echo "==> continuing mutations for 5s while apply is live"
 sleep 5
 
-echo "==> sending SIGINT to trigger cutover (run #1)"
-sigint_and_wait "$LOG1"
-echo "==> RUN #1 exited"
+# Hard-kill run #1 to simulate a crash/interruption. We use SIGTERM (not
+# SIGINT) because SIGINT triggers a graceful cutover that drops the
+# subscription — making "resume" semantically wrong (you don't resume
+# something that already completed). SIGTERM leaves the subscription and
+# slot intact so run #2 can pick up from the slot's confirmed position.
+echo "==> sending SIGTERM to kill run #1 (simulating crash)"
+kill -TERM "$MIGRATOR_PID" 2>/dev/null || true
+wait "$MIGRATOR_PID" 2>/dev/null || true
+unset MIGRATOR_PID
+echo "==> RUN #1 terminated"
 
 # Verify resume token exists
 RESUME_FILE="$DUMP_PATH.resume.json"
@@ -111,8 +119,14 @@ sleep 2
 src_count=$(query_count "$SOURCE_URL")
 echo "==> source row count after mutations: $src_count"
 
+# Wait for lag to reach 0 — this proves the apply worker has processed all
+# outstanding WAL. Only then compare content hashes.
+echo "==> waiting for replication lag to reach 0 in run #2"
+LAG_ZERO_LINE=$(wait_for_log_match "$LOG2" "replication lag 0 bytes" "$APPLY2_LINE" 300)
+echo "==> lag=0 confirmed on line $LAG_ZERO_LINE"
+
 echo "==> waiting for target to match source (pre-cutover gate)"
-HASH=$(wait_for_content_match "$SOURCE_URL" "$TARGET_URL" 300)
+HASH=$(wait_for_content_match "$SOURCE_URL" "$TARGET_URL" 60)
 echo "==> content hashes match: $HASH"
 
 sigint_and_wait "$LOG2"

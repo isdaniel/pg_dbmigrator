@@ -172,9 +172,14 @@ pub struct Cli {
     /// maintenance during the bulk `COPY` phase and rebuilds every index
     /// in parallel against fully-loaded tables. Typically 30–60 % faster
     /// on schemas with many secondary indexes; requires a directory- or
-    /// custom-format dump.
-    #[arg(long)]
+    /// custom-format dump. Enabled by default.
+    #[arg(long, default_value_t = true)]
     pub split_sections: bool,
+
+    /// Disable split-section restore (use a single all-in-one pg_restore
+    /// call). Overrides the default `--split-sections` behaviour.
+    #[arg(long)]
+    pub no_split_sections: bool,
 
     /// `pg_dump` compression spec passed to `--compress`. Examples:
     /// `gzip:6`, `zstd:3`, `lz4`, `none`. When unset, `pg_dump` picks its
@@ -192,6 +197,12 @@ pub struct Cli {
     /// (Note: `pg_restore` has no equivalent flag.)
     #[arg(long)]
     pub keep_sync: bool,
+
+    /// Pass `--no-table-access-method` to `pg_dump` (PG 15+). Omits
+    /// `USING <access_method>` clauses from CREATE TABLE statements.
+    /// Useful when the target lacks the source's custom table AMs.
+    #[arg(long)]
+    pub no_table_access_method: bool,
 
     /// Verbose logging.
     #[arg(long)]
@@ -282,13 +293,16 @@ impl Cli {
             allow_restore_errors: self.allow_restore_errors,
             no_publications: !self.keep_publications,
             no_subscriptions: !self.keep_subscriptions,
-            split_sections: self.split_sections,
+            split_sections: self.split_sections && !self.no_split_sections,
             resume: self.resume,
             resume_file: self.resume_file,
             dump_path: self.dump_path,
             verbose: self.verbose,
             dump_compress: self.dump_compress,
             no_sync: !self.keep_sync,
+            no_comments: true,
+            no_security_labels: true,
+            no_table_access_method: self.no_table_access_method,
         })
     }
 }

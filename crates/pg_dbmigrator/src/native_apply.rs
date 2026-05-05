@@ -187,6 +187,85 @@ pub async fn force_clean_stale_state(
     Ok(())
 }
 
+/// Poll the source until the replication slot is no longer active. A previous
+/// apply worker may still hold the slot briefly after its subscription was
+/// dropped. Returns Ok(()) once the slot is inactive or absent.
+pub async fn wait_for_slot_inactive(
+    source_conn: &str,
+    slot_name: &str,
+    reporter: &dyn ProgressReporter,
+) -> Result<()> {
+    let client = connect_with_sslmode(source_conn).await?;
+    let stmt = client
+        .prepare("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
+        .await?;
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let mut warned = false;
+
+    loop {
+        let rows = client.query(&stmt, &[&slot_name]).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let active: bool = rows[0].get(0);
+        if !active {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(MigrationError::apply(format!(
+                "replication slot `{slot_name}` is still active after 30s — \
+                 a previous apply worker may not have released it"
+            )));
+        }
+
+        if !warned {
+            warned = true;
+            reporter
+                .report(ProgressEvent::new(
+                    MigrationStage::StreamApply,
+                    format!(
+                        "waiting for replication slot `{slot_name}` to become inactive \
+                         (previous apply worker disconnecting)"
+                    ),
+                ))
+                .await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Disable a subscription on the target without dropping it. This stops the
+/// apply worker so it releases the replication slot, while preserving the
+/// replication origin for a subsequent re-enable. Best-effort: errors are
+/// logged but don't propagate.
+pub async fn disable_target_subscription(target_conn: &str, online: &OnlineOptions) {
+    let Ok(target) = connect_with_sslmode(target_conn).await else {
+        return;
+    };
+    let Ok(sub) = quote_ident(&online.subscription_name) else {
+        return;
+    };
+    let Ok(sub_lit) = quote_literal(&online.subscription_name) else {
+        return;
+    };
+    let sql = format!(
+        "DO $$\n\
+         BEGIN\n\
+            IF EXISTS (SELECT 1 FROM pg_subscription WHERE subname = {sub_lit}) THEN\n\
+                EXECUTE 'ALTER SUBSCRIPTION {sub} DISABLE';\n\
+            END IF;\n\
+         END $$;",
+    );
+    if let Err(e) = target.batch_execute(&sql).await {
+        warn!(error = %e, "failed to disable subscription (continuing)");
+    } else {
+        info!(subscription = %online.subscription_name, "subscription disabled for resume");
+    }
+}
+
 /// Drop only the leftover subscription on the target — leaves the source
 /// slot untouched. Used by the `--resume` path so a half-built apply
 /// stage can be retried without forfeiting the slot's WAL position.
@@ -231,26 +310,38 @@ pub async fn run_native_apply(
         "native engine: creating subscription"
     );
 
-    // Drop any stale subscription left over from a previous (crashed) run.
-    // This is idempotent — if the subscription does not exist the DO block is a no-op.
     let sub = quote_ident(&online.subscription_name)?;
-    let sub_lit = quote_literal(&online.subscription_name)?;
-    let cleanup_sql = format!(
-        "DO $$\n\
-         BEGIN\n\
-            IF EXISTS (SELECT 1 FROM pg_subscription WHERE subname = {sub_lit}) THEN\n\
-                EXECUTE 'ALTER SUBSCRIPTION {sub} DISABLE';\n\
-                EXECUTE 'ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)';\n\
-                EXECUTE 'DROP SUBSCRIPTION {sub}';\n\
-            END IF;\n\
-         END $$;",
-    );
-    if let Err(e) = target_client.batch_execute(&cleanup_sql).await {
-        warn!(error = %e, "failed to clean up stale subscription (continuing)");
-    }
 
-    let create_sql = make_create_subscription_sql(online, source_conn)?;
-    target_client.batch_execute(&create_sql).await?;
+    // Check if the subscription already exists (resume scenario). If it does,
+    // re-enable it in place — this preserves the replication origin so the
+    // apply worker does not re-process WAL events that were already applied.
+    // Dropping + recreating would lose the origin and cause duplicate key
+    // violations on replay.
+    let exists_row = target_client
+        .query(
+            "SELECT 1 FROM pg_subscription WHERE subname = $1",
+            &[&online.subscription_name],
+        )
+        .await?;
+
+    if !exists_row.is_empty() {
+        info!(
+            subscription = %online.subscription_name,
+            "subscription already exists — re-enabling (preserving replication origin)"
+        );
+        let conn_lit = quote_literal(source_conn)?;
+        let slot_lit = quote_literal(&online.slot_name)?;
+        let reattach_sql = format!(
+            "ALTER SUBSCRIPTION {sub} DISABLE;\n\
+             ALTER SUBSCRIPTION {sub} CONNECTION {conn_lit};\n\
+             ALTER SUBSCRIPTION {sub} SET (slot_name = {slot_lit});\n\
+             ALTER SUBSCRIPTION {sub} ENABLE;",
+        );
+        target_client.batch_execute(&reattach_sql).await?;
+    } else {
+        let create_sql = make_create_subscription_sql(online, source_conn)?;
+        target_client.batch_execute(&create_sql).await?;
+    }
 
     let health_stmt = target_client
         .prepare(

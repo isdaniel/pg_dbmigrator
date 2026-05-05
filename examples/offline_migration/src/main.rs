@@ -48,7 +48,9 @@ async fn main() -> Result<()> {
         jobs: 4,
         split_sections: env_flag("PG_DBMIGRATOR_SPLIT_SECTIONS"),
         resume: env_flag("PG_DBMIGRATOR_RESUME"),
-        resume_file: env::var("PG_DBMIGRATOR_RESUME_FILE").ok().map(PathBuf::from),
+        resume_file: env::var("PG_DBMIGRATOR_RESUME_FILE")
+            .ok()
+            .map(PathBuf::from),
         dump_path: env::var("PG_DBMIGRATOR_DUMP_PATH").ok().map(PathBuf::from),
         ..MigrationConfig::default()
     };

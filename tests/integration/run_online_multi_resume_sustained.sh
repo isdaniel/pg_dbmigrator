@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Online migration test — Multi-Resume with 30s sustained mutations.
 #
-# This test verifies that the migrator can be gracefully cancelled (SIGINT)
-# and resumed multiple times during the apply phase while the source is under
-# continuous mutation load, and still achieve a consistent final cutover.
+# This test verifies that the migrator can be killed (SIGTERM) and resumed
+# multiple times during the apply phase while the source is under continuous
+# mutation load, and still achieve a consistent final cutover.
 #
 #   1. Seed source (500 rows), create publication.
-#   2. RUN #1: launch migrator, wait for apply, mutate 3s, SIGINT → cutover.
-#   3. RUN #2 (resume): skip dump+restore, new subscription, mutate 3s, SIGINT → cutover.
+#   2. RUN #1: launch migrator, wait for apply, mutate 3s, SIGTERM → hard kill.
+#   3. RUN #2 (resume): skip dump+restore, new subscription, mutate 3s, SIGTERM → hard kill.
 #   4. RUN #3 (resume, final): skip dump+restore, new subscription,
-#      sustain mutations for 30s, stop mutations, wait for "ready for
-#      cutover", verify pre-cutover equality, SIGINT → cutover.
+#      sustain mutations for 30s, stop mutations, wait for lag=0,
+#      verify pre-cutover equality, SIGINT → graceful cutover.
 #   5. Assert post-cutover source == target (row count + content hash).
 set -euo pipefail
 
@@ -51,7 +51,7 @@ export PG_DBMIGRATOR_DUMP_PATH="$DUMP_PATH"
 export PG_DBMIGRATOR_MAX_RUNTIME_SECS=1200
 
 # ═══════════════════════════════════════════════════════════════════════════
-# RUN #1: initial run — cancelled mid-apply via SIGINT (graceful cutover)
+# RUN #1: initial run — killed mid-apply via SIGTERM (simulates crash)
 # ═══════════════════════════════════════════════════════════════════════════
 echo "==> RUN #1: launching migrator (initial run)"
 launch_online_migrator "$LOG1"
@@ -69,9 +69,11 @@ echo "==> apply started on line $APPLY_LINE"
 echo "==> mutating for 3s while apply is active"
 sleep 3
 
-echo "==> sending SIGINT → graceful cutover (run #1)"
-sigint_and_wait "$LOG1"
-echo "==> RUN #1 exited"
+echo "==> sending SIGTERM to kill run #1 (simulating crash)"
+kill -TERM "$MIGRATOR_PID" 2>/dev/null || true
+wait "$MIGRATOR_PID" 2>/dev/null || true
+unset MIGRATOR_PID
+echo "==> RUN #1 terminated"
 
 # Verify resume token
 if [[ ! -f "$RESUME_FILE" ]]; then
@@ -88,7 +90,7 @@ done
 echo "==> resume token valid with dump+restore marked complete"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# RUN #2: first resume — skips dump+restore, new subscription, SIGINT cutover
+# RUN #2: first resume — skips dump+restore, new subscription, SIGTERM kill
 # ═══════════════════════════════════════════════════════════════════════════
 echo "==> RUN #2: launching migrator (resume #1)"
 launch_online_migrator "$LOG2" PG_DBMIGRATOR_RESUME=1
@@ -110,9 +112,11 @@ echo "==> confirmed: run #2 skipped dump+restore (resume working)"
 echo "==> mutating for 3s while apply is active"
 sleep 3
 
-echo "==> sending SIGINT → graceful cutover (run #2)"
-sigint_and_wait "$LOG2"
-echo "==> RUN #2 exited"
+echo "==> sending SIGTERM to kill run #2 (simulating crash)"
+kill -TERM "$MIGRATOR_PID" 2>/dev/null || true
+wait "$MIGRATOR_PID" 2>/dev/null || true
+unset MIGRATOR_PID
+echo "==> RUN #2 terminated"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # RUN #3: final resume — sustained mutations, then graceful cutover
@@ -152,12 +156,12 @@ sleep 2
 src_hash_pre=$(content_hash "$SOURCE_URL")
 echo "==> source post-mutation hash: $src_hash_pre"
 
-echo "==> waiting for 'ready for cutover' in run #3"
-CUTOVER_LINE=$(wait_for_log_match "$LOG3" "ready for cutover" "$APPLY3_LINE" 300)
-echo "==> got 'ready for cutover' on line $CUTOVER_LINE"
+echo "==> waiting for replication lag to reach 0 in run #3"
+LAG_ZERO_LINE=$(wait_for_log_match "$LOG3" "replication lag 0 bytes" "$APPLY3_LINE" 300)
+echo "==> lag=0 confirmed on line $LAG_ZERO_LINE"
 
 echo "==> waiting for target to fully catch up (pre-cutover equality gate)"
-PRE_CUTOVER_HASH=$(wait_for_content_match "$SOURCE_URL" "$TARGET_URL" 600)
+PRE_CUTOVER_HASH=$(wait_for_content_match "$SOURCE_URL" "$TARGET_URL" 60)
 echo "==> PRE-CUTOVER content hashes match: $PRE_CUTOVER_HASH"
 
 if [[ "$PRE_CUTOVER_HASH" != "$src_hash_pre" ]]; then

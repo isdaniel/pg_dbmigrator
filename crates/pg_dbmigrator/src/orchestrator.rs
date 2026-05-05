@@ -15,8 +15,8 @@ use crate::cutover::CutoverHandle;
 use crate::dump::{run_pg_dump, CommandRunner, DumpFormat, DumpRequest, TokioCommandRunner};
 use crate::error::{MigrationError, Result};
 use crate::native_apply::{
-    cleanup_target_subscription, force_clean_stale_state, run_native_apply, ApplyStats,
-    PgSubscriptionLagProvider,
+    disable_target_subscription, force_clean_stale_state, run_native_apply, wait_for_slot_inactive,
+    ApplyStats, PgSubscriptionLagProvider,
 };
 use crate::preflight::{
     ensure_pglogical_not_interfering, ensure_target_database_exists, verify_pg_tools_installed,
@@ -300,12 +300,26 @@ impl Migrator {
         drop(prepared_stream);
 
         // When resuming into the apply phase a previous (crashed) run may
-        // already have created the subscription. Drop just the
-        // subscription (the slot stays — it's where we'll resume from).
+        // already have created the subscription. We leave it in place so
+        // run_native_apply can re-enable it (preserving the replication
+        // origin). Dropping it would lose origin tracking and cause
+        // duplicate key violations when the new subscription replays WAL.
+        // However, we must disable it first so the old apply worker
+        // releases the slot before we re-enable with a fresh connection.
         if self.config.resume {
-            cleanup_target_subscription(&self.config.target.connection_string, &self.config.online)
-                .await?;
+            disable_target_subscription(&self.config.target.connection_string, &self.config.online)
+                .await;
         }
+
+        // Wait for the slot to become inactive. On resume the old apply
+        // worker may still hold the walsender connection briefly after
+        // being disabled; on first run the slot should already be free.
+        wait_for_slot_inactive(
+            &self.config.source.connection_string,
+            &self.config.online.slot_name,
+            self.reporter.as_ref(),
+        )
+        .await?;
 
         // 4.5. Verify pglogical is NOT interfering with native logical replication.
         self.report(
@@ -438,6 +452,9 @@ impl Migrator {
             no_subscriptions: self.config.no_subscriptions,
             compress: self.config.dump_compress.clone(),
             no_sync: self.config.no_sync,
+            no_comments: self.config.no_comments,
+            no_security_labels: self.config.no_security_labels,
+            no_table_access_method: self.config.no_table_access_method,
         }
     }
 
@@ -605,10 +622,13 @@ mod tests {
     async fn offline_run_invokes_dump_then_restore() {
         let runner = Arc::new(RecordingRunner::default());
         let reporter = Arc::new(CollectingReporter::new());
-        let migrator = Migrator::new(baseline_config())
-            .with_runner(runner.clone())
-            .with_reporter(reporter.clone())
-            .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_test_dump"));
+        let migrator = Migrator::new(MigrationConfig {
+            split_sections: false,
+            ..baseline_config()
+        })
+        .with_runner(runner.clone())
+        .with_reporter(reporter.clone())
+        .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_test_dump"));
 
         migrator
             .run(CancellationToken::new())
@@ -694,6 +714,7 @@ mod tests {
             resume: true,
             dump_path: Some(dump.clone()),
             resume_file: Some(resume.clone()),
+            split_sections: false,
             ..baseline_config()
         };
 
@@ -752,12 +773,18 @@ mod tests {
         let cfg = MigrationConfig {
             dump_compress: Some("zstd:3".into()),
             no_sync: true,
+            no_comments: true,
+            no_security_labels: true,
+            no_table_access_method: true,
             ..baseline_config()
         };
         let m = Migrator::new(cfg);
         let req = m.dump_request(Path::new("/tmp/dump"), None);
         assert_eq!(req.compress.as_deref(), Some("zstd:3"));
         assert!(req.no_sync);
+        assert!(req.no_comments);
+        assert!(req.no_security_labels);
+        assert!(req.no_table_access_method);
     }
 
     #[test]
