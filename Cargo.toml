@@ -14,6 +14,9 @@ license = "MIT"
 authors = ["danielshih"]
 repository = "https://github.com/isdaniel/pg_dbmigrator"
 description = "PostgreSQL database migration tool (offline dump/restore + online logical replication)"
+readme = "README.md"
+keywords = ["postgresql", "migration", "database", "replication", "pg-dump"]
+categories = ["database", "command-line-utilities"]
 
 [workspace.dependencies]
 # Core async runtime + helpers

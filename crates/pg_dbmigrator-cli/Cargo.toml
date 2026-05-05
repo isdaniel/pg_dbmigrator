@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "CLI for the pg_dbmigrator PostgreSQL database migration library"
+readme.workspace = true
+keywords.workspace = true
+categories = ["database", "command-line-utilities"]
 
 [[bin]]
 name = "pg_dbmigrator"

@@ -227,4 +227,69 @@ mod tests {
         let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(v1["detail"]["lag_bytes"], 42);
     }
+
+    #[tokio::test]
+    async fn tracing_reporter_does_not_panic() {
+        let r = TracingReporter;
+        r.report(ProgressEvent::new(MigrationStage::Validate, "test"))
+            .await;
+        r.report(
+            ProgressEvent::new(MigrationStage::CaughtUp, "caught up")
+                .with_detail(serde_json::json!({"lag_bytes": 0})),
+        )
+        .await;
+    }
+
+    #[test]
+    fn migration_stage_serde_roundtrip() {
+        let stages = [
+            MigrationStage::Validate,
+            MigrationStage::PrepareSnapshot,
+            MigrationStage::Dump,
+            MigrationStage::Restore,
+            MigrationStage::StreamApply,
+            MigrationStage::Lag,
+            MigrationStage::CaughtUp,
+            MigrationStage::Cutover,
+            MigrationStage::Complete,
+        ];
+        for stage in stages {
+            let json = serde_json::to_string(&stage).unwrap();
+            let back: MigrationStage = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, stage);
+        }
+    }
+
+    #[test]
+    fn progress_event_without_detail_has_none() {
+        let ev = ProgressEvent::new(MigrationStage::Dump, "running");
+        assert!(ev.detail.is_none());
+    }
+
+    #[test]
+    fn progress_event_with_detail_attaches_json() {
+        let ev = ProgressEvent::new(MigrationStage::Lag, "lag")
+            .with_detail(serde_json::json!({"lag_bytes": 1024, "source_lsn": "0/1234"}));
+        assert!(ev.detail.is_some());
+        assert_eq!(ev.detail.unwrap()["lag_bytes"], 1024);
+    }
+
+    #[tokio::test]
+    async fn collecting_reporter_clone_shares_state() {
+        let r1 = CollectingReporter::new();
+        let r2 = r1.clone();
+        r1.report(ProgressEvent::new(MigrationStage::Validate, "a"))
+            .await;
+        r2.report(ProgressEvent::new(MigrationStage::Dump, "b"))
+            .await;
+        assert_eq!(r1.len().await, 2);
+        assert_eq!(r2.len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn json_reporter_debug_does_not_panic() {
+        let r = JsonReporter::new(Vec::<u8>::new());
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("JsonReporter"));
+    }
 }

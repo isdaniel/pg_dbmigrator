@@ -1,3 +1,9 @@
+[![Crates.io Version](https://img.shields.io/crates/v/pg_dbmigrator)](https://crates.io/crates/pg_dbmigrator)
+[![Crates.io Downloads (recent)](https://img.shields.io/crates/dr/pg_dbmigrator)](https://crates.io/crates/pg_dbmigrator)
+[![Crates.io Total Downloads](https://img.shields.io/crates/d/pg_dbmigrator)](https://crates.io/crates/pg_dbmigrator)
+[![docs.rs](https://img.shields.io/docsrs/pg_dbmigrator)](https://docs.rs/pg_dbmigrator)
+[![codecov](https://codecov.io/gh/isdaniel/pg_dbmigrator/graph/badge.svg)](https://codecov.io/gh/isdaniel/pg_dbmigrator)
+
 # pg_dbmigrator
 
 A Rust library and CLI for migrating PostgreSQL databases between two

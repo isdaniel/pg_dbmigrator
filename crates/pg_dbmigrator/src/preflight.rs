@@ -358,4 +358,36 @@ mod tests {
             "postgresql://u@host/postgres?sslmode=require"
         );
     }
+
+    #[test]
+    fn maintenance_conn_no_slash_after_host_returns_unchanged() {
+        assert_eq!(
+            maintenance_connection_string("postgresql://u:p@host:5432"),
+            "postgresql://u:p@host:5432"
+        );
+    }
+
+    #[test]
+    fn maintenance_conn_no_slash_after_host_with_query_returns_unchanged() {
+        assert_eq!(
+            maintenance_connection_string("postgresql://u:p@host:5432?sslmode=require"),
+            "postgresql://u:p@host:5432?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn maintenance_conn_no_auth() {
+        assert_eq!(
+            maintenance_connection_string("postgresql://host:5432/mydb"),
+            "postgresql://host:5432/postgres"
+        );
+    }
+
+    #[test]
+    fn maintenance_conn_password_with_at_sign() {
+        assert_eq!(
+            maintenance_connection_string("postgresql://u:p%40ss@host/db?sslmode=require"),
+            "postgresql://u:p%40ss@host/postgres?sslmode=require"
+        );
+    }
 }

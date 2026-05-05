@@ -885,4 +885,61 @@ mod tests {
         let report = s.render_report();
         assert!(report.contains("no error lines were captured"));
     }
+
+    #[test]
+    fn restore_error_category_labels_are_unique() {
+        let cats = [
+            RestoreErrorCategory::DataLoss,
+            RestoreErrorCategory::Duplicate,
+            RestoreErrorCategory::Privilege,
+            RestoreErrorCategory::Extension,
+            RestoreErrorCategory::Other,
+        ];
+        let labels: Vec<&str> = cats.iter().map(|c| c.label()).collect();
+        let mut deduped = labels.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(labels.len(), deduped.len());
+    }
+
+    #[test]
+    fn restore_error_category_descriptions_are_non_empty() {
+        let cats = [
+            RestoreErrorCategory::DataLoss,
+            RestoreErrorCategory::Duplicate,
+            RestoreErrorCategory::Privilege,
+            RestoreErrorCategory::Extension,
+            RestoreErrorCategory::Other,
+        ];
+        for c in cats {
+            assert!(!c.description().is_empty());
+            assert!(!c.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn restore_section_serde_roundtrip() {
+        let sections = [
+            RestoreSection::PreData,
+            RestoreSection::Data,
+            RestoreSection::PostData,
+        ];
+        for s in sections {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: RestoreSection = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, s);
+        }
+    }
+
+    #[test]
+    fn summary_no_errors_verdict() {
+        let s = RestoreErrorSummary::default();
+        assert_eq!(s.verdict(), "no errors captured");
+    }
+
+    #[test]
+    fn summary_has_data_loss_false_when_empty() {
+        let s = RestoreErrorSummary::default();
+        assert!(!s.has_data_loss());
+    }
 }

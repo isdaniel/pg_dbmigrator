@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 description = "Library for migrating PostgreSQL databases (offline dump/restore + online logical replication)"
 repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["database"]
 
 [lib]
 name = "pg_dbmigrator"

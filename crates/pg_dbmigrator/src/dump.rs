@@ -661,4 +661,41 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MigrationError::Cancelled));
     }
+
+    #[test]
+    fn pgpassword_env_returns_password_when_present() {
+        let ep = sample_endpoint();
+        let env = pgpassword_env(&ep);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "PGPASSWORD");
+        assert_eq!(env[0].1, "s3cret");
+    }
+
+    #[test]
+    fn pgpassword_env_returns_empty_when_no_password() {
+        let ep = EndpointConfig::parse("postgresql://u@h/db").unwrap();
+        let env = pgpassword_env(&ep);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn is_directory_dump_false_for_nonexistent_path() {
+        assert!(!is_directory_dump(std::path::Path::new(
+            "/nonexistent/path/dump"
+        )));
+    }
+
+    #[test]
+    fn is_directory_dump_true_for_actual_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_directory_dump(dir.path()));
+    }
+
+    #[test]
+    fn is_directory_dump_false_for_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dump.bin");
+        std::fs::write(&file, b"data").unwrap();
+        assert!(!is_directory_dump(&file));
+    }
 }
