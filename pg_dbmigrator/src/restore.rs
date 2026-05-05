@@ -944,9 +944,11 @@ mod tests {
     }
 
     /// Runner that records calls (used for `run_psql_file` tests).
+    type RunCall = (String, Vec<String>, Vec<(String, String)>);
+
     #[derive(Debug, Default)]
     struct RecordingRunner {
-        calls: std::sync::Mutex<Vec<(String, Vec<String>, Vec<(String, String)>)>>,
+        calls: std::sync::Mutex<Vec<RunCall>>,
     }
 
     #[async_trait]
