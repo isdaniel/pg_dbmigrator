@@ -292,4 +292,52 @@ mod tests {
         let dbg = format!("{:?}", r);
         assert!(dbg.contains("JsonReporter"));
     }
+
+    #[test]
+    fn progress_event_deserializes_from_json() {
+        let json = r#"{"stage":"Dump","message":"running","detail":null}"#;
+        let ev: ProgressEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(ev.stage, MigrationStage::Dump);
+        assert_eq!(ev.message, "running");
+        assert!(ev.detail.is_none());
+    }
+
+    #[test]
+    fn progress_event_deserializes_with_detail() {
+        let json = r#"{"stage":"Lag","message":"lag report","detail":{"lag_bytes":1024}}"#;
+        let ev: ProgressEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(ev.stage, MigrationStage::Lag);
+        assert_eq!(ev.detail.unwrap()["lag_bytes"], 1024);
+    }
+
+    #[test]
+    fn tracing_reporter_debug() {
+        let r = TracingReporter;
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("TracingReporter"));
+    }
+
+    #[test]
+    fn collecting_reporter_debug() {
+        let r = CollectingReporter::new();
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("CollectingReporter"));
+    }
+
+    #[tokio::test]
+    async fn json_reporter_handles_multiple_events() {
+        let buf = Vec::<u8>::new();
+        let r = JsonReporter::new(buf);
+        for i in 0..5 {
+            r.report(ProgressEvent::new(
+                MigrationStage::Validate,
+                format!("event {i}"),
+            ))
+            .await;
+        }
+        let writer = Arc::try_unwrap(r.writer).unwrap().into_inner();
+        let out = String::from_utf8(writer).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5);
+    }
 }

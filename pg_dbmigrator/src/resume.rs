@@ -376,4 +376,81 @@ mod tests {
         let p = default_resume_path(Path::new("/tmp/dump_online-12345"));
         assert_eq!(p, PathBuf::from("/tmp/dump_online-12345.resume.json"));
     }
+
+    #[tokio::test]
+    async fn load_rejects_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        tokio::fs::write(&path, b"not json at all {{{")
+            .await
+            .unwrap();
+        let err = ResumeToken::load(&path).await.unwrap_err();
+        assert!(matches!(err, MigrationError::Config(_)));
+        assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn check_compatible_accepts_matching_config() {
+        let c = cfg();
+        let t = ResumeToken::new(&c, PathBuf::from("/tmp/dump"));
+        t.check_compatible(&c).unwrap();
+    }
+
+    #[test]
+    fn resume_token_new_offline_has_no_online_fields() {
+        let c = MigrationConfig {
+            mode: MigrationMode::Offline,
+            source: EndpointConfig::parse("postgresql://u:p@src:5432/db").unwrap(),
+            target: EndpointConfig::parse("postgresql://u:p@dst:5432/db").unwrap(),
+            ..MigrationConfig::default()
+        };
+        let t = ResumeToken::new(&c, PathBuf::from("/tmp/dump"));
+        assert_eq!(t.mode, "offline");
+        assert!(t.slot_name.is_none());
+        assert!(t.subscription_name.is_none());
+        assert!(t.publication.is_none());
+    }
+
+    #[test]
+    fn resume_token_new_online_populates_online_fields() {
+        let c = cfg();
+        let t = ResumeToken::new(&c, PathBuf::from("/tmp/dump"));
+        assert_eq!(t.mode, "online");
+        assert_eq!(t.slot_name.as_deref(), Some("slot_a"));
+        assert_eq!(t.subscription_name.as_deref(), Some("sub_a"));
+        assert_eq!(t.publication.as_deref(), Some("pub_a"));
+    }
+
+    #[tokio::test]
+    async fn save_creates_intermediate_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_path = dir.path().join("a").join("b").join("resume.json");
+        let t = ResumeToken::new(&cfg(), PathBuf::from("/tmp/dump"));
+        t.save(&nested_path).await.unwrap();
+        assert!(nested_path.exists());
+    }
+
+    #[test]
+    fn resume_token_serde_roundtrip() {
+        let mut t = ResumeToken::new(&cfg(), PathBuf::from("/tmp/dump"));
+        t.mark(CompletedStage::PrepareSnapshot);
+        t.mark(CompletedStage::Dump);
+        t.snapshot_name = Some("snap".into());
+        t.last_applied_lsn = Some(42);
+        let json = serde_json::to_string(&t).unwrap();
+        let t2: ResumeToken = serde_json::from_str(&json).unwrap();
+        assert_eq!(t2.config_hash, t.config_hash);
+        assert_eq!(t2.mode, t.mode);
+        assert!(t2.completed.contains(&CompletedStage::PrepareSnapshot));
+        assert!(t2.completed.contains(&CompletedStage::Dump));
+        assert!(!t2.completed.contains(&CompletedStage::Restore));
+        assert_eq!(t2.snapshot_name.as_deref(), Some("snap"));
+        assert_eq!(t2.last_applied_lsn, Some(42));
+    }
+
+    #[test]
+    fn completed_stage_ordering() {
+        assert!(CompletedStage::PrepareSnapshot < CompletedStage::Dump);
+        assert!(CompletedStage::Dump < CompletedStage::Restore);
+    }
 }

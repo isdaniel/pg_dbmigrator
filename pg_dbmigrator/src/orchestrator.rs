@@ -930,4 +930,282 @@ mod tests {
         let req = m.dump_request(Path::new("/tmp/dump"), Some("00000003-deadbeef-1".into()));
         assert_eq!(req.snapshot.as_deref(), Some("00000003-deadbeef-1"));
     }
+
+    #[test]
+    fn with_dump_path_pins_dump_archive_location() {
+        let cfg = baseline_config();
+        let m = Migrator::new(cfg).with_dump_path(PathBuf::from("/custom/dump"));
+        let path = m.dump_path_or_default("test_prefix");
+        assert_eq!(path, PathBuf::from("/custom/dump"));
+    }
+
+    #[test]
+    fn dump_path_or_default_uses_config_dump_path_when_no_override() {
+        let cfg = MigrationConfig {
+            dump_path: Some(PathBuf::from("/config/level/dump")),
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let path = m.dump_path_or_default("prefix");
+        assert_eq!(path, PathBuf::from("/config/level/dump"));
+    }
+
+    #[test]
+    fn dump_path_or_default_generates_temp_path_when_no_paths() {
+        let cfg = MigrationConfig {
+            dump_path: None,
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let path = m.dump_path_or_default("offline");
+        assert!(path.to_string_lossy().contains("offline"));
+    }
+
+    #[test]
+    fn restore_request_propagates_all_fields() {
+        let cfg = MigrationConfig {
+            drop_target_first: true,
+            allow_restore_errors: true,
+            jobs: 6,
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let req = m.restore_request(Path::new("/tmp/dump.bin"));
+        assert_eq!(req.target.host, "dst");
+        assert_eq!(req.input_path, PathBuf::from("/tmp/dump.bin"));
+        assert_eq!(req.jobs, 6);
+        assert!(req.clean);
+        assert!(req.no_owner);
+        assert!(req.no_acl);
+        assert!(req.tolerate_errors);
+        assert!(req.section.is_none());
+    }
+
+    #[test]
+    fn restore_request_defaults_no_clean_and_no_tolerate() {
+        let cfg = baseline_config();
+        let m = Migrator::new(cfg);
+        let req = m.restore_request(Path::new("/tmp/d"));
+        assert!(!req.clean);
+        assert!(!req.tolerate_errors);
+    }
+
+    #[test]
+    fn with_runner_replaces_runner() {
+        let runner = Arc::new(RecordingRunner::default());
+        let m = Migrator::new(baseline_config()).with_runner(runner.clone());
+        let _ = m.config();
+        assert!(runner.snapshot().is_empty());
+    }
+
+    #[test]
+    fn with_reporter_replaces_reporter() {
+        let reporter = Arc::new(CollectingReporter::new());
+        let m = Migrator::new(baseline_config()).with_reporter(reporter);
+        let _ = m.config();
+    }
+
+    #[test]
+    fn resume_path_uses_config_resume_file_override() {
+        let cfg = MigrationConfig {
+            resume_file: Some(PathBuf::from("/custom/resume.json")),
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let path = m.resume_path(Path::new("/tmp/dump"));
+        assert_eq!(path, PathBuf::from("/custom/resume.json"));
+    }
+
+    #[test]
+    fn resume_path_defaults_to_dump_path_suffix() {
+        let cfg = MigrationConfig {
+            resume_file: None,
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let path = m.resume_path(Path::new("/tmp/my_dump"));
+        assert_eq!(path, PathBuf::from("/tmp/my_dump.resume.json"));
+    }
+
+    #[test]
+    fn dump_request_passes_none_snapshot_when_not_provided() {
+        let cfg = baseline_config();
+        let m = Migrator::new(cfg);
+        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        assert!(req.snapshot.is_none());
+    }
+
+    #[test]
+    fn dump_request_propagates_schemas_and_tables() {
+        let cfg = MigrationConfig {
+            schemas: vec!["public".into(), "app".into()],
+            tables: vec!["public.users".into()],
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        assert_eq!(req.schemas, vec!["public", "app"]);
+        assert_eq!(req.tables, vec!["public.users"]);
+    }
+
+    #[test]
+    fn dump_request_propagates_dump_scope() {
+        use crate::config::DumpScope;
+        let cfg = MigrationConfig {
+            dump_scope: DumpScope::SchemaOnly,
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        assert_eq!(req.scope, DumpScope::SchemaOnly);
+    }
+
+    #[test]
+    fn migration_outcome_cutover_not_triggered_when_stats_say_no() {
+        let out = MigrationOutcome {
+            stats: Some(ApplyStats {
+                cutover_triggered: false,
+                ..ApplyStats::default()
+            }),
+            dump_path: PathBuf::from("/tmp/x"),
+        };
+        assert!(!out.cutover_triggered());
+    }
+
+    #[tokio::test]
+    async fn offline_run_resume_true_no_token_on_disk_runs_from_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        let resume = dir.path().join("nonexistent.resume.json");
+
+        let cfg = MigrationConfig {
+            resume: true,
+            dump_path: Some(dump.clone()),
+            resume_file: Some(resume.clone()),
+            split_sections: false,
+            ..baseline_config()
+        };
+
+        let runner = Arc::new(RecordingRunner::default());
+        let migrator = Migrator::new(cfg)
+            .with_runner(runner.clone())
+            .with_reporter(Arc::new(CollectingReporter::new()));
+
+        migrator.run(CancellationToken::new()).await.unwrap();
+
+        let calls = runner.snapshot();
+        assert_eq!(calls.len(), 2, "expected 2 calls (dump+restore)");
+        assert_eq!(calls[0].0, "pg_dump");
+        assert_eq!(calls[1].0, "pg_restore");
+        // The resume token should have been written to disk.
+        assert!(resume.exists());
+    }
+
+    #[tokio::test]
+    async fn offline_run_writes_resume_token_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump_path = dir.path().join("dump_test");
+
+        let cfg = MigrationConfig {
+            dump_path: Some(dump_path.clone()),
+            split_sections: false,
+            ..baseline_config()
+        };
+
+        let runner = Arc::new(RecordingRunner::default());
+        let migrator = Migrator::new(cfg)
+            .with_runner(runner)
+            .with_reporter(Arc::new(CollectingReporter::new()));
+
+        migrator.run(CancellationToken::new()).await.unwrap();
+
+        // Even without --resume, the token should be saved for future use.
+        let resume_path = crate::resume::default_resume_path(&dump_path);
+        assert!(resume_path.exists());
+
+        let token = crate::resume::ResumeToken::load(&resume_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(token.has(crate::resume::CompletedStage::Dump));
+        assert!(token.has(crate::resume::CompletedStage::Restore));
+    }
+
+    #[test]
+    fn dump_request_propagates_no_publications_and_no_subscriptions() {
+        let cfg = MigrationConfig {
+            no_publications: false,
+            no_subscriptions: false,
+            ..baseline_config()
+        };
+        let m = Migrator::new(cfg);
+        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        assert!(!req.no_publications);
+        assert!(!req.no_subscriptions);
+    }
+
+    #[test]
+    fn dump_request_defaults_have_no_publications_true() {
+        let cfg = baseline_config();
+        let m = Migrator::new(cfg);
+        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        assert!(req.no_publications);
+        assert!(req.no_subscriptions);
+    }
+
+    #[test]
+    fn migrator_debug_includes_fields() {
+        let m = Migrator::new(baseline_config());
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("Migrator"));
+        assert!(dbg.contains("config"));
+    }
+
+    #[test]
+    fn migration_outcome_dump_path_is_accessible() {
+        let out = MigrationOutcome {
+            stats: None,
+            dump_path: PathBuf::from("/tmp/my_dump"),
+        };
+        assert_eq!(out.dump_path, PathBuf::from("/tmp/my_dump"));
+    }
+
+    #[tokio::test]
+    async fn offline_run_reports_correct_event_sequence() {
+        let runner = Arc::new(RecordingRunner::default());
+        let reporter = Arc::new(CollectingReporter::new());
+        let dir = tempfile::tempdir().unwrap();
+
+        let migrator = Migrator::new(baseline_config())
+            .with_runner(runner)
+            .with_reporter(reporter.clone())
+            .with_dump_path(dir.path().join("dump"));
+
+        migrator.run(CancellationToken::new()).await.unwrap();
+
+        let events = reporter.events().await;
+        let stages: Vec<_> = events.iter().map(|e| e.stage).collect();
+        // Validate is always first, Complete is always last.
+        assert_eq!(*stages.first().unwrap(), MigrationStage::Validate);
+        assert_eq!(*stages.last().unwrap(), MigrationStage::Complete);
+        // Dump comes before Restore in the sequence.
+        let dump_pos = stages
+            .iter()
+            .position(|s| *s == MigrationStage::Dump)
+            .unwrap();
+        let restore_pos = stages
+            .iter()
+            .position(|s| *s == MigrationStage::Restore)
+            .unwrap();
+        assert!(dump_pos < restore_pos);
+    }
+
+    #[test]
+    fn restore_request_no_owner_and_no_acl_always_true() {
+        let cfg = baseline_config();
+        let m = Migrator::new(cfg);
+        let req = m.restore_request(Path::new("/tmp/dump"));
+        assert!(req.no_owner);
+        assert!(req.no_acl);
+    }
 }

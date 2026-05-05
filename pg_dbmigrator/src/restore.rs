@@ -942,4 +942,127 @@ mod tests {
         let s = RestoreErrorSummary::default();
         assert!(!s.has_data_loss());
     }
+
+    /// Runner that records calls (used for `run_psql_file` tests).
+    #[derive(Debug, Default)]
+    struct RecordingRunner {
+        calls: std::sync::Mutex<Vec<(String, Vec<String>, Vec<(String, String)>)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            env: &[(String, String)],
+            _cancel: &CancellationToken,
+        ) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((program.to_string(), args.to_vec(), env.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_psql_file_invokes_psql_with_correct_args() {
+        let runner = RecordingRunner::default();
+        let target = EndpointConfig::parse("postgresql://bob:pw@tgt:5433/mydb").unwrap();
+        let sql_path = std::path::Path::new("/tmp/dump.sql");
+        run_psql_file(&runner, &target, sql_path, &CancellationToken::new())
+            .await
+            .unwrap();
+        let calls = runner.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (program, args, env) = &calls[0];
+        assert_eq!(program, "psql");
+        assert!(args.contains(&"--single-transaction".to_string()));
+        assert!(args.contains(&"ON_ERROR_STOP=1".to_string()));
+        assert!(args.contains(&"tgt".to_string()));
+        assert!(args.contains(&"5433".to_string()));
+        assert!(args.contains(&"bob".to_string()));
+        assert!(args.contains(&"mydb".to_string()));
+        assert!(args.contains(&"/tmp/dump.sql".to_string()));
+        assert!(env.iter().any(|(k, v)| k == "PGPASSWORD" && v == "pw"));
+    }
+
+    #[tokio::test]
+    async fn run_psql_file_omits_pgpassword_when_no_password() {
+        let runner = RecordingRunner::default();
+        let target = EndpointConfig::parse("postgresql://u@h/db").unwrap();
+        run_psql_file(
+            &runner,
+            &target,
+            std::path::Path::new("/tmp/f.sql"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(calls[0].2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_pg_restore_in_sections_cancels_mid_restore() {
+        /// Runner that cancels the token on the second call (Data section).
+        #[derive(Debug)]
+        struct CancelOnSecond {
+            cancel: CancellationToken,
+            count: std::sync::Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for CancelOnSecond {
+            async fn run(
+                &self,
+                _program: &str,
+                _args: &[String],
+                _env: &[(String, String)],
+                _cancel: &CancellationToken,
+            ) -> Result<()> {
+                let mut c = self.count.lock().unwrap();
+                *c += 1;
+                if *c == 2 {
+                    self.cancel.cancel();
+                }
+                Ok(())
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let runner = CancelOnSecond {
+            cancel: cancel.clone(),
+            count: std::sync::Mutex::new(0),
+        };
+        let err = run_pg_restore_in_sections(&runner, &sample_request(), &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MigrationError::Cancelled));
+    }
+
+    #[test]
+    fn build_pg_restore_args_includes_jobs_for_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = sample_request();
+        req.input_path = dir.path().to_path_buf();
+        req.jobs = 4;
+        let args = build_pg_restore_args(&req);
+        assert!(args.iter().any(|a| a == "--jobs"));
+        assert!(args.iter().any(|a| a == "4"));
+    }
+
+    #[tokio::test]
+    async fn run_pg_restore_does_not_tolerate_non_pg_restore_failure() {
+        let runner = FailingRunner {
+            program_to_fail: "pg_dump".into(),
+        };
+        let mut req = sample_request();
+        req.tolerate_errors = true;
+        let err = run_pg_restore(&runner, &req, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MigrationError::ExternalCommand { .. }));
+    }
 }

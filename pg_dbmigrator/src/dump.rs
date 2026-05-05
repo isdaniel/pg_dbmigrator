@@ -698,4 +698,160 @@ mod tests {
         std::fs::write(&file, b"data").unwrap();
         assert!(!is_directory_dump(&file));
     }
+
+    #[test]
+    fn build_args_appends_data_only_flag() {
+        let mut req = base_request();
+        req.scope = DumpScope::DataOnly;
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--data-only"));
+    }
+
+    #[test]
+    fn build_args_no_scope_flag_for_all() {
+        let req = base_request(); // scope = DumpScope::All
+        let args = build_pg_dump_args(&req);
+        assert!(!args.iter().any(|a| a == "--schema-only"));
+        assert!(!args.iter().any(|a| a == "--data-only"));
+    }
+
+    #[test]
+    fn build_args_directory_format_single_job_omits_jobs() {
+        let mut req = base_request();
+        req.format = DumpFormat::Directory;
+        req.jobs = 1;
+        let args = build_pg_dump_args(&req);
+        assert!(!args.iter().any(|a| a == "--jobs"));
+    }
+
+    #[tokio::test]
+    async fn tokio_runner_succeeds_for_true_command() {
+        let runner = TokioCommandRunner;
+        runner
+            .run("true", &[], &[], &CancellationToken::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tokio_runner_fails_for_false_command() {
+        let runner = TokioCommandRunner;
+        let err = runner
+            .run("false", &[], &[], &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MigrationError::ExternalCommand { .. }));
+    }
+
+    #[tokio::test]
+    async fn tokio_runner_returns_error_for_nonexistent_binary() {
+        let runner = TokioCommandRunner;
+        let err = runner
+            .run(
+                "definitely_not_a_real_binary_xyzzy",
+                &[],
+                &[],
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MigrationError::ExternalCommand { .. }));
+    }
+
+    #[test]
+    fn dump_format_flag_values() {
+        assert_eq!(DumpFormat::Custom.flag(), "c");
+        assert_eq!(DumpFormat::Plain.flag(), "p");
+        assert_eq!(DumpFormat::Directory.flag(), "d");
+    }
+
+    #[test]
+    fn build_args_includes_snapshot_when_set() {
+        let mut req = base_request();
+        req.snapshot = Some("00000003-deadbeef".into());
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--snapshot=00000003-deadbeef"));
+    }
+
+    #[test]
+    fn build_args_includes_schemas() {
+        let mut req = base_request();
+        req.schemas = vec!["public".into(), "app".into()];
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--schema=public"));
+        assert!(args.iter().any(|a| a == "--schema=app"));
+    }
+
+    #[test]
+    fn build_args_includes_tables() {
+        let mut req = base_request();
+        req.tables = vec!["public.users".into()];
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--table=public.users"));
+    }
+
+    #[test]
+    fn build_args_includes_exclude_schemas() {
+        let mut req = base_request();
+        req.exclude_schemas = vec!["audit".into()];
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--exclude-schema=audit"));
+    }
+
+    #[test]
+    fn build_args_includes_exclude_tables() {
+        let mut req = base_request();
+        req.exclude_tables = vec!["public.large_table".into()];
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--exclude-table=public.large_table"));
+    }
+
+    #[test]
+    fn build_args_includes_compress_spec() {
+        let mut req = base_request();
+        req.compress = Some("zstd:3".into());
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--compress=zstd:3"));
+    }
+
+    #[test]
+    fn build_args_includes_no_publications() {
+        let mut req = base_request();
+        req.no_publications = true;
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--no-publications"));
+    }
+
+    #[test]
+    fn build_args_includes_no_subscriptions() {
+        let mut req = base_request();
+        req.no_subscriptions = true;
+        let args = build_pg_dump_args(&req);
+        assert!(args.iter().any(|a| a == "--no-subscriptions"));
+    }
+
+    #[test]
+    fn build_args_omits_no_publications_when_false() {
+        let mut req = base_request();
+        req.no_publications = false;
+        let args = build_pg_dump_args(&req);
+        assert!(!args.iter().any(|a| a == "--no-publications"));
+    }
+
+    #[test]
+    fn build_args_directory_format_with_parallel_jobs() {
+        let mut req = base_request();
+        req.format = DumpFormat::Directory;
+        req.jobs = 4;
+        let args = build_pg_dump_args(&req);
+        assert!(args.contains(&"--jobs".to_string()));
+        assert!(args.contains(&"4".to_string()));
+    }
+
+    #[test]
+    fn tokio_command_runner_debug() {
+        let r = TokioCommandRunner;
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("TokioCommandRunner"));
+    }
 }

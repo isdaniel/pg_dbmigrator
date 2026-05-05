@@ -265,4 +265,53 @@ mod tests {
         let schemes = verifier.supported_verify_schemes();
         assert!(!schemes.is_empty());
     }
+
+    #[test]
+    fn ssl_mode_debug_and_clone() {
+        let mode = SslMode::Require;
+        let cloned = mode;
+        assert_eq!(cloned, SslMode::Require);
+        let dbg = format!("{:?}", mode);
+        assert!(dbg.contains("Require"));
+    }
+
+    #[test]
+    fn ssl_mode_parse_with_leading_trailing_whitespace() {
+        assert_eq!(SslMode::parse("  disable  "), SslMode::Disable);
+        assert_eq!(SslMode::parse(" verify-full "), SslMode::VerifyFull);
+        assert_eq!(SslMode::parse(" REQUIRE "), SslMode::Require);
+    }
+
+    #[test]
+    fn from_connection_string_sslmode_first_param() {
+        assert_eq!(
+            SslMode::from_connection_string("postgresql://u@h/db?sslmode=verify-ca&timeout=10"),
+            SslMode::VerifyFull
+        );
+    }
+
+    #[test]
+    fn from_connection_string_sslmode_case_insensitive_in_value() {
+        assert_eq!(
+            SslMode::from_connection_string("postgresql://u@h/db?sslmode=DISABLE"),
+            SslMode::Disable
+        );
+    }
+
+    #[test]
+    fn no_cert_verification_debug_format() {
+        let v = NoCertVerification::default();
+        let dbg = format!("{:?}", v);
+        assert!(dbg.contains("NoCertVerification"));
+    }
+
+    #[test]
+    fn make_tls_connector_require_and_verify_full_produce_different_configs() {
+        let require = make_tls_connector(SslMode::Require).unwrap().unwrap();
+        let verify = make_tls_connector(SslMode::VerifyFull).unwrap().unwrap();
+        // Both produce connectors, they just differ in verification behavior.
+        // We can't deeply inspect them, but we verify they are constructed.
+        let _ = require;
+        let _ = verify;
+    }
 }

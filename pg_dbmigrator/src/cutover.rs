@@ -207,4 +207,52 @@ mod tests {
         let t = s.observe(108, 100);
         assert!(matches!(t, Transition::JustCaughtUp { lag: 8 }));
     }
+
+    #[test]
+    fn transition_just_caught_up_returns_true() {
+        assert!(Transition::JustCaughtUp { lag: 0 }.just_caught_up());
+        assert!(!Transition::StillCaughtUp { lag: 0 }.just_caught_up());
+        assert!(!Transition::FellBehind { lag: 10 }.just_caught_up());
+        assert!(!Transition::StillBehind { lag: 10 }.just_caught_up());
+    }
+
+    #[test]
+    fn cutover_handle_default_is_unrequested() {
+        let h = CutoverHandle::default();
+        assert!(!h.is_requested());
+    }
+
+    #[test]
+    fn cutover_handle_debug() {
+        let h = CutoverHandle::new();
+        let dbg = format!("{:?}", h);
+        assert!(dbg.contains("CutoverHandle"));
+    }
+
+    #[test]
+    fn lag_sampler_debug() {
+        let s = LagSampler::new(100);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("LagSampler"));
+        assert!(dbg.contains("100"));
+    }
+
+    #[test]
+    fn transition_debug_and_eq() {
+        let t1 = Transition::JustCaughtUp { lag: 5 };
+        let t2 = Transition::JustCaughtUp { lag: 5 };
+        assert_eq!(t1, t2);
+        let dbg = format!("{:?}", t1);
+        assert!(dbg.contains("JustCaughtUp"));
+    }
+
+    #[test]
+    fn sampler_zero_threshold_always_caught_up() {
+        let mut s = LagSampler::new(0);
+        let t = s.observe(100, 100);
+        assert!(matches!(t, Transition::JustCaughtUp { lag: 0 }));
+        // Any non-zero lag immediately falls behind.
+        let t = s.observe(101, 100);
+        assert!(matches!(t, Transition::FellBehind { lag: 1 }));
+    }
 }

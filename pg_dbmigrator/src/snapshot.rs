@@ -146,4 +146,27 @@ mod tests {
         assert_eq!(cfg.publication_name, "pub");
         assert_eq!(cfg.protocol_version, 2);
     }
+
+    #[test]
+    fn build_stream_config_uses_apply_intervals() {
+        use std::time::Duration;
+        let opts = OnlineOptions {
+            apply: crate::config::ReplicationApplyConfig {
+                feedback_interval: Duration::from_secs(20),
+                connection_timeout: Duration::from_secs(45),
+                health_check_interval: Duration::from_secs(120),
+                max_runtime_seconds: None,
+            },
+            ..OnlineOptions::default()
+        };
+        let cfg = build_stream_config(&opts);
+        assert_eq!(cfg.feedback_interval, Duration::from_secs(20));
+        assert_eq!(cfg.connection_timeout, Duration::from_secs(45));
+        assert_eq!(cfg.health_check_interval, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn default_slot_timeout_is_60_seconds() {
+        assert_eq!(DEFAULT_SLOT_TIMEOUT, std::time::Duration::from_secs(60));
+    }
 }

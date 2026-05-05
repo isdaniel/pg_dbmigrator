@@ -196,4 +196,43 @@ mod tests {
         let err = MigrationError::InvalidConnectionString("bad://url".into());
         assert_eq!(err.to_string(), "invalid connection string: bad://url");
     }
+
+    #[test]
+    fn replication_error_display() {
+        let rep_err = pg_walstream::ReplicationError::Protocol("test message".into());
+        let err: MigrationError = rep_err.into();
+        let msg = err.to_string();
+        assert!(msg.contains("replication error"));
+    }
+
+    #[test]
+    fn external_command_fields_accessible_via_match() {
+        let err = MigrationError::external("pg_restore", "exit code 2");
+        match &err {
+            MigrationError::ExternalCommand { command, message } => {
+                assert_eq!(command, "pg_restore");
+                assert_eq!(message, "exit code 2");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn io_error_preserves_kind() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "forbidden");
+        let err: MigrationError = io_err.into();
+        match err {
+            MigrationError::Io(ref e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            _ => panic!("expected Io variant"),
+        }
+        assert!(err.to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn config_error_debug_format() {
+        let err = MigrationError::config("test cfg error");
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("Config"));
+        assert!(dbg.contains("test cfg error"));
+    }
 }
