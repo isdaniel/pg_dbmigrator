@@ -19,6 +19,15 @@ fn target_url() -> Option<String> {
     env::var("PG_TARGET_URL").ok()
 }
 
+/// Connection string the *target container's* apply worker uses to reach
+/// the source. In Docker this is the internal service name (`source-db:5432`)
+/// rather than the host-mapped `localhost:55432`.
+fn subscription_source_url() -> Option<String> {
+    env::var("PG_SUBSCRIPTION_SOURCE_URL")
+        .ok()
+        .or_else(source_url)
+}
+
 macro_rules! skip_without_pg {
     ($url:expr) => {
         match $url {
@@ -367,10 +376,19 @@ async fn disable_target_subscription_noop_when_absent() {
 
 // ─── snapshot::prepare_replication_slot ───────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn prepare_replication_slot_creates_and_exports_snapshot() {
     let url = skip_without_pg!(source_url());
     let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Clean up any leftovers from a previous run
+    client
+        .batch_execute(
+            "SELECT pg_drop_replication_slot('integ_snap_slot') \
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'integ_snap_slot')",
+        )
+        .await
+        .ok();
 
     client
         .batch_execute("CREATE PUBLICATION integ_snap_pub FOR ALL TABLES")
@@ -415,7 +433,7 @@ async fn prepare_replication_slot_creates_and_exports_snapshot() {
 
 // ─── Full online apply loop (short-circuit) ──────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn native_apply_with_cancel_exits_cleanly() {
     use pg_dbmigrator::cutover::CutoverHandle;
     use pg_dbmigrator::native_apply::{run_native_apply, SubscriptionLagProvider};
@@ -426,6 +444,7 @@ async fn native_apply_with_cancel_exits_cleanly() {
 
     let source_url_val = skip_without_pg!(source_url());
     let target_url_val = skip_without_pg!(target_url());
+    let sub_source_url = skip_without_pg!(subscription_source_url());
 
     let source = connect_with_sslmode(&source_url_val).await.unwrap();
     let target = connect_with_sslmode(&target_url_val).await.unwrap();
@@ -481,7 +500,7 @@ async fn native_apply_with_cancel_exits_cleanly() {
         &target,
         &provider,
         &online,
-        &source_url_val,
+        &sub_source_url,
         cutover,
         &reporter,
         cancel,
@@ -544,4 +563,115 @@ async fn verify_pg_tools_installed_succeeds_in_ci() {
     pg_dbmigrator::preflight::verify_pg_tools_installed()
         .await
         .unwrap();
+}
+
+// ─── analyze::run_target_analyze ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn run_target_analyze_whole_database() {
+    let url = skip_without_pg!(target_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS integ_analyze; \
+             CREATE TABLE IF NOT EXISTS integ_analyze.t1 (id int PRIMARY KEY, v text);",
+        )
+        .await
+        .unwrap();
+
+    let result = pg_dbmigrator::analyze::run_target_analyze(&url, &[], false).await;
+    assert!(result.is_ok());
+
+    client
+        .batch_execute("DROP SCHEMA integ_analyze CASCADE")
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn run_target_analyze_with_schema_filter() {
+    let url = skip_without_pg!(target_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS integ_analyze_s; \
+             CREATE TABLE IF NOT EXISTS integ_analyze_s.t1 (id int PRIMARY KEY, v text); \
+             CREATE TABLE IF NOT EXISTS integ_analyze_s.t2 (id int PRIMARY KEY, n int);",
+        )
+        .await
+        .unwrap();
+
+    let schemas = vec!["integ_analyze_s".to_string()];
+    let result = pg_dbmigrator::analyze::run_target_analyze(&url, &schemas, false).await;
+    assert!(result.is_ok());
+
+    // Verbose mode
+    let result = pg_dbmigrator::analyze::run_target_analyze(&url, &schemas, true).await;
+    assert!(result.is_ok());
+
+    client
+        .batch_execute("DROP SCHEMA integ_analyze_s CASCADE")
+        .await
+        .ok();
+}
+
+// ─── analyze::run_source_vacuum ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn run_source_vacuum_whole_database() {
+    let url = skip_without_pg!(source_url());
+    let result = pg_dbmigrator::analyze::run_source_vacuum(&url, &[], false).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn run_source_vacuum_with_schema_filter() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS integ_vacuum_s; \
+             CREATE TABLE IF NOT EXISTS integ_vacuum_s.t1 (id int PRIMARY KEY, v text);",
+        )
+        .await
+        .unwrap();
+
+    let schemas = vec!["integ_vacuum_s".to_string()];
+    let result = pg_dbmigrator::analyze::run_source_vacuum(&url, &schemas, false).await;
+    assert!(result.is_ok());
+
+    // Verbose mode
+    let result = pg_dbmigrator::analyze::run_source_vacuum(&url, &schemas, true).await;
+    assert!(result.is_ok());
+
+    client
+        .batch_execute("DROP SCHEMA integ_vacuum_s CASCADE")
+        .await
+        .ok();
+}
+
+// ─── analyze::maybe_vacuum_source / maybe_analyze_target ─────────────────────
+
+#[tokio::test]
+async fn maybe_vacuum_source_runs_when_not_skipped() {
+    let url = skip_without_pg!(source_url());
+    let config = pg_dbmigrator::MigrationConfig {
+        source: pg_dbmigrator::EndpointConfig::parse(&url).unwrap(),
+        skip_source_vacuum: false,
+        ..pg_dbmigrator::MigrationConfig::default()
+    };
+    let result = pg_dbmigrator::analyze::maybe_vacuum_source(&config).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn maybe_analyze_target_runs_when_not_skipped() {
+    let url = skip_without_pg!(target_url());
+    let config = pg_dbmigrator::MigrationConfig {
+        target: pg_dbmigrator::EndpointConfig::parse(&url).unwrap(),
+        skip_analyze: false,
+        ..pg_dbmigrator::MigrationConfig::default()
+    };
+    let result = pg_dbmigrator::analyze::maybe_analyze_target(&config).await;
+    assert!(result.is_ok());
 }

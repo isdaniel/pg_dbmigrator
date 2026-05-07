@@ -15,7 +15,10 @@
 
 use std::time::Duration;
 
-use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
+use pg_walstream::{
+    LogicalReplicationStream, ReplicationSlotOptions, ReplicationStreamConfig, RetryConfig,
+    StreamingMode,
+};
 use tracing::{info, warn};
 
 use crate::config::OnlineOptions;
@@ -53,6 +56,10 @@ pub fn build_stream_config(opts: &OnlineOptions) -> ReplicationStreamConfig {
         opts.apply.health_check_interval,
         RetryConfig::default(),
     )
+    .with_slot_options(ReplicationSlotOptions {
+        snapshot: Some("export".to_string()),
+        ..Default::default()
+    })
 }
 
 /// Open a replication connection and create the replication slot, returning

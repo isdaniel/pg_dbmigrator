@@ -59,6 +59,7 @@ examples/online_migration/
 | [pg_dbmigrator/src/error.rs](pg_dbmigrator/src/error.rs)               | `MigrationError` (`thiserror`) + `Result<T>` alias                          |
 | [pg_dbmigrator/src/dump.rs](pg_dbmigrator/src/dump.rs)                 | `pg_dump` wrapper, `CommandRunner` trait, pure argv builder                 |
 | [pg_dbmigrator/src/restore.rs](pg_dbmigrator/src/restore.rs)           | `pg_restore` / `psql` wrapper                                               |
+| [pg_dbmigrator/src/analyze.rs](pg_dbmigrator/src/analyze.rs)           | Pre-dump `VACUUM ANALYZE` on source + post-restore `ANALYZE` on target       |
 | [pg_dbmigrator/src/snapshot.rs](pg_dbmigrator/src/snapshot.rs)         | Replication slot creation + exported snapshot retrieval                     |
 | [pg_dbmigrator/src/native_apply.rs](pg_dbmigrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn`, `wait_for_slot_inactive`, `disable_target_subscription` |
 | [pg_dbmigrator/src/orchestrator.rs](pg_dbmigrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
@@ -68,10 +69,11 @@ examples/online_migration/
 
 ### Pipeline stages (`MigrationStage`)
 
-`Validate → PrepareSnapshot* → Dump → Restore → StreamApply* → Lag* → CaughtUp* → Cutover* → Complete`
-(stages marked `*` are Online-only). Any new stage must be added in **both**
-[progress.rs](pg_dbmigrator/src/progress.rs) (the enum) and
-[orchestrator.rs](pg_dbmigrator/src/orchestrator.rs) /
+`Validate → SourceVacuum → PrepareSnapshot* → Dump → Restore → Analyze → StreamApply* → Lag* → CaughtUp* → Cutover* → Complete`
+(stages marked `*` are Online-only; `SourceVacuum` and `Analyze` are
+skippable via `--skip-source-vacuum` / `--skip-analyze`). Any new stage must
+be added in **both** [progress.rs](pg_dbmigrator/src/progress.rs) (the enum)
+and [orchestrator.rs](pg_dbmigrator/src/orchestrator.rs) /
 [native_apply.rs](pg_dbmigrator/src/native_apply.rs) (the reporting site).
 
 ### Online cutover model
@@ -179,6 +181,8 @@ reduce total migration time by 30–60 % compared to vanilla `pg_dump`/
 | `no_publications = true` | Skip publication DDL from source                    | `--keep-publications`      |
 | `no_subscriptions = true`| Skip subscription DDL from source                   | `--keep-subscriptions`     |
 | `jobs = min(cpu_count, 8)` | Parallel dump/restore up to 8 workers            | `--jobs N`                 |
+| `skip_source_vacuum = false` | Pre-dump VACUUM ANALYZE on source (clean pages, fresh stats) | `--skip-source-vacuum` |
+| `skip_analyze = false`   | Post-restore ANALYZE on target (fresh query-planner stats)  | `--skip-analyze`           |
 
 Optional opt-in flags:
 - `--no-table-access-method` (PG 15+) — omit `USING <am>` from CREATE TABLE
@@ -342,6 +346,9 @@ When adding a new `pub` type:
 
 - **Every `.rs` file must have a `#[cfg(test)] mod tests`**, even if it
   only holds two or three cases.
+- **All new and modified code must have unit tests.** The project enforces
+  a minimum **85 % code coverage** via Codecov. Before submitting, verify
+  that your changes do not drop the overall coverage below this threshold.
 - Test naming convention: `<behaviour>_<condition>`, e.g.
   `validate_rejects_zero_jobs`,
   `build_args_includes_jobs_only_for_directory_format`.
@@ -356,6 +363,15 @@ When adding a new `pub` type:
   **requires** updating or adding the corresponding tests in the same PR.
 - Integration scenarios live in `tests/integration/` as shell scripts;
   and smoke tests and may connect to a real database.
+- **After all code changes, you MUST verify that both unit tests AND
+  integration tests pass before considering the task complete:**
+  ```bash
+  # Unit tests (must pass without a running PostgreSQL)
+  cargo test --workspace
+
+  # Integration tests (requires Docker)
+  make integration
+  ```
 
 ### Test commands
 
@@ -404,12 +420,20 @@ When you receive a new requirement, work in this order:
 5. **Mirror it in the CLI** — add `#[arg(...)]` in
    [args.rs](pg_dbmigrator/src/bin/pg_dbmigrator/args.rs) and map it in `into_config`. Use
    kebab-case for flag names.
-6. **Update README + examples** if user-visible behaviour changes.
-7. **Run lint and tests**:
+6. **Add unit tests for all new/modified code** — ensure coverage stays
+   above **85 %**. Every new public function, config field, and CLI flag
+   must have at least one dedicated test.
+7. **Add or update integration tests** — if the feature changes end-to-end
+   behaviour, add a script in `tests/integration/` following existing
+   patterns, register it in `run_all.sh`, and add a CI job in
+   `.github/workflows/ci.yml`.
+8. **Update README + examples** if user-visible behaviour changes.
+9. **Run lint and ALL tests — nothing ships until green**:
    ```bash
    cargo fmt --all
    cargo clippy --workspace --all-targets -- -D warnings
    cargo test --workspace
+   make integration   # requires Docker
    ```
 
 ---
@@ -452,7 +476,9 @@ When you receive a new requirement, work in this order:
 
 - [ ] `cargo fmt --all` clean
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
-- [ ] `cargo test --workspace` green
+- [ ] `cargo test --workspace` green (all unit tests pass)
+- [ ] `make integration` green (all integration tests pass; requires Docker)
+- [ ] Unit tests added for all new and modified code (target ≥ 85 % coverage)
 - [ ] Every modified or new `pub` API has `///` documentation
 - [ ] Pure functions you changed have matching tests
 - [ ] If config/CLI behaviour changed, README, examples, and this file are
