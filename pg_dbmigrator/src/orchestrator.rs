@@ -110,26 +110,7 @@ impl Migrator {
         let dump_path = self.dump_path_or_default("dump_offline");
         let mut token = self.load_or_init_resume(&dump_path).await?;
 
-        // Pre-dump: VACUUM ANALYZE on source.
-        if !self.config.skip_source_vacuum && !token.has(CompletedStage::SourceVacuum) {
-            self.report(
-                MigrationStage::SourceVacuum,
-                "running VACUUM ANALYZE on source",
-            )
-            .await;
-            match maybe_vacuum_source(&self.config).await {
-                Ok(()) => {
-                    token.mark(CompletedStage::SourceVacuum);
-                    self.save_resume(&token, &dump_path).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "VACUUM ANALYZE on source failed (non-fatal, continuing)"
-                    );
-                }
-            }
-        }
+        self.run_source_vacuum_stage(&mut token, &dump_path).await;
 
         if !token.has(CompletedStage::Dump) {
             self.report(MigrationStage::Dump, "starting pg_dump").await;
@@ -166,23 +147,7 @@ impl Migrator {
             .await;
         }
 
-        // Post-restore: ANALYZE on target.
-        if !self.config.skip_analyze && !token.has(CompletedStage::Analyze) {
-            self.report(MigrationStage::Analyze, "running ANALYZE on target")
-                .await;
-            match maybe_analyze_target(&self.config).await {
-                Ok(()) => {
-                    token.mark(CompletedStage::Analyze);
-                    self.save_resume(&token, &dump_path).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "ANALYZE on target failed (non-fatal, continuing)"
-                    );
-                }
-            }
-        }
+        self.run_target_analyze_stage(&mut token, &dump_path).await;
 
         self.report(MigrationStage::Complete, "offline migration finished")
             .await;
@@ -240,25 +205,7 @@ impl Migrator {
         let dump_path = self.dump_path_or_default("dump_online");
         let mut token = self.load_or_init_resume(&dump_path).await?;
 
-        if !self.config.skip_source_vacuum && !token.has(CompletedStage::SourceVacuum) {
-            self.report(
-                MigrationStage::SourceVacuum,
-                "running VACUUM ANALYZE on source",
-            )
-            .await;
-            match maybe_vacuum_source(&self.config).await {
-                Ok(()) => {
-                    token.mark(CompletedStage::SourceVacuum);
-                    self.save_resume(&token, &dump_path).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "VACUUM ANALYZE on source failed (non-fatal, continuing)"
-                    );
-                }
-            }
-        }
+        self.run_source_vacuum_stage(&mut token, &dump_path).await;
 
         // When resuming past Dump, the slot was created in a previous run
         // and the exported snapshot is already gone — there is no live
@@ -354,22 +301,7 @@ impl Migrator {
         }
 
         // 3.5. Post-restore: ANALYZE on target.
-        if !self.config.skip_analyze && !token.has(CompletedStage::Analyze) {
-            self.report(MigrationStage::Analyze, "running ANALYZE on target")
-                .await;
-            match maybe_analyze_target(&self.config).await {
-                Ok(()) => {
-                    token.mark(CompletedStage::Analyze);
-                    self.save_resume(&token, &dump_path).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "ANALYZE on target failed (non-fatal, continuing)"
-                    );
-                }
-            }
-        }
+        self.run_target_analyze_stage(&mut token, &dump_path).await;
 
         // 4. Streaming apply via `CREATE SUBSCRIPTION` on the target. The
         // pg_walstream stream's only job was to keep the exported snapshot
@@ -625,6 +557,53 @@ impl Migrator {
     async fn connect_target(&self) -> Result<Client> {
         info!("connecting to target {}", self.config.target.redacted());
         connect_with_sslmode(&self.config.target.connection_string).await
+    }
+
+    /// Run the pre-dump VACUUM ANALYZE on source if enabled and not already
+    /// completed. Non-fatal: logs a warning on failure and continues.
+    async fn run_source_vacuum_stage(&self, token: &mut ResumeToken, dump_path: &std::path::Path) {
+        if self.config.skip_source_vacuum || token.has(CompletedStage::SourceVacuum) {
+            return;
+        }
+        self.report(
+            MigrationStage::SourceVacuum,
+            "running VACUUM ANALYZE on source",
+        )
+        .await;
+        match maybe_vacuum_source(&self.config).await {
+            Ok(()) => {
+                token.mark(CompletedStage::SourceVacuum);
+                self.save_resume(token, dump_path).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "VACUUM ANALYZE on source failed (non-fatal, continuing)"
+                );
+            }
+        }
+    }
+
+    /// Run post-restore ANALYZE on target if enabled and not already
+    /// completed. Non-fatal: logs a warning on failure and continues.
+    async fn run_target_analyze_stage(&self, token: &mut ResumeToken, dump_path: &std::path::Path) {
+        if self.config.skip_analyze || token.has(CompletedStage::Analyze) {
+            return;
+        }
+        self.report(MigrationStage::Analyze, "running ANALYZE on target")
+            .await;
+        match maybe_analyze_target(&self.config).await {
+            Ok(()) => {
+                token.mark(CompletedStage::Analyze);
+                self.save_resume(token, dump_path).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ANALYZE on target failed (non-fatal, continuing)"
+                );
+            }
+        }
     }
 
     async fn report(&self, stage: MigrationStage, message: impl Into<String>) {
@@ -1323,5 +1302,89 @@ mod tests {
             .collect();
         assert!(!stages.contains(&MigrationStage::SourceVacuum));
         assert!(!stages.contains(&MigrationStage::Analyze));
+    }
+
+    #[tokio::test]
+    async fn offline_run_skips_vacuum_when_resume_token_marks_it_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        let resume = dir.path().join("dump.resume.json");
+
+        let cfg = MigrationConfig {
+            resume: true,
+            dump_path: Some(dump.clone()),
+            resume_file: Some(resume.clone()),
+            split_sections: false,
+            skip_analyze: true,
+            skip_source_vacuum: false,
+            ..baseline_config()
+        };
+
+        // Pre-seed: SourceVacuum already done.
+        let mut t = crate::resume::ResumeToken::new(&cfg, dump.clone());
+        t.mark(crate::resume::CompletedStage::SourceVacuum);
+        t.save(&resume).await.unwrap();
+
+        let runner = Arc::new(RecordingRunner::default());
+        let reporter = Arc::new(CollectingReporter::new());
+        let migrator = Migrator::new(cfg)
+            .with_runner(runner)
+            .with_reporter(reporter.clone());
+
+        migrator.run(CancellationToken::new()).await.unwrap();
+
+        let stages: Vec<_> = reporter
+            .events()
+            .await
+            .into_iter()
+            .map(|e| e.stage)
+            .collect();
+        assert!(
+            !stages.contains(&MigrationStage::SourceVacuum),
+            "SourceVacuum should be skipped on resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_run_skips_analyze_when_resume_token_marks_it_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        let resume = dir.path().join("dump.resume.json");
+
+        let cfg = MigrationConfig {
+            resume: true,
+            dump_path: Some(dump.clone()),
+            resume_file: Some(resume.clone()),
+            split_sections: false,
+            skip_analyze: false,
+            skip_source_vacuum: true,
+            ..baseline_config()
+        };
+
+        // Pre-seed: Dump + Restore + Analyze already done.
+        let mut t = crate::resume::ResumeToken::new(&cfg, dump.clone());
+        t.mark(crate::resume::CompletedStage::Dump);
+        t.mark(crate::resume::CompletedStage::Restore);
+        t.mark(crate::resume::CompletedStage::Analyze);
+        t.save(&resume).await.unwrap();
+
+        let runner = Arc::new(RecordingRunner::default());
+        let reporter = Arc::new(CollectingReporter::new());
+        let migrator = Migrator::new(cfg)
+            .with_runner(runner)
+            .with_reporter(reporter.clone());
+
+        migrator.run(CancellationToken::new()).await.unwrap();
+
+        let stages: Vec<_> = reporter
+            .events()
+            .await
+            .into_iter()
+            .map(|e| e.stage)
+            .collect();
+        assert!(
+            !stages.contains(&MigrationStage::Analyze),
+            "Analyze should be skipped on resume"
+        );
     }
 }

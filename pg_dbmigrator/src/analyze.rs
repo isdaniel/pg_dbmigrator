@@ -78,46 +78,47 @@ pub async fn run_source_vacuum(source_conn: &str, schemas: &[String], verbose: b
     Ok(())
 }
 
-/// ANALYZE all tables in a single schema. Errors on individual tables
-/// are logged but do not abort the process.
-async fn analyze_schema(client: &Client, schema: &str, verbose: bool) {
+/// Run a maintenance command (ANALYZE or VACUUM ANALYZE) on all tables in a
+/// schema. Errors on individual tables are logged but do not abort the process.
+async fn run_per_table(
+    client: &Client,
+    schema: &str,
+    verbose: bool,
+    build_sql: fn(&str, &str, bool) -> String,
+    op_name: &str,
+) {
     let tables = match list_tables_in_schema(client, schema).await {
         Ok(t) => t,
         Err(e) => {
-            warn!(schema = %schema, error = %e, "failed to list tables for ANALYZE");
+            warn!(schema = %schema, error = %e, "failed to list tables for {op_name}");
             return;
         }
     };
     for table in &tables {
-        let sql = build_analyze_table_sql(schema, table, verbose);
+        let sql = build_sql(schema, table, verbose);
         if let Err(e) = client.batch_execute(&sql).await {
-            warn!(schema = %schema, table = %table, error = %e, "ANALYZE failed (continuing)");
+            warn!(schema = %schema, table = %table, error = %e, "{op_name} failed (continuing)");
         } else {
-            debug!(schema = %schema, table = %table, "ANALYZE done");
+            debug!(schema = %schema, table = %table, "{op_name} done");
         }
     }
 }
 
-/// VACUUM ANALYZE all tables in a single schema. Errors on individual
-/// tables are logged but do not abort the process — a locked table or
-/// a table owned by a restricted role should not block the entire
-/// migration.
+/// ANALYZE all tables in a single schema.
+async fn analyze_schema(client: &Client, schema: &str, verbose: bool) {
+    run_per_table(client, schema, verbose, build_analyze_table_sql, "ANALYZE").await;
+}
+
+/// VACUUM ANALYZE all tables in a single schema.
 async fn vacuum_schema(client: &Client, schema: &str, verbose: bool) {
-    let tables = match list_tables_in_schema(client, schema).await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(schema = %schema, error = %e, "failed to list tables for VACUUM");
-            return;
-        }
-    };
-    for table in &tables {
-        let sql = build_vacuum_analyze_table_sql(schema, table, verbose);
-        if let Err(e) = client.batch_execute(&sql).await {
-            warn!(schema = %schema, table = %table, error = %e, "VACUUM ANALYZE failed (continuing)");
-        } else {
-            debug!(schema = %schema, table = %table, "VACUUM ANALYZE done");
-        }
-    }
+    run_per_table(
+        client,
+        schema,
+        verbose,
+        build_vacuum_analyze_table_sql,
+        "VACUUM ANALYZE",
+    )
+    .await;
 }
 
 /// List ordinary user tables in a given schema.
