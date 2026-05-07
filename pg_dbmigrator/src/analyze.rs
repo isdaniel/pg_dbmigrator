@@ -86,8 +86,9 @@ async fn run_per_table(
     verbose: bool,
     build_sql: fn(&str, &str, bool) -> String,
     op_name: &str,
+    list_sql: &str,
 ) {
-    let tables = match list_tables_in_schema(client, schema).await {
+    let tables = match list_relations(client, schema, list_sql).await {
         Ok(t) => t,
         Err(e) => {
             warn!(schema = %schema, error = %e, "failed to list tables for {op_name}");
@@ -106,7 +107,15 @@ async fn run_per_table(
 
 /// ANALYZE all tables in a single schema.
 async fn analyze_schema(client: &Client, schema: &str, verbose: bool) {
-    run_per_table(client, schema, verbose, build_analyze_table_sql, "ANALYZE").await;
+    run_per_table(
+        client,
+        schema,
+        verbose,
+        build_analyze_table_sql,
+        "ANALYZE",
+        LIST_ANALYZABLE_SQL,
+    )
+    .await;
 }
 
 /// VACUUM ANALYZE all tables in a single schema.
@@ -117,24 +126,38 @@ async fn vacuum_schema(client: &Client, schema: &str, verbose: bool) {
         verbose,
         build_vacuum_analyze_table_sql,
         "VACUUM ANALYZE",
+        LIST_VACUUMABLE_SQL,
     )
     .await;
 }
 
-/// List ordinary user tables in a given schema.
-async fn list_tables_in_schema(client: &Client, schema: &str) -> Result<Vec<String>> {
-    let rows = client.query(LIST_TABLES_SQL, &[&schema]).await?;
+/// List relations matching a given query (parameterized by schema name).
+async fn list_relations(client: &Client, schema: &str, sql: &str) -> Result<Vec<String>> {
+    let rows = client.query(sql, &[&schema]).await?;
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
-/// SQL to list tables, partitioned tables, and materialized views in a schema.
-/// Excludes individual partitions — ANALYZE/VACUUM on a partitioned parent
+/// SQL to list tables, partitioned tables, and materialized views in a schema
+/// (for ANALYZE — all these relation types support ANALYZE).
+/// Excludes individual partitions — ANALYZE on a partitioned parent
 /// already processes its children.
-pub const LIST_TABLES_SQL: &str = "\
+pub const LIST_ANALYZABLE_SQL: &str = "\
     SELECT c.relname::text \
     FROM pg_class c \
     JOIN pg_namespace n ON n.oid = c.relnamespace \
     WHERE c.relkind IN ('r', 'p', 'm') \
+      AND n.nspname = $1 \
+      AND NOT c.relispartition";
+
+/// SQL to list tables and partitioned tables in a schema (for VACUUM).
+/// Excludes materialized views — PostgreSQL does not support VACUUM on them.
+/// Excludes individual partitions — VACUUM on a partitioned parent
+/// already processes its children.
+pub const LIST_VACUUMABLE_SQL: &str = "\
+    SELECT c.relname::text \
+    FROM pg_class c \
+    JOIN pg_namespace n ON n.oid = c.relnamespace \
+    WHERE c.relkind IN ('r', 'p') \
       AND n.nspname = $1 \
       AND NOT c.relispartition";
 
@@ -287,11 +310,19 @@ mod tests {
     }
 
     #[test]
-    fn list_tables_sql_includes_partitioned_and_materialized() {
-        assert!(LIST_TABLES_SQL.contains("IN ('r', 'p', 'm')"));
-        assert!(LIST_TABLES_SQL.contains("$1"));
-        assert!(LIST_TABLES_SQL.contains("pg_namespace"));
-        assert!(LIST_TABLES_SQL.contains("NOT c.relispartition"));
+    fn list_analyzable_sql_includes_partitioned_and_materialized() {
+        assert!(LIST_ANALYZABLE_SQL.contains("IN ('r', 'p', 'm')"));
+        assert!(LIST_ANALYZABLE_SQL.contains("$1"));
+        assert!(LIST_ANALYZABLE_SQL.contains("pg_namespace"));
+        assert!(LIST_ANALYZABLE_SQL.contains("NOT c.relispartition"));
+    }
+
+    #[test]
+    fn list_vacuumable_sql_excludes_materialized_views() {
+        assert!(LIST_VACUUMABLE_SQL.contains("IN ('r', 'p')"));
+        assert!(!LIST_VACUUMABLE_SQL.contains("'m'"));
+        assert!(LIST_VACUUMABLE_SQL.contains("$1"));
+        assert!(LIST_VACUUMABLE_SQL.contains("NOT c.relispartition"));
     }
 
     #[test]
