@@ -10,6 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   PG_SOURCE_URL: "postgresql://migrator:migrator@localhost:55432/appdb"
   PG_TARGET_URL: "postgresql://migrator:migrator@localhost:55433/appdb"
+  PG_SUBSCRIPTION_SOURCE_URL: "postgresql://migrator:migrator@source-db:5432/appdb"
 
 jobs:
   coverage:

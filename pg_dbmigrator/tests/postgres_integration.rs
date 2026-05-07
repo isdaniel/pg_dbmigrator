@@ -19,6 +19,15 @@ fn target_url() -> Option<String> {
     env::var("PG_TARGET_URL").ok()
 }
 
+/// Connection string the *target container's* apply worker uses to reach
+/// the source. In Docker this is the internal service name (`source-db:5432`)
+/// rather than the host-mapped `localhost:55432`.
+fn subscription_source_url() -> Option<String> {
+    env::var("PG_SUBSCRIPTION_SOURCE_URL")
+        .ok()
+        .or_else(source_url)
+}
+
 macro_rules! skip_without_pg {
     ($url:expr) => {
         match $url {
@@ -367,10 +376,19 @@ async fn disable_target_subscription_noop_when_absent() {
 
 // ─── snapshot::prepare_replication_slot ───────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn prepare_replication_slot_creates_and_exports_snapshot() {
     let url = skip_without_pg!(source_url());
     let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Clean up any leftovers from a previous run
+    client
+        .batch_execute(
+            "SELECT pg_drop_replication_slot('integ_snap_slot') \
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'integ_snap_slot')",
+        )
+        .await
+        .ok();
 
     client
         .batch_execute("CREATE PUBLICATION integ_snap_pub FOR ALL TABLES")
@@ -415,7 +433,7 @@ async fn prepare_replication_slot_creates_and_exports_snapshot() {
 
 // ─── Full online apply loop (short-circuit) ──────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn native_apply_with_cancel_exits_cleanly() {
     use pg_dbmigrator::cutover::CutoverHandle;
     use pg_dbmigrator::native_apply::{run_native_apply, SubscriptionLagProvider};
@@ -426,6 +444,7 @@ async fn native_apply_with_cancel_exits_cleanly() {
 
     let source_url_val = skip_without_pg!(source_url());
     let target_url_val = skip_without_pg!(target_url());
+    let sub_source_url = skip_without_pg!(subscription_source_url());
 
     let source = connect_with_sslmode(&source_url_val).await.unwrap();
     let target = connect_with_sslmode(&target_url_val).await.unwrap();
@@ -481,7 +500,7 @@ async fn native_apply_with_cancel_exits_cleanly() {
         &target,
         &provider,
         &online,
-        &source_url_val,
+        &sub_source_url,
         cutover,
         &reporter,
         cancel,

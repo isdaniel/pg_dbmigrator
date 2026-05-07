@@ -111,13 +111,24 @@ impl Migrator {
         let mut token = self.load_or_init_resume(&dump_path).await?;
 
         // Pre-dump: VACUUM ANALYZE on source.
-        if !self.config.skip_source_vacuum {
+        if !self.config.skip_source_vacuum && !token.has(CompletedStage::SourceVacuum) {
             self.report(
                 MigrationStage::SourceVacuum,
                 "running VACUUM ANALYZE on source",
             )
             .await;
-            maybe_vacuum_source(&self.config).await?;
+            match maybe_vacuum_source(&self.config).await {
+                Ok(()) => {
+                    token.mark(CompletedStage::SourceVacuum);
+                    self.save_resume(&token, &dump_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "VACUUM ANALYZE on source failed (non-fatal, continuing)"
+                    );
+                }
+            }
         }
 
         if !token.has(CompletedStage::Dump) {
@@ -156,10 +167,12 @@ impl Migrator {
         }
 
         // Post-restore: ANALYZE on target.
-        if !self.config.skip_analyze {
+        if !self.config.skip_analyze && !token.has(CompletedStage::Analyze) {
             self.report(MigrationStage::Analyze, "running ANALYZE on target")
                 .await;
             maybe_analyze_target(&self.config).await?;
+            token.mark(CompletedStage::Analyze);
+            self.save_resume(&token, &dump_path).await;
         }
 
         self.report(MigrationStage::Complete, "offline migration finished")
@@ -215,17 +228,28 @@ impl Migrator {
         verify_source_logical_replication_ready(&self.config.source.connection_string).await?;
 
         // 0.7. Pre-dump: VACUUM ANALYZE on source.
-        if !self.config.skip_source_vacuum {
+        let dump_path = self.dump_path_or_default("dump_online");
+        let mut token = self.load_or_init_resume(&dump_path).await?;
+
+        if !self.config.skip_source_vacuum && !token.has(CompletedStage::SourceVacuum) {
             self.report(
                 MigrationStage::SourceVacuum,
                 "running VACUUM ANALYZE on source",
             )
             .await;
-            maybe_vacuum_source(&self.config).await?;
+            match maybe_vacuum_source(&self.config).await {
+                Ok(()) => {
+                    token.mark(CompletedStage::SourceVacuum);
+                    self.save_resume(&token, &dump_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "VACUUM ANALYZE on source failed (non-fatal, continuing)"
+                    );
+                }
+            }
         }
-
-        let dump_path = self.dump_path_or_default("dump_online");
-        let mut token = self.load_or_init_resume(&dump_path).await?;
 
         // When resuming past Dump, the slot was created in a previous run
         // and the exported snapshot is already gone — there is no live
@@ -321,10 +345,12 @@ impl Migrator {
         }
 
         // 3.5. Post-restore: ANALYZE on target.
-        if !self.config.skip_analyze {
+        if !self.config.skip_analyze && !token.has(CompletedStage::Analyze) {
             self.report(MigrationStage::Analyze, "running ANALYZE on target")
                 .await;
             maybe_analyze_target(&self.config).await?;
+            token.mark(CompletedStage::Analyze);
+            self.save_resume(&token, &dump_path).await;
         }
 
         // 4. Streaming apply via `CREATE SUBSCRIPTION` on the target. The
