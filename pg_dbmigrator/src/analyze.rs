@@ -127,12 +127,15 @@ async fn list_tables_in_schema(client: &Client, schema: &str) -> Result<Vec<Stri
 }
 
 /// SQL to list tables, partitioned tables, and materialized views in a schema.
+/// Excludes individual partitions — ANALYZE/VACUUM on a partitioned parent
+/// already processes its children.
 pub const LIST_TABLES_SQL: &str = "\
     SELECT c.relname::text \
     FROM pg_class c \
     JOIN pg_namespace n ON n.oid = c.relnamespace \
     WHERE c.relkind IN ('r', 'p', 'm') \
-      AND n.nspname = $1";
+      AND n.nspname = $1 \
+      AND NOT c.relispartition";
 
 /// Build an `ANALYZE` statement for the entire database.
 pub fn build_analyze_sql(verbose: bool) -> String {
@@ -287,6 +290,7 @@ mod tests {
         assert!(LIST_TABLES_SQL.contains("IN ('r', 'p', 'm')"));
         assert!(LIST_TABLES_SQL.contains("$1"));
         assert!(LIST_TABLES_SQL.contains("pg_namespace"));
+        assert!(LIST_TABLES_SQL.contains("NOT c.relispartition"));
     }
 
     #[test]

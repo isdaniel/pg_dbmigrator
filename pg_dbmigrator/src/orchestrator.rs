@@ -170,9 +170,18 @@ impl Migrator {
         if !self.config.skip_analyze && !token.has(CompletedStage::Analyze) {
             self.report(MigrationStage::Analyze, "running ANALYZE on target")
                 .await;
-            maybe_analyze_target(&self.config).await?;
-            token.mark(CompletedStage::Analyze);
-            self.save_resume(&token, &dump_path).await;
+            match maybe_analyze_target(&self.config).await {
+                Ok(()) => {
+                    token.mark(CompletedStage::Analyze);
+                    self.save_resume(&token, &dump_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ANALYZE on target failed (non-fatal, continuing)"
+                    );
+                }
+            }
         }
 
         self.report(MigrationStage::Complete, "offline migration finished")
@@ -348,9 +357,18 @@ impl Migrator {
         if !self.config.skip_analyze && !token.has(CompletedStage::Analyze) {
             self.report(MigrationStage::Analyze, "running ANALYZE on target")
                 .await;
-            maybe_analyze_target(&self.config).await?;
-            token.mark(CompletedStage::Analyze);
-            self.save_resume(&token, &dump_path).await;
+            match maybe_analyze_target(&self.config).await {
+                Ok(()) => {
+                    token.mark(CompletedStage::Analyze);
+                    self.save_resume(&token, &dump_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ANALYZE on target failed (non-fatal, continuing)"
+                    );
+                }
+            }
         }
 
         // 4. Streaming apply via `CREATE SUBSCRIPTION` on the target. The
