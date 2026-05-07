@@ -134,3 +134,44 @@ echo "==> OK: target has 0 pg_statistic entries (ANALYZE correctly skipped)"
 
 echo ""
 echo "PASS: offline analyze — both enabled/disabled paths verified"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Test 3: ANALYZE + VACUUM with schema filter
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "══════════════════════════════════════════════════════════════"
+echo "  Test 3: ANALYZE + VACUUM with schema filter (--schema app)"
+echo "══════════════════════════════════════════════════════════════"
+
+LOG_FILE3="$(mktemp -t pg_dbmigrator_analyze_schema.XXXXXX.log)"
+echo "==> log file: $LOG_FILE3"
+
+seed_source
+reset_target_schema
+
+PG_DBMIGRATOR_SOURCE="$SOURCE_URL" \
+PG_DBMIGRATOR_TARGET="$TARGET_URL" \
+PG_DBMIGRATOR_SCHEMAS="app" \
+NO_COLOR=1 \
+RUST_LOG="info,pg_dbmigrator=info" \
+    cargo run --quiet -p offline_migration_example >"$LOG_FILE3" 2>&1
+
+# Verify data landed correctly
+assert_data_equal 500
+
+# Verify log contains the VACUUM ANALYZE and ANALYZE stages
+if ! grep -qi "VACUUM ANALYZE" "$LOG_FILE3"; then
+    echo "FAIL: log does not contain 'VACUUM ANALYZE' with schema filter" >&2
+    cat "$LOG_FILE3" >&2
+    exit 1
+fi
+echo "==> OK: log contains VACUUM ANALYZE on source (schema-filtered)"
+
+if ! grep -qi "running ANALYZE on target" "$LOG_FILE3"; then
+    echo "FAIL: log does not contain 'running ANALYZE on target' with schema filter" >&2
+    cat "$LOG_FILE3" >&2
+    exit 1
+fi
+echo "==> OK: log contains ANALYZE on target (schema-filtered)"
+
+echo "PASS: Test 3 — schema-filtered ANALYZE + VACUUM ran successfully"

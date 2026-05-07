@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PG_SOURCE_URL: "postgresql://migrator:migrator@localhost:55432/appdb"
+  PG_TARGET_URL: "postgresql://migrator:migrator@localhost:55433/appdb"
 
 jobs:
   coverage:
@@ -26,6 +28,8 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - uses: ./.github/actions/setup-integration
+
       - name: Run tests with coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
@@ -36,3 +40,7 @@ jobs:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

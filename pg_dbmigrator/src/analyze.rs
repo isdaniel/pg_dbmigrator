@@ -42,20 +42,12 @@ pub async fn run_target_analyze(
     let client = connect_with_sslmode(target_conn).await?;
 
     if schemas.is_empty() {
-        let sql = build_analyze_sql(None, verbose);
+        let sql = build_analyze_sql(verbose);
         client.batch_execute(&sql).await?;
         info!("ANALYZE complete (all schemas)");
     } else {
         for schema in schemas {
-            let sql = build_analyze_sql(Some(schema), verbose);
-            match client.batch_execute(&sql).await {
-                Ok(()) => {
-                    debug!(schema = %schema, "ANALYZE complete");
-                }
-                Err(e) => {
-                    warn!(schema = %schema, error = %e, "ANALYZE failed for schema (continuing)");
-                }
-            }
+            analyze_schema(&client, schema, verbose).await;
         }
         info!(count = schemas.len(), "ANALYZE complete (filtered schemas)");
     }
@@ -71,7 +63,7 @@ pub async fn run_source_vacuum(source_conn: &str, schemas: &[String], verbose: b
     let client = connect_with_sslmode(source_conn).await?;
 
     if schemas.is_empty() {
-        let sql = build_vacuum_analyze_sql(None, verbose);
+        let sql = build_vacuum_analyze_sql(verbose);
         client.batch_execute(&sql).await?;
         info!("VACUUM ANALYZE complete (all schemas)");
     } else {
@@ -84,6 +76,26 @@ pub async fn run_source_vacuum(source_conn: &str, schemas: &[String], verbose: b
         );
     }
     Ok(())
+}
+
+/// ANALYZE all tables in a single schema. Errors on individual tables
+/// are logged but do not abort the process.
+async fn analyze_schema(client: &Client, schema: &str, verbose: bool) {
+    let tables = match list_tables_in_schema(client, schema).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(schema = %schema, error = %e, "failed to list tables for ANALYZE");
+            return;
+        }
+    };
+    for table in &tables {
+        let sql = build_analyze_table_sql(schema, table, verbose);
+        if let Err(e) = client.batch_execute(&sql).await {
+            warn!(schema = %schema, table = %table, error = %e, "ANALYZE failed (continuing)");
+        } else {
+            debug!(schema = %schema, table = %table, "ANALYZE done");
+        }
+    }
 }
 
 /// VACUUM ANALYZE all tables in a single schema. Errors on individual
@@ -114,47 +126,36 @@ async fn list_tables_in_schema(client: &Client, schema: &str) -> Result<Vec<Stri
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
-/// SQL to list ordinary tables (relkind='r') in a schema.
+/// SQL to list tables, partitioned tables, and materialized views in a schema.
 pub const LIST_TABLES_SQL: &str = "\
     SELECT c.relname::text \
     FROM pg_class c \
     JOIN pg_namespace n ON n.oid = c.relnamespace \
-    WHERE c.relkind = 'r' \
+    WHERE c.relkind IN ('r', 'p', 'm') \
       AND n.nspname = $1";
 
-/// Build an `ANALYZE` statement. When `schema` is provided, uses
-/// schema-qualified form by analyzing all tables in that schema via
-/// a helper approach — for whole-schema ANALYZE we use the PostgreSQL
-/// schema-level syntax available in all supported versions.
-pub fn build_analyze_sql(schema: Option<&str>, verbose: bool) -> String {
+/// Build an `ANALYZE` statement for the entire database.
+pub fn build_analyze_sql(verbose: bool) -> String {
     let verbose_kw = if verbose { " VERBOSE" } else { "" };
-    match schema {
-        Some(s) => {
-            let quoted = quote_ident_simple(s);
-            format!("ANALYZE{verbose_kw} (SKIP_LOCKED);").replace(
-                "(SKIP_LOCKED)",
-                &format!("\"{}\".*", quoted.trim_matches('"')),
-            )
-        }
-        None => format!("ANALYZE{verbose_kw};"),
-    }
+    format!("ANALYZE{verbose_kw};")
 }
 
-/// Build a `VACUUM ANALYZE` statement for the entire database or a
-/// schema-level scope.
-pub fn build_vacuum_analyze_sql(schema: Option<&str>, verbose: bool) -> String {
+/// Build an `ANALYZE` statement for a single table.
+pub fn build_analyze_table_sql(schema: &str, table: &str, verbose: bool) -> String {
+    let verbose_kw = if verbose { " VERBOSE" } else { "" };
+    let schema_q = quote_ident_simple(schema);
+    let table_q = quote_ident_simple(table);
+    format!("ANALYZE{verbose_kw} {schema_q}.{table_q};")
+}
+
+/// Build a `VACUUM ANALYZE` statement for the entire database.
+pub fn build_vacuum_analyze_sql(verbose: bool) -> String {
     let verbose_kw = if verbose {
         " (VERBOSE, ANALYZE)"
     } else {
         " ANALYZE"
     };
-    match schema {
-        Some(s) => {
-            let quoted = quote_ident_simple(s);
-            format!("VACUUM{verbose_kw} \"{}\".* ;", quoted.trim_matches('"'))
-        }
-        None => format!("VACUUM{verbose_kw};"),
-    }
+    format!("VACUUM{verbose_kw};")
 }
 
 /// Build a `VACUUM ANALYZE` statement for a single table.
@@ -209,45 +210,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_analyze_sql_no_schema_not_verbose() {
-        assert_eq!(build_analyze_sql(None, false), "ANALYZE;");
+    fn build_analyze_sql_not_verbose() {
+        assert_eq!(build_analyze_sql(false), "ANALYZE;");
     }
 
     #[test]
-    fn build_analyze_sql_no_schema_verbose() {
-        assert_eq!(build_analyze_sql(None, true), "ANALYZE VERBOSE;");
+    fn build_analyze_sql_verbose() {
+        assert_eq!(build_analyze_sql(true), "ANALYZE VERBOSE;");
     }
 
     #[test]
-    fn build_analyze_sql_with_schema() {
-        let sql = build_analyze_sql(Some("public"), false);
-        assert!(sql.contains("\"public\".*"));
-        assert!(sql.starts_with("ANALYZE"));
+    fn build_analyze_table_sql_basic() {
+        let sql = build_analyze_table_sql("public", "users", false);
+        assert_eq!(sql, "ANALYZE \"public\".\"users\";");
     }
 
     #[test]
-    fn build_analyze_sql_schema_with_special_chars() {
-        let sql = build_analyze_sql(Some("my\"schema"), false);
-        assert!(sql.contains("\"my\"\"schema\".*"));
+    fn build_analyze_table_sql_verbose() {
+        let sql = build_analyze_table_sql("public", "users", true);
+        assert_eq!(sql, "ANALYZE VERBOSE \"public\".\"users\";");
     }
 
     #[test]
-    fn build_vacuum_analyze_sql_no_schema_not_verbose() {
-        let sql = build_vacuum_analyze_sql(None, false);
+    fn build_analyze_table_sql_special_chars() {
+        let sql = build_analyze_table_sql("my\"schema", "my\"table", false);
+        assert_eq!(sql, "ANALYZE \"my\"\"schema\".\"my\"\"table\";");
+    }
+
+    #[test]
+    fn build_vacuum_analyze_sql_not_verbose() {
+        let sql = build_vacuum_analyze_sql(false);
         assert_eq!(sql, "VACUUM ANALYZE;");
     }
 
     #[test]
-    fn build_vacuum_analyze_sql_no_schema_verbose() {
-        let sql = build_vacuum_analyze_sql(None, true);
+    fn build_vacuum_analyze_sql_verbose() {
+        let sql = build_vacuum_analyze_sql(true);
         assert_eq!(sql, "VACUUM (VERBOSE, ANALYZE);");
-    }
-
-    #[test]
-    fn build_vacuum_analyze_sql_with_schema() {
-        let sql = build_vacuum_analyze_sql(Some("myschema"), false);
-        assert!(sql.contains("\"myschema\".*"));
-        assert!(sql.starts_with("VACUUM"));
     }
 
     #[test]
@@ -279,8 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn list_tables_sql_is_valid_shape() {
-        assert!(LIST_TABLES_SQL.contains("relkind = 'r'"));
+    fn quote_ident_simple_empty() {
+        assert_eq!(quote_ident_simple(""), "\"\"");
+    }
+
+    #[test]
+    fn list_tables_sql_includes_partitioned_and_materialized() {
+        assert!(LIST_TABLES_SQL.contains("IN ('r', 'p', 'm')"));
         assert!(LIST_TABLES_SQL.contains("$1"));
         assert!(LIST_TABLES_SQL.contains("pg_namespace"));
     }
@@ -308,5 +312,27 @@ mod tests {
         let config = MigrationConfig::default();
         assert!(!config.skip_analyze);
         assert!(!config.skip_source_vacuum);
+    }
+
+    #[tokio::test]
+    async fn maybe_vacuum_source_skips_when_flag_set() {
+        let config = MigrationConfig {
+            skip_source_vacuum: true,
+            ..MigrationConfig::default()
+        };
+        // Should return Ok immediately without trying to connect.
+        let result = maybe_vacuum_source(&config).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn maybe_analyze_target_skips_when_flag_set() {
+        let config = MigrationConfig {
+            skip_analyze: true,
+            ..MigrationConfig::default()
+        };
+        // Should return Ok immediately without trying to connect.
+        let result = maybe_analyze_target(&config).await;
+        assert!(result.is_ok());
     }
 }

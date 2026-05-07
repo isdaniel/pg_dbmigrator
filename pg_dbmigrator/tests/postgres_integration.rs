@@ -545,3 +545,114 @@ async fn verify_pg_tools_installed_succeeds_in_ci() {
         .await
         .unwrap();
 }
+
+// ─── analyze::run_target_analyze ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn run_target_analyze_whole_database() {
+    let url = skip_without_pg!(target_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS integ_analyze; \
+             CREATE TABLE IF NOT EXISTS integ_analyze.t1 (id int PRIMARY KEY, v text);",
+        )
+        .await
+        .unwrap();
+
+    let result = pg_dbmigrator::analyze::run_target_analyze(&url, &[], false).await;
+    assert!(result.is_ok());
+
+    client
+        .batch_execute("DROP SCHEMA integ_analyze CASCADE")
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn run_target_analyze_with_schema_filter() {
+    let url = skip_without_pg!(target_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS integ_analyze_s; \
+             CREATE TABLE IF NOT EXISTS integ_analyze_s.t1 (id int PRIMARY KEY, v text); \
+             CREATE TABLE IF NOT EXISTS integ_analyze_s.t2 (id int PRIMARY KEY, n int);",
+        )
+        .await
+        .unwrap();
+
+    let schemas = vec!["integ_analyze_s".to_string()];
+    let result = pg_dbmigrator::analyze::run_target_analyze(&url, &schemas, false).await;
+    assert!(result.is_ok());
+
+    // Verbose mode
+    let result = pg_dbmigrator::analyze::run_target_analyze(&url, &schemas, true).await;
+    assert!(result.is_ok());
+
+    client
+        .batch_execute("DROP SCHEMA integ_analyze_s CASCADE")
+        .await
+        .ok();
+}
+
+// ─── analyze::run_source_vacuum ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn run_source_vacuum_whole_database() {
+    let url = skip_without_pg!(source_url());
+    let result = pg_dbmigrator::analyze::run_source_vacuum(&url, &[], false).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn run_source_vacuum_with_schema_filter() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS integ_vacuum_s; \
+             CREATE TABLE IF NOT EXISTS integ_vacuum_s.t1 (id int PRIMARY KEY, v text);",
+        )
+        .await
+        .unwrap();
+
+    let schemas = vec!["integ_vacuum_s".to_string()];
+    let result = pg_dbmigrator::analyze::run_source_vacuum(&url, &schemas, false).await;
+    assert!(result.is_ok());
+
+    // Verbose mode
+    let result = pg_dbmigrator::analyze::run_source_vacuum(&url, &schemas, true).await;
+    assert!(result.is_ok());
+
+    client
+        .batch_execute("DROP SCHEMA integ_vacuum_s CASCADE")
+        .await
+        .ok();
+}
+
+// ─── analyze::maybe_vacuum_source / maybe_analyze_target ─────────────────────
+
+#[tokio::test]
+async fn maybe_vacuum_source_runs_when_not_skipped() {
+    let url = skip_without_pg!(source_url());
+    let config = pg_dbmigrator::MigrationConfig {
+        source: pg_dbmigrator::EndpointConfig::parse(&url).unwrap(),
+        skip_source_vacuum: false,
+        ..pg_dbmigrator::MigrationConfig::default()
+    };
+    let result = pg_dbmigrator::analyze::maybe_vacuum_source(&config).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn maybe_analyze_target_runs_when_not_skipped() {
+    let url = skip_without_pg!(target_url());
+    let config = pg_dbmigrator::MigrationConfig {
+        target: pg_dbmigrator::EndpointConfig::parse(&url).unwrap(),
+        skip_analyze: false,
+        ..pg_dbmigrator::MigrationConfig::default()
+    };
+    let result = pg_dbmigrator::analyze::maybe_analyze_target(&config).await;
+    assert!(result.is_ok());
+}

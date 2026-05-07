@@ -46,6 +46,12 @@ async fn main() -> Result<()> {
         dump_scope: DumpScope::All,
         drop_target_first: true,
         jobs: 4,
+        schemas: env::var("PG_DBMIGRATOR_SCHEMAS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect(),
         split_sections: env_flag("PG_DBMIGRATOR_SPLIT_SECTIONS"),
         resume: env_flag("PG_DBMIGRATOR_RESUME"),
         resume_file: env::var("PG_DBMIGRATOR_RESUME_FILE")
