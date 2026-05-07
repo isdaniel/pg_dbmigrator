@@ -24,12 +24,16 @@ slot we created with `EXPORT_SNAPSHOT` before `pg_dump` ran.
 ### Online migration phases
 
 ```
-Validate → PrepareSnapshot → Dump → Restore → StreamApply → (Lag heartbeat …) → CaughtUp → Cutover → Complete
+Validate → SourceVacuum → PrepareSnapshot → Dump → Restore → Analyze → StreamApply → (Lag heartbeat …) → CaughtUp → Cutover → Complete
 ```
 
+* `SourceVacuum` runs `VACUUM ANALYZE` on the source to reclaim dead tuples
+  and refresh planner statistics before the dump. Skip with `--skip-source-vacuum`.
 * `PrepareSnapshot` creates the replication slot first; `START_REPLICATION`
   is deferred until **after** the dump completes, so the exported snapshot
   remains valid for the dump.
+* `Analyze` runs `ANALYZE` on the target after restore so the query planner
+  has fresh statistics for the first application queries. Skip with `--skip-analyze`.
 * During `StreamApply` the library polls
   `pg_current_wal_flush_lsn()` on the source every
   `--cutover-poll-secs` and emits a `Lag` progress event with
@@ -42,17 +46,9 @@ Validate → PrepareSnapshot → Dump → Restore → StreamApply → (Lag heart
 
 ```bash
 # Install the CLI from source. Produces a binary called `pg_dbmigrator`.
-cargo install --path pg_dbmigrator
-
+cargo install pg_dbmigrator
+pg_dbmigrator --help     
 pg_dbmigrator --mode offline --source '…' --target '…' --jobs 4
-```
-
-For development from a clone, the workspace ships a `cargo` alias so you
-don't need `--bin` / `-p`:
-
-```bash
-cargo pg_dbmigrator --help                      # equivalent to `cargo run --bin pg_dbmigrator -- --help`
-cargo pg_dbmigrator --mode offline --source '…' --target '…'
 ```
 
 ## CLI
@@ -60,13 +56,18 @@ cargo pg_dbmigrator --mode offline --source '…' --target '…'
 ### Offline
 
 ```bash
-cargo pg_dbmigrator \
+pg_dbmigrator \
     --mode offline \
     --source 'postgres://user:pw@src.example/db' \
     --target 'postgres://user:pw@dst.example/db' \
     --jobs 4 \
     --drop-target-first
 ```
+
+By default, `VACUUM ANALYZE` runs on the source before `pg_dump` and
+`ANALYZE` runs on the target after `pg_restore`. Disable with
+`--skip-source-vacuum` / `--skip-analyze` if you manage maintenance
+externally.
 
 ### Online
 
@@ -78,7 +79,7 @@ CREATE PUBLICATION pg_dbmigrator_pub FOR ALL TABLES;
 ```
 
 ```bash
-cargo pg_dbmigrator \
+pg_dbmigrator \
     --mode online \
     --source 'postgres://user:pw@src/db' \
     --target 'postgres://user:pw@dst/db' \
@@ -112,7 +113,7 @@ Use `--exclude-schema` and `--exclude-table` to omit large or transient
 objects from the dump. Both flags accept multiple values.
 
 ```bash
-cargo pg_dbmigrator --mode offline \
+pg_dbmigrator --mode offline \
     --source ... --target ... \
     --exclude-schema audit \
     --exclude-table public.large_log
@@ -143,6 +144,10 @@ When the customer is satisfied with the lag, they press **Ctrl+C** once:
 Cutover is always operator-driven; `--lag-threshold-bytes` is purely advisory and only controls when the one-shot `CaughtUp` "ready for cutover" event fires.
 
 For online migrations, hold on to `migrator.cutover_handle()` and call `request()` from your own signal handler / RPC endpoint when the operator is ready to cut over. See [`examples/online_migration`](examples/online_migration) for a complete program that wires Ctrl+C to the cutover handle.
+
+## Benchmark
+
+See [BENCHMARK.md](BENCHMARK.md) for migration performance results across 10 GB – 200 GB datasets (PG 16 → PG 18, 8 parallel jobs, zstd compression).
 
 ## Known limitations
 
