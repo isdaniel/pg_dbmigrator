@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
-license = "MIT"
+license = "BSD-3-Clause"
 authors = ["danielshih"]
 repository = "https://github.com/isdaniel/pg_dbmigrator"
 description = "PostgreSQL database migration tool (offline dump/restore + online logical replication)"

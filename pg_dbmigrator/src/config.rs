@@ -107,6 +107,23 @@ pub struct MigrationConfig {
     /// Leave `false` unless you know the target lacks the source's AMs.
     #[serde(default)]
     pub no_table_access_method: bool,
+    /// Skip `ANALYZE` on the target after restore completes. Default
+    /// `false` (i.e. ANALYZE runs). After a bulk `pg_restore` the
+    /// target's `pg_statistic` is empty — the query planner will produce
+    /// terrible plans until `ANALYZE` runs. Set to `true` only if you
+    /// run `ANALYZE` out-of-band or if restore time is more critical
+    /// than first-query latency.
+    #[serde(default)]
+    pub skip_analyze: bool,
+    /// Skip `VACUUM ANALYZE` on the source before dump. Default `false`
+    /// (i.e. VACUUM ANALYZE runs). Running VACUUM ANALYZE on the source
+    /// before `pg_dump` ensures the dump reads from clean, unfragmented
+    /// heap pages and has fresh statistics for parallel-dump planning.
+    /// Set to `true` when the source is under heavy write load and you
+    /// cannot afford the I/O cost of a full VACUUM, or when you have
+    /// just recently run maintenance manually.
+    #[serde(default)]
+    pub skip_source_vacuum: bool,
     /// If `true`, attempt to resume a previous run by reading the
     /// resume token at [`Self::resume_file`] (default
     /// `<dump_path>.resume.json`). Stages already marked complete in the
@@ -177,6 +194,8 @@ impl Default for MigrationConfig {
             no_comments: true,
             no_security_labels: true,
             no_table_access_method: false,
+            skip_analyze: false,
+            skip_source_vacuum: false,
             resume: false,
             resume_file: None,
             dump_path: None,
@@ -920,5 +939,37 @@ mod tests {
             ..MigrationConfig::default()
         };
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn serde_roundtrip_skip_analyze_fields() {
+        let cfg = MigrationConfig {
+            skip_analyze: true,
+            skip_source_vacuum: true,
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            ..MigrationConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: MigrationConfig = serde_json::from_str(&json).unwrap();
+        assert!(cfg2.skip_analyze);
+        assert!(cfg2.skip_source_vacuum);
+    }
+
+    #[test]
+    fn serde_backwards_compat_missing_skip_fields_default_false() {
+        // Simulate a JSON config from an older version that doesn't have
+        // the skip_analyze / skip_source_vacuum fields.
+        let cfg = MigrationConfig {
+            source: EndpointConfig::parse("postgres://u@s/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u@t/db").unwrap(),
+            ..MigrationConfig::default()
+        };
+        let mut json: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        json.as_object_mut().unwrap().remove("skip_analyze");
+        json.as_object_mut().unwrap().remove("skip_source_vacuum");
+        let cfg2: MigrationConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg2.skip_analyze);
+        assert!(!cfg2.skip_source_vacuum);
     }
 }

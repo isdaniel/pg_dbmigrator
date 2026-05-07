@@ -47,12 +47,16 @@ pub const RESUME_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletedStage {
+    /// Pre-dump `VACUUM ANALYZE` on the source completed.
+    SourceVacuum,
     /// Replication slot + exported snapshot have been created on the source.
     PrepareSnapshot,
     /// `pg_dump` finished successfully and the archive is on disk.
     Dump,
     /// `pg_restore` (or all three sections, if split) finished.
     Restore,
+    /// Post-restore `ANALYZE` on the target completed.
+    Analyze,
 }
 
 /// Persisted state used by [`crate::Migrator::run`] when `--resume` is set.
@@ -450,7 +454,9 @@ mod tests {
 
     #[test]
     fn completed_stage_ordering() {
+        assert!(CompletedStage::SourceVacuum < CompletedStage::PrepareSnapshot);
         assert!(CompletedStage::PrepareSnapshot < CompletedStage::Dump);
         assert!(CompletedStage::Dump < CompletedStage::Restore);
+        assert!(CompletedStage::Restore < CompletedStage::Analyze);
     }
 }

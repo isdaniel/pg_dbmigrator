@@ -14,10 +14,14 @@ pub enum MigrationStage {
     Validate,
     /// Creating logical replication slot + exporting snapshot (online only).
     PrepareSnapshot,
+    /// Pre-dump VACUUM ANALYZE on the source database.
+    SourceVacuum,
     /// Running `pg_dump` against the source.
     Dump,
     /// Running `pg_restore` (or `psql`) against the target.
     Restore,
+    /// Post-restore ANALYZE on the target database.
+    Analyze,
     /// Streaming WAL changes from source to target (online only).
     StreamApply,
     /// Periodic replication-lag heartbeat emitted every

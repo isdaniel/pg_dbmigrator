@@ -10,6 +10,7 @@ use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::analyze::{maybe_analyze_target, maybe_vacuum_source};
 use crate::config::{MigrationConfig, MigrationMode};
 use crate::cutover::CutoverHandle;
 use crate::dump::{run_pg_dump, CommandRunner, DumpFormat, DumpRequest, TokioCommandRunner};
@@ -109,6 +110,27 @@ impl Migrator {
         let dump_path = self.dump_path_or_default("dump_offline");
         let mut token = self.load_or_init_resume(&dump_path).await?;
 
+        // Pre-dump: VACUUM ANALYZE on source.
+        if !self.config.skip_source_vacuum && !token.has(CompletedStage::SourceVacuum) {
+            self.report(
+                MigrationStage::SourceVacuum,
+                "running VACUUM ANALYZE on source",
+            )
+            .await;
+            match maybe_vacuum_source(&self.config).await {
+                Ok(()) => {
+                    token.mark(CompletedStage::SourceVacuum);
+                    self.save_resume(&token, &dump_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "VACUUM ANALYZE on source failed (non-fatal, continuing)"
+                    );
+                }
+            }
+        }
+
         if !token.has(CompletedStage::Dump) {
             self.report(MigrationStage::Dump, "starting pg_dump").await;
             run_pg_dump(
@@ -142,6 +164,24 @@ impl Migrator {
                 "skipped (resume): pg_restore already complete",
             )
             .await;
+        }
+
+        // Post-restore: ANALYZE on target.
+        if !self.config.skip_analyze && !token.has(CompletedStage::Analyze) {
+            self.report(MigrationStage::Analyze, "running ANALYZE on target")
+                .await;
+            match maybe_analyze_target(&self.config).await {
+                Ok(()) => {
+                    token.mark(CompletedStage::Analyze);
+                    self.save_resume(&token, &dump_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ANALYZE on target failed (non-fatal, continuing)"
+                    );
+                }
+            }
         }
 
         self.report(MigrationStage::Complete, "offline migration finished")
@@ -196,8 +236,29 @@ impl Migrator {
         .await;
         verify_source_logical_replication_ready(&self.config.source.connection_string).await?;
 
+        // 0.7. Pre-dump: VACUUM ANALYZE on source.
         let dump_path = self.dump_path_or_default("dump_online");
         let mut token = self.load_or_init_resume(&dump_path).await?;
+
+        if !self.config.skip_source_vacuum && !token.has(CompletedStage::SourceVacuum) {
+            self.report(
+                MigrationStage::SourceVacuum,
+                "running VACUUM ANALYZE on source",
+            )
+            .await;
+            match maybe_vacuum_source(&self.config).await {
+                Ok(()) => {
+                    token.mark(CompletedStage::SourceVacuum);
+                    self.save_resume(&token, &dump_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "VACUUM ANALYZE on source failed (non-fatal, continuing)"
+                    );
+                }
+            }
+        }
 
         // When resuming past Dump, the slot was created in a previous run
         // and the exported snapshot is already gone — there is no live
@@ -290,6 +351,24 @@ impl Migrator {
                 "skipped (resume): pg_restore already complete",
             )
             .await;
+        }
+
+        // 3.5. Post-restore: ANALYZE on target.
+        if !self.config.skip_analyze && !token.has(CompletedStage::Analyze) {
+            self.report(MigrationStage::Analyze, "running ANALYZE on target")
+                .await;
+            match maybe_analyze_target(&self.config).await {
+                Ok(()) => {
+                    token.mark(CompletedStage::Analyze);
+                    self.save_resume(&token, &dump_path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ANALYZE on target failed (non-fatal, continuing)"
+                    );
+                }
+            }
         }
 
         // 4. Streaming apply via `CREATE SUBSCRIPTION` on the target. The
@@ -614,6 +693,8 @@ mod tests {
         MigrationConfig {
             source: EndpointConfig::parse("postgres://u:p@src/db").unwrap(),
             target: EndpointConfig::parse("postgres://u:p@dst/db").unwrap(),
+            skip_analyze: true,
+            skip_source_vacuum: true,
             ..MigrationConfig::default()
         }
     }
@@ -1207,5 +1288,40 @@ mod tests {
         let req = m.restore_request(Path::new("/tmp/dump"));
         assert!(req.no_owner);
         assert!(req.no_acl);
+    }
+
+    #[test]
+    fn baseline_config_skips_analyze_and_vacuum() {
+        let cfg = baseline_config();
+        assert!(cfg.skip_analyze);
+        assert!(cfg.skip_source_vacuum);
+    }
+
+    #[tokio::test]
+    async fn offline_run_skips_analyze_when_skip_flags_set() {
+        let runner = Arc::new(RecordingRunner::default());
+        let reporter = Arc::new(CollectingReporter::new());
+        let dir = tempfile::tempdir().unwrap();
+
+        let migrator = Migrator::new(MigrationConfig {
+            skip_analyze: true,
+            skip_source_vacuum: true,
+            split_sections: false,
+            ..baseline_config()
+        })
+        .with_runner(runner)
+        .with_reporter(reporter.clone())
+        .with_dump_path(dir.path().join("dump"));
+
+        migrator.run(CancellationToken::new()).await.unwrap();
+
+        let stages: Vec<_> = reporter
+            .events()
+            .await
+            .into_iter()
+            .map(|e| e.stage)
+            .collect();
+        assert!(!stages.contains(&MigrationStage::SourceVacuum));
+        assert!(!stages.contains(&MigrationStage::Analyze));
     }
 }
