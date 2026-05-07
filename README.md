@@ -42,17 +42,9 @@ Validate → PrepareSnapshot → Dump → Restore → StreamApply → (Lag heart
 
 ```bash
 # Install the CLI from source. Produces a binary called `pg_dbmigrator`.
-cargo install --path pg_dbmigrator
-
+cargo install pg_dbmigrator
+pg_dbmigrator --help     
 pg_dbmigrator --mode offline --source '…' --target '…' --jobs 4
-```
-
-For development from a clone, the workspace ships a `cargo` alias so you
-don't need `--bin` / `-p`:
-
-```bash
-cargo pg_dbmigrator --help                      # equivalent to `cargo run --bin pg_dbmigrator -- --help`
-cargo pg_dbmigrator --mode offline --source '…' --target '…'
 ```
 
 ## CLI
@@ -143,6 +135,10 @@ When the customer is satisfied with the lag, they press **Ctrl+C** once:
 Cutover is always operator-driven; `--lag-threshold-bytes` is purely advisory and only controls when the one-shot `CaughtUp` "ready for cutover" event fires.
 
 For online migrations, hold on to `migrator.cutover_handle()` and call `request()` from your own signal handler / RPC endpoint when the operator is ready to cut over. See [`examples/online_migration`](examples/online_migration) for a complete program that wires Ctrl+C to the cutover handle.
+
+## Benchmark
+
+See [BENCHMARK.md](BENCHMARK.md) for migration performance results across 10 GB – 200 GB datasets (PG 16 → PG 18, 8 parallel jobs, zstd compression).
 
 ## Known limitations
 

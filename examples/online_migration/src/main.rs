@@ -126,6 +126,8 @@ async fn main() -> Result<()> {
             .ok()
             .map(PathBuf::from),
         dump_path: env::var("PG_DBMIGRATOR_DUMP_PATH").ok().map(PathBuf::from),
+        skip_analyze: env_flag("PG_DBMIGRATOR_SKIP_ANALYZE"),
+        skip_source_vacuum: env_flag("PG_DBMIGRATOR_SKIP_SOURCE_VACUUM"),
         ..MigrationConfig::default()
     };
 

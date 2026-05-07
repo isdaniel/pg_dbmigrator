@@ -38,6 +38,7 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
 
+pub mod analyze;
 pub mod config;
 pub mod cutover;
 pub mod dump;

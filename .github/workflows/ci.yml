@@ -180,6 +180,26 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
 
+  integration-offline-analyze:
+    name: Integration test (offline, pre-dump VACUUM ANALYZE + post-restore ANALYZE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-integration
+
+      - name: Run offline analyze e2e
+        run: bash tests/integration/run_offline_analyze.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
   integration-online-lag-cadence:
     name: Integration test (online, adaptive lag-poll cadence near catch-up)
     runs-on: ubuntu-latest
@@ -274,6 +294,7 @@ jobs:
       - integration-offline-split-sections
       - integration-offline-resume
       - integration-offline-sigint-cancel
+      - integration-offline-analyze
       - integration-online-lag-cadence
       - integration-online-cancel-resume
       - integration-online-multi-resume-sustained

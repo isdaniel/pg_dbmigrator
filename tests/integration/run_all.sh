@@ -114,6 +114,7 @@ OFFLINE_TESTS=(
     tests/integration/run_offline_split_sections.sh
     tests/integration/run_offline_resume.sh
     tests/integration/run_offline_sigint_cancel.sh
+    tests/integration/run_offline_analyze.sh
 )
 
 ONLINE_TESTS=(

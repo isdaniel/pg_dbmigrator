@@ -204,6 +204,21 @@ pub struct Cli {
     #[arg(long)]
     pub no_table_access_method: bool,
 
+    /// Skip the post-restore `ANALYZE` on the target database. By default
+    /// pg_dbmigrator runs `ANALYZE` on all restored tables so the query
+    /// planner has fresh statistics immediately. Pass this flag only if you
+    /// run ANALYZE out-of-band or need minimum restore time.
+    #[arg(long)]
+    pub skip_analyze: bool,
+
+    /// Skip the pre-dump `VACUUM ANALYZE` on the source database. By
+    /// default pg_dbmigrator runs `VACUUM ANALYZE` on the source before
+    /// `pg_dump` to ensure the dump reads clean heap pages and has fresh
+    /// planner statistics for parallel-dump. Pass this flag when the
+    /// source is under heavy write load and VACUUM I/O is unacceptable.
+    #[arg(long)]
+    pub skip_source_vacuum: bool,
+
     /// Verbose logging.
     #[arg(long)]
     pub verbose: bool,
@@ -303,6 +318,8 @@ impl Cli {
             no_comments: true,
             no_security_labels: true,
             no_table_access_method: self.no_table_access_method,
+            skip_analyze: self.skip_analyze,
+            skip_source_vacuum: self.skip_source_vacuum,
         })
     }
 }
@@ -670,5 +687,47 @@ mod tests {
             "postgresql://u@dst/db",
         ]);
         assert!(cli.into_config().is_err());
+    }
+
+    #[test]
+    fn into_config_skip_analyze_flag() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--skip-analyze",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.skip_analyze);
+    }
+
+    #[test]
+    fn into_config_skip_source_vacuum_flag() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--skip-source-vacuum",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.skip_source_vacuum);
+    }
+
+    #[test]
+    fn into_config_defaults_analyze_and_vacuum_enabled() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(!cfg.skip_analyze);
+        assert!(!cfg.skip_source_vacuum);
     }
 }
