@@ -167,7 +167,12 @@ pub async fn apply_sequences_to_target(
 ///
 /// Public for unit tests.
 pub fn build_batch_setval_sql(sequences: &[&SourceSequence]) -> Result<String> {
-    let mut body = String::from("DO $seq_sync$\nDECLARE\n  _applied int := 0;\nBEGIN\n");
+    let mut body = String::new();
+    body.push_str(
+        "CREATE TEMP TABLE IF NOT EXISTS _seq_sync_result (applied int) ON COMMIT DROP;\n",
+    );
+    body.push_str("TRUNCATE _seq_sync_result;\n");
+    body.push_str("DO $seq_sync$\nDECLARE\n  _applied int := 0;\nBEGIN\n");
     for seq in sequences {
         let last_value = seq.last_value.unwrap_or(0);
         let qualified = format!(
@@ -184,11 +189,11 @@ pub fn build_batch_setval_sql(sequences: &[&SourceSequence]) -> Result<String> {
         body.push_str("  EXCEPTION WHEN OTHERS THEN\n");
         body.push_str(&format!(
             "    RAISE WARNING 'setval failed for {}: %', SQLERRM;\n",
-            qualified.replace('\'', "''")
+            qualified.replace('\'', "''").replace('%', "%%")
         ));
         body.push_str("  END;\n");
     }
-    body.push_str("  RAISE NOTICE 'sequences_applied=%', _applied;\n");
+    body.push_str("  INSERT INTO _seq_sync_result VALUES (_applied);\n");
     body.push_str("END;\n$seq_sync$;");
     Ok(body)
 }
@@ -198,23 +203,14 @@ pub fn build_batch_setval_sql(sequences: &[&SourceSequence]) -> Result<String> {
 async fn apply_batch(target: &Client, sequences: &[&SourceSequence]) -> Result<usize> {
     let sql = build_batch_setval_sql(sequences)?;
     target.batch_execute(&sql).await?;
-    // batch_execute doesn't give us the NOTICE content back through
-    // tokio-postgres easily, so we count the total minus expected failures.
-    // Since exceptions are caught inside the DO block, if batch_execute
-    // succeeds the block ran to completion. We optimistically report all as
-    // applied — individual failures would have raised WARNINGs in the PG log
-    // but the DO block itself succeeded.
-    //
-    // To get the true count we re-query.  However that adds a round-trip.
-    // Instead, since the DO block completed without error, we trust that all
-    // per-sequence sub-blocks either succeeded or logged a warning. We'll
-    // verify by checking which sequences actually changed — but for
-    // simplicity and to match prior behavior, assume all applied.
-    let applied = sequences.len();
+    let row = target
+        .query_one("SELECT applied FROM _seq_sync_result", &[])
+        .await?;
+    let applied: i32 = row.get(0);
     for seq in sequences {
         debug!(schema = %seq.schema, name = %seq.name, "synced sequence (batch)");
     }
-    Ok(applied)
+    Ok(applied as usize)
 }
 
 /// Apply a single sequence (used when there's only one).
@@ -444,14 +440,15 @@ mod tests {
         ];
         let refs: Vec<&SourceSequence> = seqs.iter().collect();
         let sql = build_batch_setval_sql(&refs).unwrap();
-        assert!(sql.starts_with("DO $seq_sync$"));
+        assert!(sql.contains("CREATE TEMP TABLE IF NOT EXISTS _seq_sync_result"));
+        assert!(sql.contains("DO $seq_sync$"));
         assert!(sql.ends_with("$seq_sync$;"));
         assert!(sql.contains("PERFORM setval"));
         assert!(sql.contains("42::bigint"));
         assert!(sql.contains("100::bigint"));
         assert!(sql.contains("EXCEPTION WHEN OTHERS"));
         assert!(sql.contains("_applied := _applied + 1"));
-        assert!(sql.contains("sequences_applied=%"));
+        assert!(sql.contains("INSERT INTO _seq_sync_result VALUES (_applied)"));
     }
 
     #[test]
@@ -468,10 +465,26 @@ mod tests {
     }
 
     #[test]
+    fn build_batch_setval_sql_escapes_percent_in_raise_warning() {
+        let seqs = [SourceSequence {
+            schema: "public".into(),
+            name: "pct%seq".into(),
+            last_value: Some(1),
+        }];
+        let refs: Vec<&SourceSequence> = seqs.iter().collect();
+        let sql = build_batch_setval_sql(&refs).unwrap();
+        assert!(
+            sql.contains("%%"),
+            "percent signs in identifiers must be doubled for RAISE WARNING"
+        );
+    }
+
+    #[test]
     fn build_batch_setval_sql_empty_input() {
         let refs: Vec<&SourceSequence> = vec![];
         let sql = build_batch_setval_sql(&refs).unwrap();
         assert!(sql.contains("DO $seq_sync$"));
         assert!(!sql.contains("PERFORM setval"));
+        assert!(sql.contains("INSERT INTO _seq_sync_result VALUES (_applied)"));
     }
 }
