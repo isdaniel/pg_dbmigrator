@@ -100,6 +100,14 @@ pub struct Cli {
     #[arg(long)]
     pub no_sequence_sync: bool,
 
+    /// Disable auto-creation of the publication on the source. By default the migrator creates the publication automatically if it does not exist. Pass this flag to require the operator to create it manually before running the migration. Online mode only.
+    #[arg(long)]
+    pub no_auto_create_publication: bool,
+
+    /// Keep the replication slot on the source after cutover (default: drop it). Online mode only.
+    #[arg(long)]
+    pub keep_slot: bool,
+
     /// pgoutput protocol version.
     #[arg(long, default_value_t = 2)]
     pub protocol_version: u32,
@@ -285,6 +293,8 @@ impl Cli {
             drop_subscription_on_cutover: !self.keep_subscription,
             force_clean: self.force_clean,
             sync_sequences_on_cutover: !self.no_sequence_sync,
+            auto_create_publication: !self.no_auto_create_publication,
+            drop_slot_on_cutover: !self.keep_slot,
             apply,
             cutover: CutoverConfig {
                 poll_interval: std::time::Duration::from_secs(self.cutover_poll_secs),
@@ -729,5 +739,51 @@ mod tests {
         let cfg = cli.into_config().unwrap();
         assert!(!cfg.skip_analyze);
         assert!(!cfg.skip_source_vacuum);
+    }
+
+    #[test]
+    fn into_config_no_auto_create_publication() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "online",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--no-auto-create-publication",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(!cfg.online.auto_create_publication);
+    }
+
+    #[test]
+    fn into_config_keep_slot() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "online",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+            "--keep-slot",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(!cfg.online.drop_slot_on_cutover);
+    }
+
+    #[test]
+    fn into_config_defaults_auto_create_publication_and_drop_slot() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgresql://u@src/db",
+            "--target",
+            "postgresql://u@dst/db",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.online.auto_create_publication);
+        assert!(cfg.online.drop_slot_on_cutover);
     }
 }

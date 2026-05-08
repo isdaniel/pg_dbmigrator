@@ -145,6 +145,175 @@ pub async fn verify_source_logical_replication_ready(source_conn: &str) -> Resul
     Ok(())
 }
 
+/// Quote a potentially schema-qualified name (`schema.table`) by splitting
+/// on `.` and quoting each part individually. Unqualified names (no dot)
+/// are quoted as a single identifier.
+///
+/// PostgreSQL requires `"schema"."table"` — quoting the whole thing as
+/// `"schema.table"` creates a single identifier that includes a literal dot.
+pub fn quote_qualified_name(name: &str) -> Result<String> {
+    let parts: Vec<&str> = name.splitn(2, '.').collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(MigrationError::config(format!(
+            "invalid qualified name: `{name}` (empty component)"
+        )));
+    }
+    let quoted: std::result::Result<Vec<_>, _> =
+        parts.iter().map(|p| pg_walstream::quote_ident(p)).collect();
+    Ok(quoted?.join("."))
+}
+
+/// Build the `CREATE PUBLICATION` SQL statement from the given parameters.
+///
+/// When both `tables` and `schemas` are empty, creates `FOR ALL TABLES`.
+/// When `tables` is non-empty, creates `FOR TABLE <t1>, <t2>, …`.
+/// When only `schemas` is non-empty, creates `FOR TABLES IN SCHEMA <s1>, <s2>, …`.
+pub fn build_create_publication_sql(
+    publication: &str,
+    tables: &[String],
+    schemas: &[String],
+) -> Result<String> {
+    let pub_ident = pg_walstream::quote_ident(publication)?;
+    let scope = if !tables.is_empty() || !schemas.is_empty() {
+        let mut scope_parts = Vec::new();
+        if !tables.is_empty() {
+            let quoted: std::result::Result<Vec<_>, _> =
+                tables.iter().map(|t| quote_qualified_name(t)).collect();
+            scope_parts.push(format!("TABLE {}", quoted?.join(", ")));
+        }
+        if !schemas.is_empty() {
+            let quoted: std::result::Result<Vec<_>, _> = schemas
+                .iter()
+                .map(|s| pg_walstream::quote_ident(s))
+                .collect();
+            scope_parts.push(format!("TABLES IN SCHEMA {}", quoted?.join(", ")));
+        }
+        format!("FOR {}", scope_parts.join(", "))
+    } else {
+        "FOR ALL TABLES".to_string()
+    };
+    Ok(format!("CREATE PUBLICATION {pub_ident} {scope}"))
+}
+
+/// Filter a list of `schema.table` names by removing entries that match
+/// `exclude_tables` or belong to a schema in `exclude_schemas`.
+pub fn filter_tables_by_exclusions(
+    tables: &[String],
+    exclude_tables: &[String],
+    exclude_schemas: &[String],
+) -> Vec<String> {
+    tables
+        .iter()
+        .filter(|t| {
+            if exclude_tables.iter().any(|ex| ex == *t) {
+                return false;
+            }
+            if let Some(schema) = t.split('.').next() {
+                if exclude_schemas.iter().any(|ex| ex == schema) {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+/// Query the source for all ordinary and partitioned tables, excluding
+/// system schemas and applying the caller's exclusion lists. Returns
+/// `schema.table` qualified names suitable for `build_create_publication_sql`.
+async fn fetch_published_tables(
+    client: &tokio_postgres::Client,
+    exclude_tables: &[String],
+    exclude_schemas: &[String],
+) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "SELECT n.nspname::text, c.relname::text \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p') \
+               AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
+            &[],
+        )
+        .await?;
+
+    let all_tables: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let schema: &str = r.get(0);
+            let table: &str = r.get(1);
+            format!("{schema}.{table}")
+        })
+        .collect();
+
+    Ok(filter_tables_by_exclusions(
+        &all_tables,
+        exclude_tables,
+        exclude_schemas,
+    ))
+}
+
+/// Ensure that a logical-replication publication with the given name exists
+/// on the source. If absent and `auto_create` is enabled, create it
+/// automatically.
+///
+/// When `exclude_tables` or `exclude_schemas` are non-empty and the include
+/// lists (`tables`, `schemas`) are empty, the publication is scoped to an
+/// explicit table list obtained by querying the source and subtracting the
+/// excluded objects. This prevents the target's apply worker from crashing
+/// when excluded objects are modified on the source.
+///
+/// Returns `Ok(true)` if the publication was auto-created, `Ok(false)` if
+/// it already existed.
+pub async fn ensure_publication_exists(
+    source_conn: &str,
+    publication: &str,
+    tables: &[String],
+    schemas: &[String],
+    exclude_tables: &[String],
+    exclude_schemas: &[String],
+) -> Result<bool> {
+    let client = connect_with_sslmode(source_conn).await?;
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
+            &[&publication],
+        )
+        .await?;
+    let exists: bool = row.get(0);
+    if exists {
+        info!(publication, "publication already exists on source");
+        return Ok(false);
+    }
+
+    let has_exclusions = !exclude_tables.is_empty() || !exclude_schemas.is_empty();
+    let has_includes = !tables.is_empty() || !schemas.is_empty();
+
+    let (effective_tables, effective_schemas): (Vec<String>, Vec<String>) = if has_exclusions
+        && !has_includes
+    {
+        let resolved = fetch_published_tables(&client, exclude_tables, exclude_schemas).await?;
+        (resolved, Vec::new())
+    } else if has_exclusions && has_includes {
+        let filtered_tables = filter_tables_by_exclusions(tables, exclude_tables, exclude_schemas);
+        let filtered_schemas: Vec<String> = schemas
+            .iter()
+            .filter(|s| !exclude_schemas.iter().any(|ex| ex == *s))
+            .cloned()
+            .collect();
+        (filtered_tables, filtered_schemas)
+    } else {
+        (tables.to_vec(), schemas.to_vec())
+    };
+
+    let sql = build_create_publication_sql(publication, &effective_tables, &effective_schemas)?;
+    info!(publication, sql = %sql, "auto-creating publication on source");
+    client.batch_execute(&sql).await?;
+    info!(publication, "publication created successfully");
+    Ok(true)
+}
+
 /// Rewrite a connection string so the path component (database name) points
 /// to the `postgres` maintenance database. Used to run admin commands like
 /// `CREATE DATABASE` which cannot target the database they are creating.
@@ -424,5 +593,191 @@ mod tests {
     #[test]
     fn required_tools_length() {
         assert_eq!(REQUIRED_TOOLS.len(), 2);
+    }
+
+    #[test]
+    fn build_publication_sql_all_tables() {
+        let sql = build_create_publication_sql("my_pub", &[], &[]).unwrap();
+        assert_eq!(sql, "CREATE PUBLICATION \"my_pub\" FOR ALL TABLES");
+    }
+
+    #[test]
+    fn build_publication_sql_specific_tables() {
+        let tables = vec!["public.users".to_string(), "public.orders".to_string()];
+        let sql = build_create_publication_sql("my_pub", &tables, &[]).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE PUBLICATION \"my_pub\" FOR TABLE \"public\".\"users\", \"public\".\"orders\""
+        );
+    }
+
+    #[test]
+    fn build_publication_sql_specific_schemas() {
+        let schemas = vec!["public".to_string(), "app".to_string()];
+        let sql = build_create_publication_sql("my_pub", &[], &schemas).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE PUBLICATION \"my_pub\" FOR TABLES IN SCHEMA \"public\", \"app\""
+        );
+    }
+
+    #[test]
+    fn build_publication_sql_combines_tables_and_schemas() {
+        let tables = vec!["public.users".to_string()];
+        let schemas = vec!["app".to_string()];
+        let sql = build_create_publication_sql("my_pub", &tables, &schemas).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE PUBLICATION \"my_pub\" FOR TABLE \"public\".\"users\", TABLES IN SCHEMA \"app\""
+        );
+    }
+
+    #[test]
+    fn build_publication_sql_quotes_special_chars() {
+        let sql = build_create_publication_sql("pub\"name", &[], &[]).unwrap();
+        assert!(sql.contains("\"pub\"\"name\""));
+    }
+
+    #[test]
+    fn quote_qualified_name_unqualified() {
+        let result = quote_qualified_name("users").unwrap();
+        assert_eq!(result, "\"users\"");
+    }
+
+    #[test]
+    fn quote_qualified_name_schema_qualified() {
+        let result = quote_qualified_name("public.users").unwrap();
+        assert_eq!(result, "\"public\".\"users\"");
+    }
+
+    #[test]
+    fn quote_qualified_name_special_chars() {
+        let result = quote_qualified_name("my schema.my table").unwrap();
+        assert_eq!(result, "\"my schema\".\"my table\"");
+    }
+
+    #[test]
+    fn quote_qualified_name_dot_in_table_part() {
+        // Only splits on first dot: "schema.table.extra" -> "schema" + "table.extra"
+        let result = quote_qualified_name("public.my.table").unwrap();
+        assert_eq!(result, "\"public\".\"my.table\"");
+    }
+
+    #[test]
+    fn quote_qualified_name_rejects_trailing_dot() {
+        let result = quote_qualified_name("public.");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn quote_qualified_name_rejects_leading_dot() {
+        let result = quote_qualified_name(".table");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn filter_tables_excludes_by_table_name() {
+        let tables = vec![
+            "public.users".into(),
+            "public.orders".into(),
+            "public.large_logs".into(),
+        ];
+        let result = filter_tables_by_exclusions(&tables, &["public.large_logs".into()], &[]);
+        assert_eq!(result, vec!["public.users", "public.orders"]);
+    }
+
+    #[test]
+    fn filter_tables_excludes_by_schema() {
+        let tables = vec![
+            "public.users".into(),
+            "audit.events".into(),
+            "audit.actions".into(),
+            "app.config".into(),
+        ];
+        let result = filter_tables_by_exclusions(&tables, &[], &["audit".into()]);
+        assert_eq!(result, vec!["public.users", "app.config"]);
+    }
+
+    #[test]
+    fn filter_tables_excludes_both_table_and_schema() {
+        let tables = vec![
+            "public.users".into(),
+            "public.large_logs".into(),
+            "audit.events".into(),
+            "app.config".into(),
+        ];
+        let result =
+            filter_tables_by_exclusions(&tables, &["public.large_logs".into()], &["audit".into()]);
+        assert_eq!(result, vec!["public.users", "app.config"]);
+    }
+
+    #[test]
+    fn filter_tables_no_exclusions_returns_all() {
+        let tables = vec!["public.users".into(), "public.orders".into()];
+        let result = filter_tables_by_exclusions(&tables, &[], &[]);
+        assert_eq!(result, tables);
+    }
+
+    #[test]
+    fn filter_tables_empty_input() {
+        let result: Vec<String> =
+            filter_tables_by_exclusions(&[], &["public.x".into()], &["audit".into()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_tables_exclude_all_matches_returns_empty() {
+        let tables = vec!["audit.x".into(), "audit.y".into()];
+        let result = filter_tables_by_exclusions(&tables, &[], &["audit".into()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_tables_exclude_nonexistent_is_noop() {
+        let tables = vec!["public.users".into()];
+        let result = filter_tables_by_exclusions(
+            &tables,
+            &["public.nonexistent".into()],
+            &["no_such_schema".into()],
+        );
+        assert_eq!(result, vec!["public.users"]);
+    }
+
+    #[test]
+    fn filter_then_build_sql_excludes_correctly() {
+        let all_tables: Vec<String> = vec![
+            "public.users".into(),
+            "public.orders".into(),
+            "audit.logs".into(),
+            "temp.scratch".into(),
+        ];
+        let filtered =
+            filter_tables_by_exclusions(&all_tables, &["public.orders".into()], &["audit".into()]);
+        let sql = build_create_publication_sql("my_pub", &filtered, &[]).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE PUBLICATION \"my_pub\" FOR TABLE \"public\".\"users\", \"temp\".\"scratch\""
+        );
+        assert!(!sql.contains("orders"));
+        assert!(!sql.contains("audit"));
+    }
+
+    #[test]
+    fn filter_schemas_from_include_list() {
+        let schemas: Vec<String> = ["public", "audit", "app"]
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        let exclude_schemas: Vec<String> = ["audit"].iter().map(|s| (*s).into()).collect();
+        let filtered: Vec<String> = schemas
+            .iter()
+            .filter(|s| !exclude_schemas.iter().any(|ex| ex == *s))
+            .cloned()
+            .collect();
+        assert_eq!(filtered, vec!["public", "app"]);
+        let sql = build_create_publication_sql("p", &[], &filtered).unwrap();
+        assert!(sql.contains("\"public\""));
+        assert!(sql.contains("\"app\""));
+        assert!(!sql.contains("\"audit\""));
     }
 }

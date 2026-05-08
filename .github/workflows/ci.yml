@@ -282,6 +282,46 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
 
+  integration-online-auto-pub-lifecycle:
+    name: Integration test (online, auto-create publication + post-cutover cleanup)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-integration
+
+      - name: Run online auto-pub lifecycle e2e
+        run: bash tests/integration/run_online_auto_pub_lifecycle.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  integration-online-keep-slot:
+    name: Integration test (online, keep-slot flag retains slot + pre-existing publication)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-integration
+
+      - name: Run online keep-slot e2e
+        run: bash tests/integration/run_online_keep_slot.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
   publish:
     name: Publish to crates.io
     if: startsWith(github.ref, 'refs/tags/v')
@@ -299,6 +339,8 @@ jobs:
       - integration-online-cancel-resume
       - integration-online-multi-resume-sustained
       - integration-online-sequence-sync
+      - integration-online-auto-pub-lifecycle
+      - integration-online-keep-slot
     runs-on: ubuntu-latest
     permissions:
       contents: write

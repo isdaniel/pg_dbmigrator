@@ -37,6 +37,9 @@ pub enum MigrationStage {
     /// Cutover requested — the apply loop is winding down so the operator can
     /// switch traffic to the target.
     Cutover,
+    /// Post-cutover cleanup of auto-created publications and replication slots
+    /// on the source.
+    SourceCleanup,
     /// All work completed.
     Complete,
 }
@@ -249,12 +252,15 @@ mod tests {
         let stages = [
             MigrationStage::Validate,
             MigrationStage::PrepareSnapshot,
+            MigrationStage::SourceVacuum,
             MigrationStage::Dump,
             MigrationStage::Restore,
+            MigrationStage::Analyze,
             MigrationStage::StreamApply,
             MigrationStage::Lag,
             MigrationStage::CaughtUp,
             MigrationStage::Cutover,
+            MigrationStage::SourceCleanup,
             MigrationStage::Complete,
         ];
         for stage in stages {

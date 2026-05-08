@@ -16,12 +16,13 @@ use crate::cutover::CutoverHandle;
 use crate::dump::{run_pg_dump, CommandRunner, DumpFormat, DumpRequest, TokioCommandRunner};
 use crate::error::{MigrationError, Result};
 use crate::native_apply::{
-    disable_target_subscription, force_clean_stale_state, run_native_apply, wait_for_slot_inactive,
-    ApplyStats, PgSubscriptionLagProvider,
+    disable_target_subscription, drop_source_publication, drop_source_slot,
+    force_clean_stale_state, run_native_apply, wait_for_slot_inactive, ApplyStats,
+    PgSubscriptionLagProvider,
 };
 use crate::preflight::{
-    ensure_pglogical_not_interfering, ensure_target_database_exists, verify_pg_tools_installed,
-    verify_publication_exists, verify_source_logical_replication_ready,
+    ensure_pglogical_not_interfering, ensure_publication_exists, ensure_target_database_exists,
+    verify_pg_tools_installed, verify_publication_exists, verify_source_logical_replication_ready,
 };
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
 use crate::restore::{run_pg_restore, run_pg_restore_in_sections, RestoreRequest};
@@ -213,22 +214,46 @@ impl Migrator {
         // hold a stream) when we still need to run pg_dump.
         let mut prepared_stream = None;
         let snapshot_name = if !token.has(CompletedStage::Dump) {
-            // Fail fast if the publication is missing. Without this check
-            // the apply worker would only error out 10+ minutes later
-            // (after dump+restore) from inside `CREATE SUBSCRIPTION`.
-            self.report(
-                MigrationStage::Validate,
-                format!(
-                    "verifying publication `{}` exists on source",
-                    self.config.online.publication
-                ),
-            )
-            .await;
-            verify_publication_exists(
-                &self.config.source.connection_string,
-                &self.config.online.publication,
-            )
-            .await?;
+            // Ensure the publication exists on the source. If auto-create
+            // is enabled and it's missing, create it. Otherwise fail fast
+            // so the apply worker doesn't error 10+ minutes later.
+            if self.config.online.auto_create_publication {
+                self.report(
+                    MigrationStage::Validate,
+                    format!(
+                        "ensuring publication `{}` exists on source (auto-create enabled)",
+                        self.config.online.publication
+                    ),
+                )
+                .await;
+                let created = ensure_publication_exists(
+                    &self.config.source.connection_string,
+                    &self.config.online.publication,
+                    &self.config.tables,
+                    &self.config.schemas,
+                    &self.config.exclude_tables,
+                    &self.config.exclude_schemas,
+                )
+                .await?;
+                if created {
+                    token.pub_auto_created = true;
+                    self.save_resume(&token, &dump_path).await;
+                }
+            } else {
+                self.report(
+                    MigrationStage::Validate,
+                    format!(
+                        "verifying publication `{}` exists on source",
+                        self.config.online.publication
+                    ),
+                )
+                .await;
+                verify_publication_exists(
+                    &self.config.source.connection_string,
+                    &self.config.online.publication,
+                )
+                .await?;
+            }
 
             // 1. Prepare slot + snapshot (must happen *before* pg_dump runs).
             self.report(MigrationStage::PrepareSnapshot, "creating replication slot")
@@ -391,6 +416,17 @@ impl Migrator {
                     .await;
                 }
             }
+        }
+
+        // 6. Post-cutover cleanup: drop auto-created publication and slot.
+        if stats.cutover_triggered {
+            cleanup_source_after_cutover(
+                &self.config.source.connection_string,
+                &self.config.online,
+                token.pub_auto_created,
+                self.reporter.as_ref(),
+            )
+            .await;
         }
 
         self.report(MigrationStage::Complete, "online migration finished")
@@ -627,6 +663,54 @@ impl MigrationOutcome {
     /// (operator-driven or auto). Always `false` for offline migrations.
     pub fn cutover_triggered(&self) -> bool {
         self.stats.map(|s| s.cutover_triggered).unwrap_or(false)
+    }
+}
+
+/// Post-cutover cleanup: drop auto-created publication and replication slot
+/// on the source. Non-fatal — errors are logged as warnings.
+pub async fn cleanup_source_after_cutover(
+    source_conn: &str,
+    online: &crate::config::OnlineOptions,
+    pub_auto_created: bool,
+    reporter: &dyn ProgressReporter,
+) {
+    if pub_auto_created {
+        reporter
+            .report(ProgressEvent::new(
+                MigrationStage::SourceCleanup,
+                format!(
+                    "dropping auto-created publication `{}` on source",
+                    online.publication
+                ),
+            ))
+            .await;
+        if let Err(e) = drop_source_publication(source_conn, &online.publication).await {
+            tracing::warn!(
+                error = %e,
+                "failed to drop auto-created publication (non-fatal)"
+            );
+        }
+    }
+
+    if online.drop_slot_on_cutover {
+        reporter
+            .report(ProgressEvent::new(
+                MigrationStage::SourceCleanup,
+                format!("dropping replication slot `{}` on source", online.slot_name),
+            ))
+            .await;
+        if let Err(e) = wait_for_slot_inactive(source_conn, &online.slot_name, reporter).await {
+            tracing::warn!(
+                error = %e,
+                "failed waiting for slot to become inactive (non-fatal)"
+            );
+        }
+        if let Err(e) = drop_source_slot(source_conn, &online.slot_name).await {
+            tracing::warn!(
+                error = %e,
+                "failed to drop replication slot (non-fatal)"
+            );
+        }
     }
 }
 
