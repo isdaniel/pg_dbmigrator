@@ -576,11 +576,7 @@ mod tests {
                 .unwrap_or(Ok(()))
         }
         async fn query_batch_applied(&self) -> Result<i32> {
-            self.batch_applied
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or(Ok(0))
+            self.batch_applied.lock().unwrap().take().unwrap_or(Ok(0))
         }
     }
 
@@ -617,9 +613,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_single_sequence_failure_returns_zero() {
-        let target = MockTarget::ok(0).with_setval_results(vec![Err(
-            MigrationError::config("permission denied"),
-        )]);
+        let target = MockTarget::ok(0)
+            .with_setval_results(vec![Err(MigrationError::config("permission denied"))]);
         let seqs = vec![seq("public", "users_id_seq", Some(42))];
         let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
         assert_eq!(applied, 0);
@@ -628,10 +623,7 @@ mod tests {
     #[tokio::test]
     async fn apply_batch_success() {
         let target = MockTarget::ok(2);
-        let seqs = vec![
-            seq("public", "s1", Some(10)),
-            seq("public", "s2", Some(20)),
-        ];
+        let seqs = vec![seq("public", "s1", Some(10)), seq("public", "s2", Some(20))];
         let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
         assert_eq!(applied, 2);
     }
@@ -639,10 +631,7 @@ mod tests {
     #[tokio::test]
     async fn apply_batch_reports_partial_success() {
         let target = MockTarget::ok(1);
-        let seqs = vec![
-            seq("public", "s1", Some(10)),
-            seq("public", "s2", Some(20)),
-        ];
+        let seqs = vec![seq("public", "s1", Some(10)), seq("public", "s2", Some(20))];
         let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
         assert_eq!(applied, 1);
     }
@@ -650,10 +639,7 @@ mod tests {
     #[tokio::test]
     async fn apply_batch_failure_falls_back_to_individual() {
         let target = MockTarget::batch_fails().with_setval_results(vec![Ok(1), Ok(1)]);
-        let seqs = vec![
-            seq("public", "s1", Some(10)),
-            seq("public", "s2", Some(20)),
-        ];
+        let seqs = vec![seq("public", "s1", Some(10)), seq("public", "s2", Some(20))];
         let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
         assert_eq!(applied, 2);
     }
