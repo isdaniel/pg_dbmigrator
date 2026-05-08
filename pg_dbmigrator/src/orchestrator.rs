@@ -231,6 +231,8 @@ impl Migrator {
                     &self.config.online.publication,
                     &self.config.tables,
                     &self.config.schemas,
+                    &self.config.exclude_tables,
+                    &self.config.exclude_schemas,
                 )
                 .await?;
                 if created {
