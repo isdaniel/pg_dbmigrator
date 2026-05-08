@@ -90,6 +90,8 @@ async fn main() -> Result<()> {
         drop_subscription_on_cutover: !env_flag("PG_DBMIGRATOR_KEEP_SUBSCRIPTION"),
         force_clean: env_flag("PG_DBMIGRATOR_FORCE_CLEAN"),
         sync_sequences_on_cutover: !env_flag("PG_DBMIGRATOR_NO_SEQUENCE_SYNC"),
+        auto_create_publication: !env_flag("PG_DBMIGRATOR_NO_AUTO_CREATE_PUB"),
+        drop_slot_on_cutover: !env_flag("PG_DBMIGRATOR_KEEP_SLOT"),
         apply: ReplicationApplyConfig {
             feedback_interval: Duration::from_secs(env_secs("PG_DBMIGRATOR_FEEDBACK_SECS", 5)),
             connection_timeout: Duration::from_secs(15),

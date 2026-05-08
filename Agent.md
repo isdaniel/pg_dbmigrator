@@ -1,505 +1,232 @@
-# Agent.md — pg_dbmigrator Development Guide
+# Agent.md — pg_dbmigrator
 
-> This document is intended for both AI coding agents and human contributors.
-> It captures the architecture, conventions, and non-negotiable rules for the
-> `pg_dbmigrator` Rust PostgreSQL migration tool.
-> **Read this file in full before modifying any source.**
+> Read this before modifying source. Covers architecture, invariants, and rules.
 
----
+## 1. Architecture
 
-## 1. Project Overview
+**Modes**: `Offline` (pg_dump → pg_restore) | `Online` (slot+snapshot → dump → restore → CREATE SUBSCRIPTION → WAL apply → cutover)
 
+**Pipeline**: `Validate → SourceVacuum → PrepareSnapshot* → Dump → Restore → Analyze → StreamApply* → Lag* → CaughtUp* → Cutover* → SourceCleanup* → Complete`
+(`*` = online-only; SourceVacuum/Analyze skippable via `--skip-source-vacuum`/`--skip-analyze`)
 
-| Mode      | Behaviour                                                                                                                                                                                                  |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Offline` | `pg_dump` → `pg_restore`. One-shot copy. Sequences are carried inside the dump, no extra step.                                                                                                             |
-| `Online`  | Create a logical replication slot with `EXPORT_SNAPSHOT` → snapshot-consistent dump → restore → `CREATE SUBSCRIPTION` on target so PostgreSQL's apply worker streams WAL → on cutover, sync sequence values. |
+### Offline mode
 
-### Apply path
+1. Pre-flight: verify pg_dump/pg_restore on PATH, validate config
+2. `VACUUM ANALYZE` on source (skip with `--skip-source-vacuum`)
+3. `pg_dump` (directory format, parallel `--jobs`, `--compress=lz4:1`)
+4. `pg_restore` — split-section by default (pre-data → data → post-data for index-free COPY)
+5. `ANALYZE` on target (skip with `--skip-analyze`)
 
-After `pg_dump` / `pg_restore` the orchestrator drops the
-[`pg_walstream`] stream connection (whose only job was to keep the exported
-snapshot alive across the dump) and issues
-`CREATE SUBSCRIPTION ... WITH (create_slot=false, slot_name='<existing>',
-enabled=true, copy_data=false)` on the target. The pre-existing slot is
-re-used — `create_slot=false` is the critical bit — and the built-in apply
-worker streams WAL from the source's `confirmed_flush_lsn`.
+### Online mode
 
-`pg_walstream` is now used **only** as a slot-creation helper inside
-[snapshot.rs](pg_dbmigrator/src/snapshot.rs). There is no longer an
-in-process apply path; the previous `OnlineApplyEngine` enum and
-`--apply-engine` CLI flag have been removed.
+1. **Validate**: pre-flight source (`wal_level=logical`, `max_replication_slots > 0`, `max_wal_senders > 0`); ensure publication exists (auto-create if missing)
+2. **PrepareSnapshot**: `pg_walstream` creates replication slot with `EXPORT_SNAPSHOT` — snapshot kept alive by holding the stream connection open
+3. **Dump**: `pg_dump --snapshot=<exported_id>` for a consistent baseline
+4. **Restore**: `pg_restore` into target (same as offline)
+5. **Analyze**: `ANALYZE` on target
+6. **StreamApply**: orchestrator drops the pg_walstream stream connection, then issues `CREATE SUBSCRIPTION ... WITH (create_slot=false, slot_name='<existing>', enabled=true, copy_data=false)` on the target. PG's built-in apply worker streams WAL from `confirmed_flush_lsn`.
+7. **Lag polling**: polls `pg_current_wal_flush_lsn()` on source every `poll_interval`, emits `Lag` heartbeat (lag_bytes, source_lsn, applied_lsn)
+8. **CaughtUp**: when lag ≤ `lag_threshold_bytes`, one-shot advisory event fires
+9. **Cutover**: operator presses Ctrl+C → sequence sync → source cleanup → done
 
-[`pg_walstream`]: https://github.com/isdaniel/pg-walstream
+### Cutover logic
+
+1. First Ctrl+C → `CutoverHandle::request()` → apply loop exits on next poll
+2. `ALTER SUBSCRIPTION ... DISABLE` + `DROP SUBSCRIPTION` (unless `--keep-subscription`)
+3. `sync_sequences()` — setval() on all target sequences (PG logical replication doesn't replay nextval())
+4. Source cleanup: drop auto-created publication + drop slot (unless `--keep-slot`)
+5. Return `MigrationOutcome::cutover_triggered() == true`
+6. Second Ctrl+C → `CancellationToken` cancel (abort escape hatch)
+
+Cutover is **always operator-driven** — `lag_threshold_bytes` is purely advisory, never triggers cutover.
+
+### Online resume flow
+
+`--resume` after interrupt: load token → skip dump/restore → `disable_target_subscription` → `wait_for_slot_inactive` → re-enable subscription in place (preserves replication origin) → apply resumes from slot's LSN. Supports multiple consecutive cancel+resume cycles without data loss.
+
+### Publication/subscription lifecycle
+
+- **Before dump**: if `auto_create_publication` (default true) and publication missing → `CREATE PUBLICATION <name> FOR ALL TABLES` (or scoped to tables/schemas)
+- **Apply phase**: subscription created by `run_native_apply`, torn down after cutover (unless `--keep-subscription`)
+- **After cutover**: if pub was auto-created → `DROP PUBLICATION IF EXISTS`; if `drop_slot_on_cutover` (default true) → drop slot. All cleanup is best-effort (warnings only).
+- CLI: `--no-auto-create-publication`, `--keep-slot`, `--keep-subscription`
 
 ### Workspace layout
 
 ```
-Cargo.toml                          # workspace root, central versions/deps
-.cargo/config.toml                  # `cargo pg_dbmigrator` alias
-crates/
-  pg_dbmigrator/                      # library crate (package: pg_dbmigrator)
-  pg_dbmigrator-cli/                  # CLI crate (package: pg_dbmigrator-cli, bin: pg_dbmigrator)
-examples/offline_migration/         # integration example for the library
-examples/online_migration/
+Cargo.toml                        # workspace root (central versions/deps)
+pg_dbmigrator/src/lib.rs          # library entry
+pg_dbmigrator/src/bin/pg_dbmigrator/{main,args}.rs  # CLI
+pg_dbmigrator/tests/postgres_integration.rs         # Rust integration tests (needs PG)
+examples/{offline,online}_migration/                # example binaries
+tests/integration/                # shell e2e tests (Docker PG 17)
+docker-compose.test.yml           # source :55432, target :55433
 ```
 
-> **Single source of truth.** Versions, edition, authors, and external
-> dependency versions live in the workspace [Cargo.toml](Cargo.toml) under
-> `[workspace.package]` / `[workspace.dependencies]`. Sub-crates reference
-> them via `xxx.workspace = true`. **Do not** hard-code versions in sub-crate
-> manifests.
+### Module map
 
-### Library module map
+| Module | Role |
+|--------|------|
+| `config.rs` | `MigrationConfig`/`OnlineOptions`, validation, performance defaults |
+| `error.rs` | `MigrationError` (thiserror) + `Result<T>` |
+| `dump.rs` | pg_dump wrapper, `CommandRunner` trait, argv builder, stderr progress parsing |
+| `restore.rs` | pg_restore/psql wrapper |
+| `analyze.rs` | Pre-dump VACUUM ANALYZE + post-restore ANALYZE |
+| `snapshot.rs` | Replication slot creation + exported snapshot |
+| `native_apply.rs` | CREATE SUBSCRIPTION, lag polling, `ApplyStats`, `drop_source_{publication,slot}` |
+| `orchestrator.rs` | `Migrator` — wires all stages |
+| `progress.rs` | `ProgressReporter` trait + Tracing/Collecting impls |
+| `preflight.rs` | Source validation, `ensure_publication_exists` (auto-create) |
+| `sequences.rs` | Source→target setval at cutover |
+| `resume.rs` | Resume token persistence |
+| `tls.rs` | TLS-aware connection helper |
 
-| File                                                                       | Responsibility                                                              |
-| -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| [pg_dbmigrator/src/lib.rs](pg_dbmigrator/src/lib.rs)                   | Crate entry point, re-exports, `#![deny]`/`#![warn]` lints                  |
-| [pg_dbmigrator/src/config.rs](pg_dbmigrator/src/config.rs)             | `MigrationConfig` / `EndpointConfig` / `OnlineOptions` and validation. Performance defaults: `split_sections`, `dump_compress`, `no_sync`, `no_comments`, `no_security_labels` |
-| [pg_dbmigrator/src/error.rs](pg_dbmigrator/src/error.rs)               | `MigrationError` (`thiserror`) + `Result<T>` alias                          |
-| [pg_dbmigrator/src/dump.rs](pg_dbmigrator/src/dump.rs)                 | `pg_dump` wrapper, `CommandRunner` trait, pure argv builder                 |
-| [pg_dbmigrator/src/restore.rs](pg_dbmigrator/src/restore.rs)           | `pg_restore` / `psql` wrapper                                               |
-| [pg_dbmigrator/src/analyze.rs](pg_dbmigrator/src/analyze.rs)           | Pre-dump `VACUUM ANALYZE` on source + post-restore `ANALYZE` on target       |
-| [pg_dbmigrator/src/snapshot.rs](pg_dbmigrator/src/snapshot.rs)         | Replication slot creation + exported snapshot retrieval                     |
-| [pg_dbmigrator/src/native_apply.rs](pg_dbmigrator/src/native_apply.rs) | `CREATE SUBSCRIPTION` apply path + `pg_replication_slots` lag polling, `ApplyStats`, `parse_pg_lsn`, `wait_for_slot_inactive`, `disable_target_subscription` |
-| [pg_dbmigrator/src/orchestrator.rs](pg_dbmigrator/src/orchestrator.rs) | `Migrator`, wires all stages together                                       |
-| [pg_dbmigrator/src/progress.rs](pg_dbmigrator/src/progress.rs)         | `ProgressReporter` trait + Tracing/Collecting implementations               |
-| [pg_dbmigrator/src/preflight.rs](pg_dbmigrator/src/preflight.rs)       | Pre-migration checks (target empty, source `wal_level=logical`, slot/sender capacity) |
-| [pg_dbmigrator/src/sequences.rs](pg_dbmigrator/src/sequences.rs)       | Source→target sequence value sync at cutover (closes the PG logical-replication sequence gap) |
+### Critical invariants
 
-### Pipeline stages (`MigrationStage`)
-
-`Validate → SourceVacuum → PrepareSnapshot* → Dump → Restore → Analyze → StreamApply* → Lag* → CaughtUp* → Cutover* → Complete`
-(stages marked `*` are Online-only; `SourceVacuum` and `Analyze` are
-skippable via `--skip-source-vacuum` / `--skip-analyze`). Any new stage must
-be added in **both** [progress.rs](pg_dbmigrator/src/progress.rs) (the enum)
-and [orchestrator.rs](pg_dbmigrator/src/orchestrator.rs) /
-[native_apply.rs](pg_dbmigrator/src/native_apply.rs) (the reporting site).
-
-### Online cutover model
-
-The customer drives cutover with **SIGINT (Ctrl+C)**, mirroring the Azure
-DMS "Cut over" button:
-
-1. After `Restore`, `native_apply::run_native_apply` issues
-   `CREATE SUBSCRIPTION` on the target and polls
-   `pg_replication_slots.confirmed_flush_lsn` against
-   `pg_current_wal_flush_lsn()` on the source every
-   `CutoverConfig::poll_interval`.
-2. Each poll emits a `Lag` heartbeat (`lag_bytes`, `source_lsn`,
-   `received_lsn`, `applied_lsn` in `detail`) — the operator's
-   continuous bytes-behind read-out.
-3. When the lag drops at or below `CutoverConfig::lag_threshold_bytes`, a
-   one-shot `CaughtUp` event is emitted.
-4. The CLI (`pg_dbmigrator/src/bin/pg_dbmigrator/main.rs`) installs a SIGINT handler that
-   calls `CutoverHandle::request()` on the first Ctrl+C. The apply loop
-   sees the request on its next poll, runs `ALTER SUBSCRIPTION ... DISABLE`
-   and (unless `--keep-subscription` is set) `DROP SUBSCRIPTION`, emits
-   `Cutover`, and `Migrator::run` returns with
-   `MigrationOutcome::cutover_triggered() == true`.
-5. A second SIGINT cancels via the `CancellationToken` (escape hatch). See
-   `classify_sigint` in `pg_dbmigrator/src/bin/pg_dbmigrator/main.rs`.
-
-Cutover is **always operator-driven**: the apply loop never exits on
-`CaughtUp` alone. The `lag_threshold_bytes` knob is purely advisory —
-it controls when the one-shot `CaughtUp` event fires, never whether the
-loop terminates.
-
-### Online resume flow (cancel + resume)
-
-When the migrator is interrupted (SIGTERM / crash) during the apply phase
-and restarted with `--resume`:
-
-1. The orchestrator loads the resume token (dump+restore already marked
-   complete) and **skips** dump+restore entirely.
-2. Instead of dropping the existing subscription (which would lose the
-   replication origin and cause duplicate-key violations on replay), it
-   calls `disable_target_subscription` — issuing `ALTER SUBSCRIPTION ... DISABLE`
-   on the target so the old apply worker releases the slot.
-3. `wait_for_slot_inactive` polls `pg_replication_slots.active` on the
-   source until the slot is free (30 s timeout with 500 ms polling).
-4. `run_native_apply` detects the subscription already exists and
-   re-enables it in place (`ALTER SUBSCRIPTION ... ENABLE`), preserving
-   the replication origin. The apply worker resumes from the slot's
-   `confirmed_flush_lsn` — no data loss, no conflicts.
-
-This flow supports **multiple consecutive cancel+resume cycles** without
-data loss. Key invariant: the slot on the source is never dropped during
-a cancel — only the subscription's apply worker is stopped.
-
-### Sequence sync at cutover (online only)
-
-PostgreSQL logical replication does **not** replicate sequence values —
-the target's sequences stay frozen at whatever `pg_dump`/`pg_restore`
-baked in. Without intervention, the first INSERT after cutover can
-collide with rows the apply worker streamed from the source.
-
-[`sequences.rs`](pg_dbmigrator/src/sequences.rs) closes that gap:
-
-1. After the operator presses Ctrl+C and `run_native_apply` returns with
-   `cutover_triggered = true`, the orchestrator calls
-   `sync_sequences(source, target, schemas)`.
-2. `collect_source_sequences` reads `pg_class` joined with
-   `pg_sequence_last_value(...)`; `apply_sequences_to_target` runs
-   `setval('"schema"."name"'::regclass, $1::bigint, true)` on the target
-   for each one.
-3. Per-sequence failures are logged with `warn!` and counted, but never
-   abort the migration — a managed-PG role-permission issue should not
-   roll back an otherwise-successful cutover. The aggregate count is
-   emitted as a `Cutover` progress event.
-4. The behaviour can be turned off via
-   `OnlineOptions.sync_sequences_on_cutover = false` (CLI flag
-   `--no-sequence-sync`).
-
-The SQL layer escapes both halves of the qualified name: `quote_ident`
-for any embedded `"`, then `quote_literal` for any embedded `'` so the
-resulting `'...'::regclass` string literal parses cleanly.
-
-### Filtering schemas / tables
-
-`MigrationConfig.exclude_schemas` and `exclude_tables` propagate to
-`pg_dump` as `--exclude-schema=` / `--exclude-table=` arguments. Use
-them to skip very large or transient tables (or schemas owned by
-background services) that should not be part of the cutover. Online
-mode still captures their changes via the slot if they are in the
-publication, so combine with a narrower `pg_dbmigrator_pub` definition
-for full coverage.
-
-### Performance defaults
-
-The migrator ships with aggressive-but-safe performance defaults that
-reduce total migration time by 30–60 % compared to vanilla `pg_dump`/
-`pg_restore` without any user tuning:
-
-| Default                  | Effect                                              | Override                   |
-| ------------------------ | --------------------------------------------------- | -------------------------- |
-| `split_sections = true`  | Index-free COPY + parallel index rebuild            | `--no-split-sections`      |
-| `dump_compress = lz4:1`  | 3–5× dump size reduction, negligible CPU overhead   | `--dump-compress none`     |
-| `no_sync = true`         | Skip fsync on transient dump archive                | `--keep-sync`              |
-| `no_comments = true`     | Skip `COMMENT ON` — rarely needed post-migration    | `--keep-comments`          |
-| `no_security_labels = true` | Skip SE-Linux labels                             | `--keep-security-labels`   |
-| `no_publications = true` | Skip publication DDL from source                    | `--keep-publications`      |
-| `no_subscriptions = true`| Skip subscription DDL from source                   | `--keep-subscriptions`     |
-| `jobs = min(cpu_count, 8)` | Parallel dump/restore up to 8 workers            | `--jobs N`                 |
-| `skip_source_vacuum = false` | Pre-dump VACUUM ANALYZE on source (clean pages, fresh stats) | `--skip-source-vacuum` |
-| `skip_analyze = false`   | Post-restore ANALYZE on target (fresh query-planner stats)  | `--skip-analyze`           |
-
-Optional opt-in flags:
-- `--no-table-access-method` (PG 15+) — omit `USING <am>` from CREATE TABLE
-- `--dump-compress zstd:3` — better ratio than lz4, slightly more CPU
-
-### Integration test coverage
-
-All integration tests live in `tests/integration/` as **shell scripts** (not
-Rust integration tests). This is deliberate — the tests exercise the full
-binary end-to-end against Docker-composed PostgreSQL 17 instances (source on
-`:55432`, target on `:55433`). The Rust library contains only pure unit tests
-that never require a running database.
-
-| Script                              | Scenario                                                                                       |
-| ----------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `run_offline.sh`                    | Simple offline dump → restore                                                                  |
-| `run_offline_split_sections.sh`     | Offline with `--split-sections` (pre-data/data/post-data)                                      |
-| `run_offline_resume.sh`             | Offline cancel + resume (resume token skips completed stages)                                  |
-| `run_offline_sigint_cancel.sh`      | SIGINT mid-pg_dump → fast cancellation                                                         |
-| `run_online.sh`                     | Full online: seed → dump → restore → apply → two CaughtUp transitions → cutover               |
-| `run_online_updates.sh`             | Online with UPDATE/DELETE/INSERT during dump+restore window, cutover, data equality check       |
-| `run_online_sustained.sh`           | 60s sustained mutations during apply, pre-cutover equality gate, post-cutover stability        |
-| `run_online_lag_cadence.sh`         | Adaptive fast/slow poll cadence near catch-up                                                  |
-| `run_online_cancel_resume.sh`       | Cancel mid-apply (SIGTERM) + resume (skip dump/restore, re-attach slot, data equality)         |
-| `run_online_multi_resume_sustained.sh` | 2× cancel+resume + 30s sustained mutations + pre-cutover equality + cutover                 |
-| `run_online_sequence_sync.sh`       | Sequence sync at cutover (no post-cutover PK collision)                                        |
+1. **Slot before dump**: `prepare_replication_slot` MUST run before pg_dump. `START_REPLICATION` MUST be deferred until AFTER dump completes (else snapshot is invalidated).
+2. **Cutover is operator-driven**: apply loop NEVER exits on CaughtUp alone.
+3. **Resume preserves replication origin**: subscription is disabled/re-enabled (not dropped/recreated) to avoid duplicate-key violations.
+4. **Sequence sync at cutover**: migrator runs setval() on all target sequences after cutover.
+5. **Publication lifecycle**: auto-created publications are tracked (`pub_auto_created`) and dropped after cutover; pre-existing ones are never dropped.
 
 ---
 
 ## 2. Design Principles (mandatory reading)
 
 1. **Clean library / CLI separation**
-   - The library only returns `pg_dbmigrator::Result<T>` (`MigrationError`).
-   - Only the CLI is allowed to use `anyhow`; it converts library errors into
-     terminal output and exit codes.
-   - **No** `unwrap()` / `expect()` / `panic!()` in production code paths.
-     Panics are reserved for true invariant violations (i.e. bugs).
+   - Library returns `pg_dbmigrator::Result<T>` (`MigrationError`) only.
+   - Only CLI/examples may use `anyhow`.
+   - No `unwrap()`/`expect()`/`panic!()` in production paths.
 
 2. **Side effects vs. pure logic**
-   - Anything that spawns a process or opens a socket must sit behind a
-     trait (e.g. `CommandRunner`, `ProgressReporter`).
-   - Pure functions (`build_pg_dump_args`, `build_pg_restore_args`,
-     `make_create_subscription_sql`, `parse_pg_lsn`) **must not** perform I/O so
-     that unit tests can validate them without PostgreSQL.
+   - Anything spawning a process or opening a socket sits behind a trait (`CommandRunner`, `ProgressReporter`).
+   - Pure functions (`build_pg_dump_args`, `build_pg_restore_args`, `make_create_subscription_sql`, `parse_pg_lsn`) must not perform I/O — unit-testable without PostgreSQL.
 
 3. **Configuration as data**
-   - All `*Config` structs derive `Serialize + Deserialize + Clone + Debug`.
-   - Cross-field invariants live in `validate(&self) -> Result<()>`;
-     `Migrator::run` calls `config.validate()` first.
-   - When adding optional fields, provide a `Default` so existing call sites
-     keep working with `..Default::default()`.
+   - All `*Config` structs: `Serialize + Deserialize + Clone + Debug`.
+   - Cross-field invariants in `validate(&self) -> Result<()>`.
+   - New optional fields must have a `Default`.
 
 4. **Cancellation everywhere**
-   - Every long-running async function takes a `CancellationToken` and
-     checks `cancel.is_cancelled()` before each loop iteration.
-   - Cancellation is part of the success path; if you must return an error
-     for it, use `MigrationError::Cancelled` so the upper layer can detect it.
+   - Every long-running async function takes `CancellationToken`, checks `cancel.is_cancelled()` before each iteration.
+   - Use `MigrationError::Cancelled` for cancellation errors.
 
 5. **Connection-string secrecy**
-   - `EndpointConfig` keeps the original libpq URI verbatim. **Always** call
-     `endpoint.redacted()` before logging it (the password is masked).
-   - When you add new fields that may carry secrets, extend `redacted()` and
-     add a unit test for it.
+   - Always call `endpoint.redacted()` before logging.
+   - Passwords via `PGPASSWORD` env var (never in argv where `ps` exposes them).
 
-6. **Contract with `pg_walstream`**
-   - Slot creation (`prepare_replication_slot`) must happen **before**
-     `pg_dump`. `START_REPLICATION` must only be called **after** the dump
-     completes — otherwise the exported snapshot is invalidated.
-     The orchestrator already follows this order; do not reshuffle it.
-   - We pin `pg_walstream = 0.6.2` via a path dep to the sibling workspace
-     `../pg-walstream`. Before bumping the version, verify compatibility of
-     the `ChangeEvent` and `EventType` enums.
+6. **Contract with pg_walstream**
+   - Slot creation before dump. START_REPLICATION only after dump.
+   - Pinned at `0.6.2` via path dep to `../pg-walstream`. Verify `ChangeEvent`/`EventType` compatibility before bumping.
 
 7. **No unsolicited optimisation**
-   - Do not silently turn sync APIs into async, swap `Vec<String>` for
-     `SmallVec`, or pull in new crates. **Make only the changes the task
-     requires (or that correctness requires).**
+   - Make only the changes the task requires. No silent async conversions, container swaps, or new crate additions.
 
 ---
 
 ## 3. Code Style
 
-> Core Rust style guidance lives in [`rust-skills`] / [`rust-async`] /
-> [`rust-docs`]. The rules below are **specific to this project**.
-
-[`rust-skills`]: https://example.invalid
-[`rust-async`]: https://example.invalid
-[`rust-docs`]: https://example.invalid
-
-### 3.1 Crate-level lints
-
-[lib.rs](pg_dbmigrator/src/lib.rs#L42-L43) sets:
-
-```rust
-#![deny(rust_2018_idioms)]
-#![warn(missing_debug_implementations)]
-```
-
-When adding a new `pub` type:
-- Default to `#[derive(Debug, Clone)]` unless there is a concrete reason not
-  to (trait object, contains `tokio_postgres::Client`, etc.).
-- If the type contains a non-`Debug` member (e.g. `LogicalReplicationStream`),
-  attach `#[allow(missing_debug_implementations)]` and explain why in a doc
-  comment (see
-  [snapshot.rs](pg_dbmigrator/src/snapshot.rs#L26-L29)).
-
-### 3.2 Error handling
-
-- Library errors always go through
-  [`MigrationError`](pg_dbmigrator/src/error.rs#L17):
-  - String-bearing variants must be built via the helpers
-    `MigrationError::config(...)`, `::external(...)`, `::apply(...)`. Do not
-    construct the enum directly.
-  - When introducing a new error category, add a variant **and** a helper
-    **and** a unit test.
-- CLI/example code uses `anyhow::Result` plus `.context("...")`.
-- **Never** `unwrap()` in production paths. Tests may use it for brevity.
-
-### 3.3 Logging
-
-- Use `tracing` macros (`info!` / `debug!` / `warn!` / `error!`).
-  **Forbidden**: `println!` / `eprintln!` (the only exception is `--help`,
-  which clap prints itself).
-- Prefer structured fields:
-  `info!(slot = %opts.slot_name, "preparing slot")` over baked-in formatting.
-- Connection strings must be passed through `redacted()` before they reach
-  any log line.
-
-### 3.4 Async
-
-- The whole library targets `tokio` as the runtime; tests use
-  `#[tokio::test]` (with `(flavor = "multi_thread")` when needed).
-- Public traits with async methods use `#[async_trait]` (already in
-  workspace deps).
-- Long-running loops, `select!`, and waits must be cancellable via the
-  `CancellationToken`. **Never** call `std::thread::sleep`.
-
-### 3.5 Naming and module organisation
-
-- One responsibility per module. Each file starts with a `//!` doc comment
-  describing **why the module exists** and **what it deliberately does not
-  do**. See [native_apply.rs](pg_dbmigrator/src/native_apply.rs#L1-L19) for the pattern.
-- File ordering: `use` → public types → public functions → private helpers
-  → `#[cfg(test)] mod tests`.
-- Do not introduce `mod.rs`-style folders; keep the flat `lib.rs` + sibling
-  files layout.
-
-### 3.6 Doc comments
-
-- Every `pub` item has a `///` comment that covers purpose, required call
-  ordering, and edge cases.
-- Configuration fields are documented **per field** (see
-  [config.rs](pg_dbmigrator/src/config.rs#L11-L33)).
-- Crate- and module-level docs include an `# Examples` block, marked
-  `no_run` so doc-tests do not actually connect to PostgreSQL (see
-  [lib.rs](pg_dbmigrator/src/lib.rs#L19-L37)).
+- **Logging**: `tracing` structured fields (`info!(slot = %name, "msg")`). No `println!`/`eprintln!`.
+- **Types**: `#[derive(Debug, Clone)]` on all `pub` types unless impossible (trait objects, etc.).
+- **Errors**: use `MigrationError::config()`/`::external()`/`::apply()` helpers. Never construct enum directly.
+- **Async**: tokio runtime, `#[async_trait]`, `CancellationToken` in all loops. Never `std::thread::sleep`.
+- **SQL safety**: `quote_ident`/`quote_literal` from pg_walstream. No string concatenation for values.
+- **Module layout**: `use` → public types → public functions → private helpers → `#[cfg(test)] mod tests`.
+- **Doc comments**: every `pub` item gets `///` covering purpose, call ordering, edge cases.
 
 ---
 
-## 4. Testing Discipline
+## 4. Testing
 
-- **Every `.rs` file must have a `#[cfg(test)] mod tests`**, even if it
-  only holds two or three cases.
-- **All new and modified code must have unit tests.** The project enforces
-  a minimum **85 % code coverage** via Codecov. Before submitting, verify
-  that your changes do not drop the overall coverage below this threshold.
-- Test naming convention: `<behaviour>_<condition>`, e.g.
-  `validate_rejects_zero_jobs`,
-  `build_args_includes_jobs_only_for_directory_format`.
-- Do not depend on a real PostgreSQL instance:
-  - Use `RecordingRunner` for dump/restore tests (see
-    [orchestrator.rs](pg_dbmigrator/src/orchestrator.rs#L246-L276)).
-  - Use `CollectingReporter` for progress tests
-    ([progress.rs](pg_dbmigrator/src/progress.rs#L83)).
-  - Use `StaticLagProvider` for lag-loop cadence tests.
-- Modifying any pure function (`build_pg_dump_args`,
-  `build_pg_restore_args`, `make_create_subscription_sql`, `parse_pg_lsn`)
-  **requires** updating or adding the corresponding tests in the same PR.
-- Integration scenarios live in `tests/integration/` as shell scripts;
-  and smoke tests and may connect to a real database.
-- **After all code changes, you MUST verify that both unit tests AND
-  integration tests pass before considering the task complete:**
-  ```bash
-  # Unit tests (must pass without a running PostgreSQL)
-  cargo test --workspace
+- Every `.rs` file has `#[cfg(test)] mod tests`
+- Min **85% code coverage** (Codecov enforced)
+- Test naming: `<behaviour>_<condition>` (e.g. `validate_rejects_zero_jobs`)
+- No real PG in unit tests — use `RecordingRunner`, `CollectingReporter`, `StaticLagProvider`
+- Integration tests: shell scripts in `tests/integration/`, registered in `run_all.sh` and `.github/workflows/ci.yml`
 
-  # Integration tests (requires Docker)
-  make integration
-  ```
+### Integration tests
 
-### Test commands
+| Script | Scenario |
+|--------|----------|
+| `run_offline.sh` | Simple dump → restore |
+| `run_offline_split_sections.sh` | pre-data/data/post-data phases |
+| `run_offline_resume.sh` | Cancel + resume token |
+| `run_offline_sigint_cancel.sh` | SIGINT mid-dump → fast cancel |
+| `run_offline_analyze.sh` | VACUUM ANALYZE + ANALYZE |
+| `run_online.sh` | Full online: two CaughtUp + cutover |
+| `run_online_updates.sh` | DML during dump+restore |
+| `run_online_sustained.sh` | 60s mutations + equality gate |
+| `run_online_lag_cadence.sh` | Adaptive poll cadence |
+| `run_online_cancel_resume.sh` | Cancel mid-apply + resume |
+| `run_online_multi_resume_sustained.sh` | 2× cancel+resume + mutations |
+| `run_online_sequence_sync.sh` | Sequence sync (no PK collision) |
+| `run_online_auto_pub_lifecycle.sh` | Auto-create pub + post-cutover cleanup |
+| `run_online_keep_slot.sh` | keep-slot flag + pre-existing pub retained |
+
+### Verify before commit
 
 ```bash
-# Whole workspace
-cargo test --workspace
-
-# Library only
-cargo test -p pg_dbmigrator
-
-# With logs
-RUST_LOG=debug cargo test -p pg_dbmigrator -- --nocapture
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace           # unit tests, no PG required
+make integration                 # e2e, requires Docker
 ```
-
-> `cargo test --workspace` must pass **without** a running PostgreSQL.
-> If a new test genuinely needs a live database, move it under examples/
-> or mark it `#[ignore]`.
-
-### CI pipeline
-
-`.github/workflows/ci.yml` runs on every push/PR:
-
-1. **build-and-unit-test** — fmt, clippy, build, `cargo test --workspace`
-2. **integration-offline** (+ split-sections, resume, SIGINT cancel variants)
-3. **integration-online** (+ updates, sustained, lag-cadence, cancel-resume, multi-resume, sequence-sync)
-4. **publish** — gated on tag `v*.*.*`, publishes `pg_dbmigrator` then `pg_dbmigrator-cli` to crates.io
-
-All integration jobs use `.github/actions/setup-integration` which starts
-the Docker Compose stack (`docker-compose.test.yml`: source PG 17 on `:55432`,
-target PG 17 on `:55433`) and installs PostgreSQL client tools.
 
 ---
 
 ## 5. Standard Workflow for New Features
 
-When you receive a new requirement, work in this order:
-
-1. **Locate the affected module** using the module map in §1.
-2. **Start with config** — extend `MigrationConfig` / `OnlineOptions`,
-   provide `Default`, add `validate()` rules, add unit tests.
-3. **Then update pure functions** — e.g. teach `build_pg_dump_args` about
-   the new field; add tests for each new branch.
-4. **Wire the orchestrator last** — call the new logic from
-   `Migrator::run_offline` / `run_online` and emit progress events via
-   `self.report(stage, message)`.
-5. **Mirror it in the CLI** — add `#[arg(...)]` in
-   [args.rs](pg_dbmigrator/src/bin/pg_dbmigrator/args.rs) and map it in `into_config`. Use
-   kebab-case for flag names.
-6. **Add unit tests for all new/modified code** — ensure coverage stays
-   above **85 %**. Every new public function, config field, and CLI flag
-   must have at least one dedicated test.
-7. **Add or update integration tests** — if the feature changes end-to-end
-   behaviour, add a script in `tests/integration/` following existing
-   patterns, register it in `run_all.sh`, and add a CI job in
-   `.github/workflows/ci.yml`.
-8. **Update README + examples** if user-visible behaviour changes.
-9. **Run lint and ALL tests — nothing ships until green**:
-   ```bash
-   cargo fmt --all
-   cargo clippy --workspace --all-targets -- -D warnings
-   cargo test --workspace
-   make integration   # requires Docker
-   ```
+1. **Config** — extend `MigrationConfig`/`OnlineOptions` + `Default` + `validate()` + unit tests
+2. **Pure functions** — update argv/SQL builders + tests for each branch
+3. **Orchestrator** — wire logic in `Migrator::run_offline`/`run_online`, emit progress events via `self.report(stage, message)`
+4. **CLI** — add `#[arg(...)]` in args.rs, map in `into_config` (kebab-case flags) + tests
+5. **Unit tests** — ≥85% coverage for all new/modified code
+6. **Integration tests** — add script in `tests/integration/`, register in `run_all.sh` + CI job in `.github/workflows/ci.yml`
+7. **Documentation** — update README + examples if user-visible behaviour changes
+8. **Validate** — run full lint+test suite (see §4)
 
 ---
 
 ## 6. Hard Rules (do-not list)
 
-- ❌ Do not pull `anyhow` into the library (CLI/examples only).
-- ❌ Do not `unwrap()` / `expect()` / `panic!()` in production paths.
-- ❌ Do not `println!` to stdout/stderr; use `tracing`.
-- ❌ Do not log passwords or full connection strings.
-- ❌ Do not bypass `CommandRunner` and call `tokio::process::Command`
-  directly.
-- ❌ Do not invoke `START_REPLICATION` before `pg_dump` finishes (it would
-  invalidate the snapshot).
-- ❌ Do not hard-code external crate versions in sub-crate manifests.
-- ❌ Do not “tidy up” unrelated code while doing your task.
-- ❌ Do not add a new dependency without checking license, maintenance
-  status, and whether the workspace already provides an equivalent.
+- ❌ No `anyhow` in library (CLI/examples only)
+- ❌ No `unwrap()`/`expect()`/`panic!()` in production paths
+- ❌ No `println!`/`eprintln!` — use `tracing`
+- ❌ No logging passwords or full connection strings (use `redacted()`)
+- ❌ No bypassing `CommandRunner` for direct `tokio::process::Command`
+- ❌ No `START_REPLICATION` before pg_dump finishes
+- ❌ No hard-coded crate versions in crate manifest (use workspace deps)
+- ❌ No unrelated cleanup in task PRs
+- ❌ No new deps without license/maintenance/equivalence check
 
 ---
 
-## 7. Security Considerations
-
-- Connection strings may contain passwords: any serialisation, log line, or
-  error message must go through `redacted()`.
-- `pg_dump` / `pg_restore` are external processes. We pass the password via
-  the `PGPASSWORD` environment variable (see
-  [dump.rs](pg_dbmigrator/src/dump.rs#L165-L172)). **Do not** put it in
-  argv where `ps` could expose it.
-- SQL injection surface: `native_apply` and `sequences` use `quote_ident`
-  / `quote_literal` from `pg_walstream` for identifiers and string
-  literals. **Do not** switch to string concatenation for values.
-- Cancellation means the user wants to stop. After cancel, do not send
-  feedback, write files, or take other actions that could leave partial
-  state behind.
-
----
-
-## 8. Change-management Checklist (before commit / PR)
+## 7. Change-management Checklist (before commit / PR)
 
 - [ ] `cargo fmt --all` clean
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
 - [ ] `cargo test --workspace` green (all unit tests pass)
-- [ ] `make integration` green (all integration tests pass; requires Docker)
-- [ ] Unit tests added for all new and modified code (target ≥ 85 % coverage)
+- [ ] `make integration` green (requires Docker)
+- [ ] Unit tests added for all new/modified code (≥ 85% coverage)
 - [ ] Every modified or new `pub` API has `///` documentation
 - [ ] Pure functions you changed have matching tests
-- [ ] If config/CLI behaviour changed, README, examples, and this file are
-      updated
-- [ ] No un-redacted connection strings or passwords appear in logs
+- [ ] If config/CLI behaviour changed → update README, examples, and this file
+- [ ] No un-redacted connection strings or passwords in logs
 
 ---
 
-## 9. Tips for AI Agents
+## 8. Tips for AI Agents
 
-- This is a **small, self-contained** Rust workspace. Before editing,
-  use semantic search and grep to confirm the blast radius, then read full
-  files for context.
-- Read the entire file before editing it (most files are 200–400 lines and
-  fit in a single read).
-- After editing, validate with the editor's diagnostics and run the
-  matching `cargo test` subset.
-- If asked to add a new stage / new mode, update **all** of:
-  the `MigrationStage` enum, the `Migrator` entry point, the CLI args,
-  the README, and this file.
-- If asked to change `pg_walstream` behaviour, note that the crate lives in
-  a sibling workspace (`../pg-walstream`) and is a separate project.
-  **Do not** vendor or fork its source into this repo; propose the change
-  upstream instead.
+- **Small workspace** — most files are 200–400 lines. Read the entire file before editing. Use grep to confirm blast radius.
+- **Validate after editing** — run `cargo test -p pg_dbmigrator` after every change.
+- **New stage / mode** → must update ALL of: `MigrationStage` enum, `Migrator` entry point, CLI args, README, and this file.
+- **pg_walstream** lives in sibling workspace (`../pg-walstream`). Pinned at `0.6.2` via path dep. Do NOT vendor/fork — propose changes upstream.
+- **Library/CLI boundary** — library returns `pg_dbmigrator::Result<T>` only. `anyhow` is CLI/examples only.
+- **Versions** — all dependency versions live in workspace `Cargo.toml` under `[workspace.dependencies]`. Crate manifests use `xxx.workspace = true`.
+
+---
+
+## 9. CI Pipeline
+
+Jobs: `build-and-unit-test` → per-script integration jobs (parallel) → `publish` (on tag `v*.*.*`)
+All integration jobs use `.github/actions/setup-integration` (Docker Compose + PG 17 client tools).

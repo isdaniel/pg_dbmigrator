@@ -675,3 +675,424 @@ async fn maybe_analyze_target_runs_when_not_skipped() {
     let result = pg_dbmigrator::analyze::maybe_analyze_target(&config).await;
     assert!(result.is_ok());
 }
+
+// ─── preflight::ensure_publication_exists ────────────────────────────────────
+
+#[tokio::test]
+async fn ensure_publication_exists_creates_when_missing() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Clean up any leftover
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_auto_pub")
+        .await
+        .ok();
+
+    let created = pg_dbmigrator::preflight::ensure_publication_exists(
+        &url,
+        "integ_auto_pub",
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(created, "publication should have been auto-created");
+
+    // Verify it exists now
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'integ_auto_pub')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let exists: bool = row.get(0);
+    assert!(exists);
+
+    // Clean up
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_auto_pub")
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn ensure_publication_exists_noop_when_present() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Pre-create the publication
+    client
+        .batch_execute("CREATE PUBLICATION integ_existing_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+
+    let created = pg_dbmigrator::preflight::ensure_publication_exists(
+        &url,
+        "integ_existing_pub",
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(
+        !created,
+        "publication already existed, should not re-create"
+    );
+
+    // Clean up
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_existing_pub")
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn ensure_publication_excludes_tables_when_no_includes() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_excl_pub")
+        .await
+        .ok();
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS public.keep_me (id int); \
+             CREATE TABLE IF NOT EXISTS public.skip_me (id int);",
+        )
+        .await
+        .unwrap();
+
+    let created = pg_dbmigrator::preflight::ensure_publication_exists(
+        &url,
+        "integ_excl_pub",
+        &[],
+        &[],
+        &["public.skip_me".into()],
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(created);
+
+    // The publication should list tables explicitly, NOT be FOR ALL TABLES.
+    let row = client
+        .query_one(
+            "SELECT puballtables FROM pg_publication WHERE pubname = 'integ_excl_pub'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let all_tables: bool = row.get(0);
+    assert!(
+        !all_tables,
+        "publication should NOT be FOR ALL TABLES when exclusions are set"
+    );
+
+    // Verify skip_me is not in the publication's table list.
+    let skip_rows = client
+        .query(
+            "SELECT schemaname, tablename FROM pg_publication_tables \
+             WHERE pubname = 'integ_excl_pub' AND tablename = 'skip_me'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        skip_rows.is_empty(),
+        "excluded table should not be in publication"
+    );
+
+    // Verify keep_me IS in the publication.
+    let keep_rows = client
+        .query(
+            "SELECT schemaname, tablename FROM pg_publication_tables \
+             WHERE pubname = 'integ_excl_pub' AND tablename = 'keep_me'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !keep_rows.is_empty(),
+        "non-excluded table should be in publication"
+    );
+
+    client
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS integ_excl_pub; \
+             DROP TABLE IF EXISTS public.keep_me; \
+             DROP TABLE IF EXISTS public.skip_me;",
+        )
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn ensure_publication_excludes_schema_when_no_includes() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_excl_schema_pub")
+        .await
+        .ok();
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS excl_test; \
+             CREATE TABLE IF NOT EXISTS excl_test.should_skip (id int); \
+             CREATE TABLE IF NOT EXISTS public.should_keep (id int);",
+        )
+        .await
+        .unwrap();
+
+    let created = pg_dbmigrator::preflight::ensure_publication_exists(
+        &url,
+        "integ_excl_schema_pub",
+        &[],
+        &[],
+        &[],
+        &["excl_test".into()],
+    )
+    .await
+    .unwrap();
+    assert!(created);
+
+    let skip_rows = client
+        .query(
+            "SELECT schemaname, tablename FROM pg_publication_tables \
+             WHERE pubname = 'integ_excl_schema_pub' AND schemaname = 'excl_test'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        skip_rows.is_empty(),
+        "tables from excluded schema should not be in publication"
+    );
+
+    client
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS integ_excl_schema_pub; \
+             DROP TABLE IF EXISTS excl_test.should_skip; \
+             DROP TABLE IF EXISTS public.should_keep; \
+             DROP SCHEMA IF EXISTS excl_test;",
+        )
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn ensure_publication_filters_includes_with_exclusions() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_incl_excl_pub")
+        .await
+        .ok();
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS public.inc_keep (id int); \
+             CREATE TABLE IF NOT EXISTS public.inc_skip (id int);",
+        )
+        .await
+        .unwrap();
+
+    let created = pg_dbmigrator::preflight::ensure_publication_exists(
+        &url,
+        "integ_incl_excl_pub",
+        &["public.inc_keep".into(), "public.inc_skip".into()],
+        &[],
+        &["public.inc_skip".into()],
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(created);
+
+    let skip_rows = client
+        .query(
+            "SELECT tablename FROM pg_publication_tables \
+             WHERE pubname = 'integ_incl_excl_pub' AND tablename = 'inc_skip'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        skip_rows.is_empty(),
+        "excluded table should be filtered from include list"
+    );
+
+    let keep_rows = client
+        .query(
+            "SELECT tablename FROM pg_publication_tables \
+             WHERE pubname = 'integ_incl_excl_pub' AND tablename = 'inc_keep'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !keep_rows.is_empty(),
+        "non-excluded table from include list should be in publication"
+    );
+
+    client
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS integ_incl_excl_pub; \
+             DROP TABLE IF EXISTS public.inc_keep; \
+             DROP TABLE IF EXISTS public.inc_skip;",
+        )
+        .await
+        .ok();
+}
+
+// ─── native_apply::drop_source_publication ──────────────────────────────────
+
+#[tokio::test]
+async fn drop_source_publication_is_idempotent() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Create a publication, then drop it twice — both should succeed
+    client
+        .batch_execute("CREATE PUBLICATION integ_drop_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+
+    let result = pg_dbmigrator::native_apply::drop_source_publication(&url, "integ_drop_pub").await;
+    assert!(result.is_ok());
+
+    // Second drop should also succeed (IF EXISTS)
+    let result = pg_dbmigrator::native_apply::drop_source_publication(&url, "integ_drop_pub").await;
+    assert!(result.is_ok());
+}
+
+// ─── native_apply::drop_source_slot ─────────────────────────────────────────
+
+#[tokio::test]
+async fn drop_source_slot_is_idempotent() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Create a slot, then drop it
+    client
+        .batch_execute("SELECT pg_create_logical_replication_slot('integ_drop_slot', 'pgoutput')")
+        .await
+        .unwrap_or(());
+
+    let result = pg_dbmigrator::native_apply::drop_source_slot(&url, "integ_drop_slot").await;
+    assert!(result.is_ok());
+
+    // Second drop should also succeed (slot absent → noop)
+    let result = pg_dbmigrator::native_apply::drop_source_slot(&url, "integ_drop_slot").await;
+    assert!(result.is_ok());
+}
+
+// ─── orchestrator::cleanup_source_after_cutover ─────────────────────────────
+
+#[tokio::test]
+async fn cleanup_source_after_cutover_drops_pub_and_slot() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Pre-create a publication and slot
+    client
+        .batch_execute("CREATE PUBLICATION integ_cleanup_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+    client
+        .batch_execute(
+            "SELECT pg_create_logical_replication_slot('integ_cleanup_slot', 'pgoutput')",
+        )
+        .await
+        .unwrap_or(());
+
+    let online = pg_dbmigrator::OnlineOptions {
+        publication: "integ_cleanup_pub".into(),
+        slot_name: "integ_cleanup_slot".into(),
+        drop_slot_on_cutover: true,
+        ..pg_dbmigrator::OnlineOptions::default()
+    };
+
+    let reporter = pg_dbmigrator::progress::CollectingReporter::new();
+    pg_dbmigrator::cleanup_source_after_cutover(&url, &online, true, &reporter).await;
+
+    // Verify publication was dropped
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'integ_cleanup_pub')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let exists: bool = row.get(0);
+    assert!(!exists, "publication should have been dropped");
+
+    // Verify slot was dropped
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = 'integ_cleanup_slot')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let exists: bool = row.get(0);
+    assert!(!exists, "slot should have been dropped");
+
+    // Check reporter emitted SourceCleanup events
+    let events = reporter.events().await;
+    assert!(events.len() >= 2);
+    assert!(events
+        .iter()
+        .all(|e| e.stage == pg_dbmigrator::MigrationStage::SourceCleanup));
+}
+
+#[tokio::test]
+async fn cleanup_source_after_cutover_skips_when_not_auto_created() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Pre-create a publication (simulate operator-created)
+    client
+        .batch_execute("CREATE PUBLICATION integ_keep_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+
+    let online = pg_dbmigrator::OnlineOptions {
+        publication: "integ_keep_pub".into(),
+        slot_name: "integ_absent_slot_xyz".into(),
+        drop_slot_on_cutover: false,
+        ..pg_dbmigrator::OnlineOptions::default()
+    };
+
+    let reporter = pg_dbmigrator::progress::CollectingReporter::new();
+    // pub_auto_created = false, drop_slot_on_cutover = false → should be a no-op
+    pg_dbmigrator::cleanup_source_after_cutover(&url, &online, false, &reporter).await;
+
+    // Publication should still exist
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'integ_keep_pub')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let exists: bool = row.get(0);
+    assert!(exists, "publication should NOT have been dropped");
+
+    // No events emitted
+    let events = reporter.events().await;
+    assert!(events.is_empty());
+
+    // Clean up
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_keep_pub")
+        .await
+        .ok();
+}

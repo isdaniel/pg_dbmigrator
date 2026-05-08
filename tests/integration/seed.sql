@@ -28,6 +28,7 @@ INSERT INTO app.events (note)
 SELECT 'event-' || g
 FROM generate_series(1, 100) g;
 
--- Publication required for online mode. Library does not auto-create it.
+-- Publication for online mode. The library can auto-create it, but most
+-- integration tests pre-create it here so they exercise the pre-existing path.
 DROP PUBLICATION IF EXISTS pg_dbmigrator_pub;
 CREATE PUBLICATION pg_dbmigrator_pub FOR ALL TABLES;

@@ -291,6 +291,62 @@ pub async fn cleanup_target_subscription(target_conn: &str, online: &OnlineOptio
     Ok(())
 }
 
+/// Drop the publication on the source. Best-effort: errors are logged but
+/// do not propagate.
+///
+/// Called after a successful cutover when the publication was auto-created
+/// by the migrator. Uses `DROP PUBLICATION IF EXISTS` for idempotency.
+pub async fn drop_source_publication(source_conn: &str, publication: &str) -> Result<()> {
+    let client = connect_with_sslmode(source_conn).await?;
+    let pub_ident = quote_ident(publication)?;
+    let sql = format!("DROP PUBLICATION IF EXISTS {pub_ident}");
+    info!(publication, "dropping auto-created publication on source");
+    client.batch_execute(&sql).await?;
+    info!(publication, "publication dropped on source");
+    Ok(())
+}
+
+/// Build the SQL to drop a publication (pure function for testing).
+pub fn build_drop_publication_sql(publication: &str) -> Result<String> {
+    let pub_ident = quote_ident(publication)?;
+    Ok(format!("DROP PUBLICATION IF EXISTS {pub_ident}"))
+}
+
+/// Drop the replication slot on the source. Best-effort: errors are logged
+/// but do not propagate.
+///
+/// Called after a successful cutover when `drop_slot_on_cutover` is `true`.
+/// Only drops the slot if it exists and is not currently active.
+pub async fn drop_source_slot(source_conn: &str, slot_name: &str) -> Result<()> {
+    let client = connect_with_sslmode(source_conn).await?;
+    let slot_lit = quote_literal(slot_name)?;
+    let sql = format!(
+        "DO $$\n\
+         BEGIN\n\
+            IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = {slot_lit} AND NOT active) THEN\n\
+                PERFORM pg_drop_replication_slot({slot_lit});\n\
+            END IF;\n\
+         END $$;",
+    );
+    info!(slot_name, "dropping replication slot on source");
+    client.batch_execute(&sql).await?;
+    info!(slot_name, "cleanup of replication slot on source completed");
+    Ok(())
+}
+
+/// Build the SQL to drop a replication slot (pure function for testing).
+pub fn build_drop_slot_sql(slot_name: &str) -> Result<String> {
+    let slot_lit = quote_literal(slot_name)?;
+    Ok(format!(
+        "DO $$\n\
+         BEGIN\n\
+            IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = {slot_lit} AND NOT active) THEN\n\
+                PERFORM pg_drop_replication_slot({slot_lit});\n\
+            END IF;\n\
+         END $$;",
+    ))
+}
+
 /// Run the native apply phase: create a subscription on the target, poll the
 /// source for replication lag, and exit gracefully when the operator
 /// triggers cutover.
@@ -994,5 +1050,31 @@ mod tests {
         let conn = "postgres://user:pass@host:5432/mydb";
         let sql = make_create_subscription_sql(&opts, conn).unwrap();
         assert!(sql.contains(conn));
+    }
+
+    #[test]
+    fn build_drop_publication_sql_produces_if_exists() {
+        let sql = build_drop_publication_sql("my_pub").unwrap();
+        assert_eq!(sql, "DROP PUBLICATION IF EXISTS \"my_pub\"");
+    }
+
+    #[test]
+    fn build_drop_publication_sql_quotes_special_chars() {
+        let sql = build_drop_publication_sql("pub\"name").unwrap();
+        assert!(sql.contains("\"pub\"\"name\""));
+    }
+
+    #[test]
+    fn build_drop_slot_sql_checks_inactive() {
+        let sql = build_drop_slot_sql("my_slot").unwrap();
+        assert!(sql.contains("NOT active"));
+        assert!(sql.contains("pg_drop_replication_slot"));
+        assert!(sql.contains("'my_slot'"));
+    }
+
+    #[test]
+    fn build_drop_slot_sql_quotes_special_chars() {
+        let sql = build_drop_slot_sql("slot'name").unwrap();
+        assert!(sql.contains("'slot''name'"));
     }
 }
