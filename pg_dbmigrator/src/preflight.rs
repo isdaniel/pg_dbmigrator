@@ -233,7 +233,9 @@ async fn fetch_published_tables(
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('r', 'p') \
-               AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
+               AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+               AND n.nspname NOT LIKE 'pg_temp_%' \
+               AND n.nspname NOT LIKE 'pg_toast_temp_%'",
             &[],
         )
         .await?;

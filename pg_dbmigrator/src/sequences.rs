@@ -30,6 +30,7 @@
 //!
 //! [`pg_sequence_last_value(regclass)`]: https://www.postgresql.org/docs/current/functions-info.html
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Client;
 use tracing::{debug, info, warn};
@@ -105,6 +106,32 @@ pub async fn collect_source_sequences(
     Ok(out)
 }
 
+/// Abstraction over the target-side database operations needed by the
+/// sequence sync logic, following the [`CommandRunner`](crate::dump::CommandRunner)
+/// pattern so unit tests can substitute a mock without a real PostgreSQL.
+#[async_trait]
+pub(crate) trait SeqSyncTarget: Send + Sync {
+    async fn execute_setval(&self, sql: &str, last_value: i64) -> Result<u64>;
+    async fn batch_execute_sql(&self, sql: &str) -> Result<()>;
+    async fn query_batch_applied(&self) -> Result<i32>;
+}
+
+#[async_trait]
+impl SeqSyncTarget for Client {
+    async fn execute_setval(&self, sql: &str, last_value: i64) -> Result<u64> {
+        Ok(self.execute(sql, &[&last_value]).await?)
+    }
+    async fn batch_execute_sql(&self, sql: &str) -> Result<()> {
+        Ok(Client::batch_execute(self, sql).await?)
+    }
+    async fn query_batch_applied(&self) -> Result<i32> {
+        let row = self
+            .query_one("SELECT applied FROM _seq_sync_result", &[])
+            .await?;
+        Ok(row.get(0))
+    }
+}
+
 /// Apply the source-side sequence state to the target via `setval(...)`.
 ///
 /// Sequences whose source-side `last_value` is `None` are skipped — they
@@ -116,22 +143,136 @@ pub async fn collect_source_sequences(
 /// (e.g. owned by a role we can't act on) shouldn't block the rest of
 /// the migration from completing. The function returns the number of
 /// sequences successfully applied.
+///
+/// When more than one sequence needs syncing, a single PL/pgSQL `DO`
+/// block is executed to reduce network round-trips. Each `setval()`
+/// inside the block is wrapped in its own exception handler so a failure
+/// on one sequence doesn't prevent the others from being applied. If the
+/// batched approach fails entirely (e.g. older PG without PL/pgSQL), we
+/// fall back to individual statements.
 pub async fn apply_sequences_to_target(
     target: &Client,
     sequences: &[SourceSequence],
 ) -> Result<usize> {
-    let mut applied = 0usize;
+    apply_sequences_impl(target, sequences).await
+}
+
+async fn apply_sequences_impl(
+    target: &dyn SeqSyncTarget,
+    sequences: &[SourceSequence],
+) -> Result<usize> {
+    let actionable: Vec<&SourceSequence> = sequences
+        .iter()
+        .filter(|s| {
+            if s.last_value.is_none() {
+                debug!(
+                    schema = %s.schema,
+                    name = %s.name,
+                    "skipping sequence: never advanced on source",
+                );
+            }
+            s.last_value.is_some()
+        })
+        .collect();
+
+    if actionable.is_empty() {
+        return Ok(0);
+    }
+
+    if actionable.len() == 1 {
+        return apply_single(target, actionable[0]).await;
+    }
+
+    match apply_batch(target, &actionable).await {
+        Ok(applied) => Ok(applied),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "batch sequence sync failed — falling back to individual statements"
+            );
+            apply_individually(target, &actionable).await
+        }
+    }
+}
+
+/// Build a PL/pgSQL `DO` block that applies all sequences in one round-trip.
+/// Each setval is wrapped in a sub-block with exception handling so that a
+/// failure on one sequence does not abort the rest.
+///
+/// Public for unit tests.
+pub fn build_batch_setval_sql(sequences: &[&SourceSequence]) -> Result<String> {
+    let mut body = String::new();
+    body.push_str("CREATE TEMP TABLE IF NOT EXISTS _seq_sync_result (applied int);\n");
+    body.push_str("TRUNCATE _seq_sync_result;\n");
+    body.push_str("DO $__pg_dbmigrator_seq_sync__$\nDECLARE\n  _applied int := 0;\nBEGIN\n");
     for seq in sequences {
-        let Some(last_value) = seq.last_value else {
-            debug!(
+        let last_value = seq.last_value.unwrap_or(0);
+        let qualified = format!(
+            "{}.{}",
+            pg_walstream::quote_ident(&seq.schema)?,
+            pg_walstream::quote_ident(&seq.name)?,
+        );
+        let qualified_lit = pg_walstream::quote_literal(&qualified)?;
+        body.push_str("  BEGIN\n");
+        body.push_str(&format!(
+            "    PERFORM setval({qualified_lit}::regclass, {last_value}::bigint, true);\n"
+        ));
+        body.push_str("    _applied := _applied + 1;\n");
+        body.push_str("  EXCEPTION WHEN OTHERS THEN\n");
+        body.push_str(&format!(
+            "    RAISE WARNING 'setval failed for {}: %', SQLERRM;\n",
+            qualified.replace('\'', "''").replace('%', "%%")
+        ));
+        body.push_str("  END;\n");
+    }
+    body.push_str("  INSERT INTO _seq_sync_result VALUES (_applied);\n");
+    body.push_str("END;\n$__pg_dbmigrator_seq_sync__$;");
+    Ok(body)
+}
+
+/// Execute the batched PL/pgSQL block and parse the applied count from the
+/// RAISE NOTICE output.
+async fn apply_batch(target: &dyn SeqSyncTarget, sequences: &[&SourceSequence]) -> Result<usize> {
+    let sql = build_batch_setval_sql(sequences)?;
+    target.batch_execute_sql(&sql).await?;
+    let applied = target.query_batch_applied().await?;
+    for seq in sequences {
+        debug!(schema = %seq.schema, name = %seq.name, "synced sequence (batch)");
+    }
+    Ok(applied as usize)
+}
+
+/// Apply a single sequence (used when there's only one).
+async fn apply_single(target: &dyn SeqSyncTarget, seq: &SourceSequence) -> Result<usize> {
+    let last_value = seq.last_value.unwrap_or(0);
+    let sql = build_setval_sql(&seq.schema, &seq.name)?;
+    match target.execute_setval(&sql, last_value).await {
+        Ok(_) => {
+            debug!(schema = %seq.schema, name = %seq.name, last_value, "synced sequence");
+            Ok(1)
+        }
+        Err(e) => {
+            warn!(
                 schema = %seq.schema,
                 name = %seq.name,
-                "skipping sequence: never advanced on source",
+                error = %e,
+                "failed to sync sequence (continuing)"
             );
-            continue;
-        };
+            Ok(0)
+        }
+    }
+}
+
+/// Sequential per-statement fallback.
+async fn apply_individually(
+    target: &dyn SeqSyncTarget,
+    sequences: &[&SourceSequence],
+) -> Result<usize> {
+    let mut applied = 0usize;
+    for seq in sequences {
+        let last_value = seq.last_value.unwrap_or(0);
         let sql = build_setval_sql(&seq.schema, &seq.name)?;
-        match target.execute(&sql, &[&last_value]).await {
+        match target.execute_setval(&sql, last_value).await {
             Ok(_) => {
                 applied += 1;
                 debug!(schema = %seq.schema, name = %seq.name, last_value, "synced sequence");
@@ -313,5 +454,231 @@ mod tests {
     #[test]
     fn collect_sql_with_schema_filter_uses_any_operator() {
         assert!(COLLECT_SEQUENCES_SQL_WITH_SCHEMA_FILTER.contains("ANY($1::text[])"));
+    }
+
+    #[test]
+    fn build_batch_setval_sql_produces_valid_plpgsql() {
+        let seqs = [
+            SourceSequence {
+                schema: "public".into(),
+                name: "users_id_seq".into(),
+                last_value: Some(42),
+            },
+            SourceSequence {
+                schema: "public".into(),
+                name: "orders_id_seq".into(),
+                last_value: Some(100),
+            },
+        ];
+        let refs: Vec<&SourceSequence> = seqs.iter().collect();
+        let sql = build_batch_setval_sql(&refs).unwrap();
+        assert!(sql.contains("CREATE TEMP TABLE IF NOT EXISTS _seq_sync_result"));
+        assert!(!sql.contains("ON COMMIT DROP"));
+        assert!(sql.contains("DO $__pg_dbmigrator_seq_sync__$"));
+        assert!(sql.ends_with("$__pg_dbmigrator_seq_sync__$;"));
+        assert!(sql.contains("PERFORM setval"));
+        assert!(sql.contains("42::bigint"));
+        assert!(sql.contains("100::bigint"));
+        assert!(sql.contains("EXCEPTION WHEN OTHERS"));
+        assert!(sql.contains("_applied := _applied + 1"));
+        assert!(sql.contains("INSERT INTO _seq_sync_result VALUES (_applied)"));
+    }
+
+    #[test]
+    fn build_batch_setval_sql_escapes_special_chars() {
+        let seqs = [SourceSequence {
+            schema: "my\"schema".into(),
+            name: "o'reilly_seq".into(),
+            last_value: Some(7),
+        }];
+        let refs: Vec<&SourceSequence> = seqs.iter().collect();
+        let sql = build_batch_setval_sql(&refs).unwrap();
+        assert!(sql.contains("\"my\"\"schema\""));
+        assert!(sql.contains("7::bigint"));
+    }
+
+    #[test]
+    fn build_batch_setval_sql_escapes_percent_in_raise_warning() {
+        let seqs = [SourceSequence {
+            schema: "public".into(),
+            name: "pct%seq".into(),
+            last_value: Some(1),
+        }];
+        let refs: Vec<&SourceSequence> = seqs.iter().collect();
+        let sql = build_batch_setval_sql(&refs).unwrap();
+        assert!(
+            sql.contains("%%"),
+            "percent signs in identifiers must be doubled for RAISE WARNING"
+        );
+    }
+
+    #[test]
+    fn build_batch_setval_sql_empty_input() {
+        let refs: Vec<&SourceSequence> = vec![];
+        let sql = build_batch_setval_sql(&refs).unwrap();
+        assert!(sql.contains("DO $__pg_dbmigrator_seq_sync__$"));
+        assert!(!sql.contains("PERFORM setval"));
+        assert!(sql.contains("INSERT INTO _seq_sync_result VALUES (_applied)"));
+    }
+
+    // ── Mock-based async tests ──────────────────────────────────────────────
+
+    use crate::error::MigrationError;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct MockTarget {
+        setval_results: Mutex<VecDeque<Result<u64>>>,
+        batch_exec_result: Mutex<Option<Result<()>>>,
+        batch_applied: Mutex<Option<Result<i32>>>,
+    }
+
+    impl MockTarget {
+        fn ok(applied_count: i32) -> Self {
+            Self {
+                setval_results: Mutex::new(VecDeque::new()),
+                batch_exec_result: Mutex::new(Some(Ok(()))),
+                batch_applied: Mutex::new(Some(Ok(applied_count))),
+            }
+        }
+
+        fn batch_fails() -> Self {
+            Self {
+                setval_results: Mutex::new(VecDeque::new()),
+                batch_exec_result: Mutex::new(Some(Err(MigrationError::config(
+                    "batch not supported",
+                )))),
+                batch_applied: Mutex::new(None),
+            }
+        }
+
+        fn with_setval_results(mut self, results: Vec<Result<u64>>) -> Self {
+            self.setval_results = Mutex::new(results.into());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl SeqSyncTarget for MockTarget {
+        async fn execute_setval(&self, _sql: &str, _last_value: i64) -> Result<u64> {
+            self.setval_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(1))
+        }
+        async fn batch_execute_sql(&self, _sql: &str) -> Result<()> {
+            self.batch_exec_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Ok(()))
+        }
+        async fn query_batch_applied(&self) -> Result<i32> {
+            self.batch_applied.lock().unwrap().take().unwrap_or(Ok(0))
+        }
+    }
+
+    fn seq(schema: &str, name: &str, val: Option<i64>) -> SourceSequence {
+        SourceSequence {
+            schema: schema.into(),
+            name: name.into(),
+            last_value: val,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_all_none_last_value_returns_zero() {
+        let target = MockTarget::ok(0);
+        let seqs = vec![seq("public", "s1", None), seq("public", "s2", None)];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_empty_sequences_returns_zero() {
+        let target = MockTarget::ok(0);
+        let applied = apply_sequences_impl(&target, &[]).await.unwrap();
+        assert_eq!(applied, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_single_sequence_success() {
+        let target = MockTarget::ok(0).with_setval_results(vec![Ok(1)]);
+        let seqs = vec![seq("public", "users_id_seq", Some(42))];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_single_sequence_failure_returns_zero() {
+        let target = MockTarget::ok(0)
+            .with_setval_results(vec![Err(MigrationError::config("permission denied"))]);
+        let seqs = vec![seq("public", "users_id_seq", Some(42))];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_success() {
+        let target = MockTarget::ok(2);
+        let seqs = vec![seq("public", "s1", Some(10)), seq("public", "s2", Some(20))];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_reports_partial_success() {
+        let target = MockTarget::ok(1);
+        let seqs = vec![seq("public", "s1", Some(10)), seq("public", "s2", Some(20))];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_failure_falls_back_to_individual() {
+        let target = MockTarget::batch_fails().with_setval_results(vec![Ok(1), Ok(1)]);
+        let seqs = vec![seq("public", "s1", Some(10)), seq("public", "s2", Some(20))];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_individually_mixed_results() {
+        let target = MockTarget::batch_fails().with_setval_results(vec![
+            Ok(1),
+            Err(MigrationError::config("fail")),
+            Ok(1),
+        ]);
+        let seqs = vec![
+            seq("public", "s1", Some(1)),
+            seq("public", "s2", Some(2)),
+            seq("public", "s3", Some(3)),
+        ];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_filters_none_and_routes_remaining() {
+        let target = MockTarget::ok(0).with_setval_results(vec![Ok(1)]);
+        let seqs = vec![
+            seq("public", "never_used", None),
+            seq("public", "used_seq", Some(99)),
+        ];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_filters_none_and_routes_to_batch() {
+        let target = MockTarget::ok(2);
+        let seqs = vec![
+            seq("public", "skip_me", None),
+            seq("public", "s1", Some(10)),
+            seq("public", "s2", Some(20)),
+        ];
+        let applied = apply_sequences_impl(&target, &seqs).await.unwrap();
+        assert_eq!(applied, 2);
     }
 }

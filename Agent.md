@@ -69,15 +69,15 @@ docker-compose.test.yml           # source :55432, target :55433
 |--------|------|
 | `config.rs` | `MigrationConfig`/`OnlineOptions`, validation, performance defaults |
 | `error.rs` | `MigrationError` (thiserror) + `Result<T>` |
-| `dump.rs` | pg_dump wrapper, `CommandRunner` trait, argv builder, stderr progress parsing |
+| `dump.rs` | pg_dump wrapper, `CommandRunner` trait, argv builder, stderr ingestion |
 | `restore.rs` | pg_restore/psql wrapper |
 | `analyze.rs` | Pre-dump VACUUM ANALYZE + post-restore ANALYZE |
 | `snapshot.rs` | Replication slot creation + exported snapshot |
 | `native_apply.rs` | CREATE SUBSCRIPTION, lag polling, `ApplyStats`, `drop_source_{publication,slot}` |
-| `orchestrator.rs` | `Migrator` — wires all stages |
+| `orchestrator.rs` | `Migrator` — wires all stages, parallel pre-flight via `tokio::join!` |
 | `progress.rs` | `ProgressReporter` trait + Tracing/Collecting impls |
 | `preflight.rs` | Source validation, `ensure_publication_exists` (auto-create) |
-| `sequences.rs` | Source→target setval at cutover |
+| `sequences.rs` | Source→target setval at cutover (batched PL/pgSQL for single round-trip) |
 | `resume.rs` | Resume token persistence |
 | `tls.rs` | TLS-aware connection helper |
 
@@ -88,6 +88,13 @@ docker-compose.test.yml           # source :55432, target :55433
 3. **Resume preserves replication origin**: subscription is disabled/re-enabled (not dropped/recreated) to avoid duplicate-key violations.
 4. **Sequence sync at cutover**: migrator runs setval() on all target sequences after cutover.
 5. **Publication lifecycle**: auto-created publications are tracked (`pub_auto_created`) and dropped after cutover; pre-existing ones are never dropped.
+
+### Performance optimizations
+
+- **Parallel pre-flight**: `ensure_target_database_exists` and `verify_source_logical_replication_ready` run concurrently via `tokio::join!` (they hit different servers).
+- **Batched sequence sync**: `apply_sequences_to_target()` builds a single PL/pgSQL `DO` block with per-sequence exception handling, reducing N round-trips to 1. Falls back to individual statements if the batch fails.
+- **Split-section restore**: pre-data → data → post-data for index-free COPY (30-60% faster index rebuild).
+- **LZ4 compression**: default `lz4:1` for dump archives (fast compress/decompress).
 
 ---
 
@@ -117,7 +124,9 @@ docker-compose.test.yml           # source :55432, target :55433
 
 6. **Contract with pg_walstream**
    - Slot creation before dump. START_REPLICATION only after dump.
-   - Pinned at `0.6.2` via path dep to `../pg-walstream`. Verify `ChangeEvent`/`EventType` compatibility before bumping.
+   - Pinned at `0.6.3` via workspace dep. Verify `ChangeEvent`/`EventType` compatibility before bumping.
+   - Used functions: `quote_ident`, `quote_literal`, `parse_lsn`, `format_lsn`, `build_create_subscription_sql`, `build_disable_subscription_sql`, `build_detach_slot_sql`, `build_drop_subscription_sql`, `LogicalReplicationStream`, `ReplicationStreamConfig`, `CreateSubscriptionOptions`.
+   - pg_walstream has NO publication SQL builders — publication SQL in `preflight.rs` is hand-rolled (necessary).
 
 7. **No unsolicited optimisation**
    - Make only the changes the task requires. No silent async conversions, container swaps, or new crate additions.
@@ -220,7 +229,7 @@ make integration                 # e2e, requires Docker
 - **Small workspace** — most files are 200–400 lines. Read the entire file before editing. Use grep to confirm blast radius.
 - **Validate after editing** — run `cargo test -p pg_dbmigrator` after every change.
 - **New stage / mode** → must update ALL of: `MigrationStage` enum, `Migrator` entry point, CLI args, README, and this file.
-- **pg_walstream** lives in sibling workspace (`../pg-walstream`). Pinned at `0.6.2` via path dep. Do NOT vendor/fork — propose changes upstream.
+- **pg_walstream** pinned at `0.6.3` via workspace dep. Do NOT vendor/fork — propose changes upstream.
 - **Library/CLI boundary** — library returns `pg_dbmigrator::Result<T>` only. `anyhow` is CLI/examples only.
 - **Versions** — all dependency versions live in workspace `Cargo.toml` under `[workspace.dependencies]`. Crate manifests use `xxx.workspace = true`.
 
