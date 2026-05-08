@@ -796,10 +796,17 @@ async fn ensure_publication_excludes_tables_when_no_includes() {
     );
 
     // Verify skip_me is not in the publication's table list.
+    // Use pg_publication_rel JOIN pg_class instead of pg_publication_tables
+    // because the latter calls relation_open() on every OID and crashes if
+    // a concurrently-running test dropped a table after the publication was
+    // created.
     let skip_rows = client
         .query(
-            "SELECT schemaname, tablename FROM pg_publication_tables \
-             WHERE pubname = 'integ_excl_pub' AND tablename = 'skip_me'",
+            "SELECT c.relname FROM pg_publication_rel pr \
+             JOIN pg_class c ON c.oid = pr.prrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE pr.prpubid = (SELECT oid FROM pg_publication WHERE pubname = 'integ_excl_pub') \
+               AND c.relname = 'skip_me'",
             &[],
         )
         .await
@@ -812,8 +819,11 @@ async fn ensure_publication_excludes_tables_when_no_includes() {
     // Verify keep_me IS in the publication.
     let keep_rows = client
         .query(
-            "SELECT schemaname, tablename FROM pg_publication_tables \
-             WHERE pubname = 'integ_excl_pub' AND tablename = 'keep_me'",
+            "SELECT c.relname FROM pg_publication_rel pr \
+             JOIN pg_class c ON c.oid = pr.prrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE pr.prpubid = (SELECT oid FROM pg_publication WHERE pubname = 'integ_excl_pub') \
+               AND c.relname = 'keep_me'",
             &[],
         )
         .await
