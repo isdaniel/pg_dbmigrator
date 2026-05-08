@@ -213,7 +213,6 @@ impl Migrator {
         // stream to keep. We only call `prepare_replication_slot` (and
         // hold a stream) when we still need to run pg_dump.
         let mut prepared_stream = None;
-        let mut pub_auto_created = false;
         let snapshot_name = if !token.has(CompletedStage::Dump) {
             // Ensure the publication exists on the source. If auto-create
             // is enabled and it's missing, create it. Otherwise fail fast
@@ -227,13 +226,17 @@ impl Migrator {
                     ),
                 )
                 .await;
-                pub_auto_created = ensure_publication_exists(
+                let created = ensure_publication_exists(
                     &self.config.source.connection_string,
                     &self.config.online.publication,
                     &self.config.tables,
                     &self.config.schemas,
                 )
                 .await?;
+                if created {
+                    token.pub_auto_created = true;
+                    self.save_resume(&token, &dump_path).await;
+                }
             } else {
                 self.report(
                     MigrationStage::Validate,
@@ -415,9 +418,9 @@ impl Migrator {
 
         // 6. Post-cutover cleanup: drop auto-created publication and slot.
         if stats.cutover_triggered {
-            if pub_auto_created {
+            if token.pub_auto_created {
                 self.report(
-                    MigrationStage::Cutover,
+                    MigrationStage::SourceCleanup,
                     format!(
                         "dropping auto-created publication `{}` on source",
                         self.config.online.publication
@@ -439,13 +442,25 @@ impl Migrator {
 
             if self.config.online.drop_slot_on_cutover {
                 self.report(
-                    MigrationStage::Cutover,
+                    MigrationStage::SourceCleanup,
                     format!(
                         "dropping replication slot `{}` on source",
                         self.config.online.slot_name
                     ),
                 )
                 .await;
+                if let Err(e) = wait_for_slot_inactive(
+                    &self.config.source.connection_string,
+                    &self.config.online.slot_name,
+                    self.reporter.as_ref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "failed waiting for slot to become inactive (non-fatal)"
+                    );
+                }
                 if let Err(e) = drop_source_slot(
                     &self.config.source.connection_string,
                     &self.config.online.slot_name,

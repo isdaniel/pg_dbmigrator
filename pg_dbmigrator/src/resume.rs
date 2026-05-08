@@ -90,6 +90,10 @@ pub struct ResumeToken {
     /// Most recent `confirmed_flush_lsn` observed by the apply lag
     /// poller. Useful for the operator's sanity check after a resume.
     pub last_applied_lsn: Option<u64>,
+    /// Whether the publication was auto-created by this migration run.
+    /// Persisted so cleanup can drop it even after a resume.
+    #[serde(default)]
+    pub pub_auto_created: bool,
     /// RFC-3339 timestamp of the last save.
     pub updated_at: String,
 }
@@ -124,6 +128,7 @@ impl ResumeToken {
             },
             snapshot_name: None,
             last_applied_lsn: None,
+            pub_auto_created: false,
             updated_at: now_rfc3339(),
         }
     }
@@ -458,5 +463,33 @@ mod tests {
         assert!(CompletedStage::PrepareSnapshot < CompletedStage::Dump);
         assert!(CompletedStage::Dump < CompletedStage::Restore);
         assert!(CompletedStage::Restore < CompletedStage::Analyze);
+    }
+
+    #[test]
+    fn pub_auto_created_defaults_false_when_missing() {
+        let json = r#"{
+            "schema_version": 1,
+            "config_hash": "abc",
+            "mode": "online",
+            "completed": [],
+            "dump_path": "/tmp/dump",
+            "slot_name": "slot",
+            "subscription_name": null,
+            "publication": null,
+            "snapshot_name": null,
+            "last_applied_lsn": null,
+            "updated_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let token: ResumeToken = serde_json::from_str(json).unwrap();
+        assert!(!token.pub_auto_created);
+    }
+
+    #[test]
+    fn pub_auto_created_roundtrip() {
+        let mut t = ResumeToken::new(&cfg(), PathBuf::from("/tmp/dump"));
+        t.pub_auto_created = true;
+        let json = serde_json::to_string(&t).unwrap();
+        let t2: ResumeToken = serde_json::from_str(&json).unwrap();
+        assert!(t2.pub_auto_created);
     }
 }

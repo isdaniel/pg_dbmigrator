@@ -145,6 +145,19 @@ pub async fn verify_source_logical_replication_ready(source_conn: &str) -> Resul
     Ok(())
 }
 
+/// Quote a potentially schema-qualified name (`schema.table`) by splitting
+/// on `.` and quoting each part individually. Unqualified names (no dot)
+/// are quoted as a single identifier.
+///
+/// PostgreSQL requires `"schema"."table"` — quoting the whole thing as
+/// `"schema.table"` creates a single identifier that includes a literal dot.
+pub fn quote_qualified_name(name: &str) -> Result<String> {
+    let parts: Vec<&str> = name.splitn(2, '.').collect();
+    let quoted: std::result::Result<Vec<_>, _> =
+        parts.iter().map(|p| pg_walstream::quote_ident(p)).collect();
+    Ok(quoted?.join("."))
+}
+
 /// Build the `CREATE PUBLICATION` SQL statement from the given parameters.
 ///
 /// When both `tables` and `schemas` are empty, creates `FOR ALL TABLES`.
@@ -157,10 +170,8 @@ pub fn build_create_publication_sql(
 ) -> Result<String> {
     let pub_ident = pg_walstream::quote_ident(publication)?;
     let scope = if !tables.is_empty() {
-        let quoted: std::result::Result<Vec<_>, _> = tables
-            .iter()
-            .map(|t| pg_walstream::quote_ident(t))
-            .collect();
+        let quoted: std::result::Result<Vec<_>, _> =
+            tables.iter().map(|t| quote_qualified_name(t)).collect();
         format!("FOR TABLE {}", quoted?.join(", "))
     } else if !schemas.is_empty() {
         let quoted: std::result::Result<Vec<_>, _> = schemas
@@ -499,7 +510,7 @@ mod tests {
         let sql = build_create_publication_sql("my_pub", &tables, &[]).unwrap();
         assert_eq!(
             sql,
-            "CREATE PUBLICATION \"my_pub\" FOR TABLE \"public.users\", \"public.orders\""
+            "CREATE PUBLICATION \"my_pub\" FOR TABLE \"public\".\"users\", \"public\".\"orders\""
         );
     }
 
@@ -526,5 +537,30 @@ mod tests {
     fn build_publication_sql_quotes_special_chars() {
         let sql = build_create_publication_sql("pub\"name", &[], &[]).unwrap();
         assert!(sql.contains("\"pub\"\"name\""));
+    }
+
+    #[test]
+    fn quote_qualified_name_unqualified() {
+        let result = quote_qualified_name("users").unwrap();
+        assert_eq!(result, "\"users\"");
+    }
+
+    #[test]
+    fn quote_qualified_name_schema_qualified() {
+        let result = quote_qualified_name("public.users").unwrap();
+        assert_eq!(result, "\"public\".\"users\"");
+    }
+
+    #[test]
+    fn quote_qualified_name_special_chars() {
+        let result = quote_qualified_name("my schema.my table").unwrap();
+        assert_eq!(result, "\"my schema\".\"my table\"");
+    }
+
+    #[test]
+    fn quote_qualified_name_dot_in_table_part() {
+        // Only splits on first dot: "schema.table.extra" -> "schema" + "table.extra"
+        let result = quote_qualified_name("public.my.table").unwrap();
+        assert_eq!(result, "\"public\".\"my.table\"");
     }
 }
