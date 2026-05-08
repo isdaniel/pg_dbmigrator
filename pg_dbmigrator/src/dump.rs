@@ -377,15 +377,9 @@ fn kill_child_group(_pid: Option<u32>, _sigkill: bool) {}
 ///   pg_dump: dumping contents of table "schema"."table"
 ///   pg_restore: processing data for table "schema"."table"
 fn emit_table_progress(line: &str) {
-    if let Some(table) = line
-        .strip_prefix("pg_dump: dumping contents of table \"")
-        .and_then(|s| s.strip_suffix('"'))
-    {
+    if let Some(table) = line.strip_prefix("pg_dump: dumping contents of table ") {
         info!(table, "pg_dump: dumping table");
-    } else if let Some(table) = line
-        .strip_prefix("pg_restore: processing data for table \"")
-        .and_then(|s| s.strip_suffix('"'))
-    {
+    } else if let Some(table) = line.strip_prefix("pg_restore: processing data for table ") {
         info!(table, "pg_restore: restoring table");
     }
 }

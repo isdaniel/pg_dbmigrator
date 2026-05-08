@@ -418,61 +418,13 @@ impl Migrator {
 
         // 6. Post-cutover cleanup: drop auto-created publication and slot.
         if stats.cutover_triggered {
-            if token.pub_auto_created {
-                self.report(
-                    MigrationStage::SourceCleanup,
-                    format!(
-                        "dropping auto-created publication `{}` on source",
-                        self.config.online.publication
-                    ),
-                )
-                .await;
-                if let Err(e) = drop_source_publication(
-                    &self.config.source.connection_string,
-                    &self.config.online.publication,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to drop auto-created publication (non-fatal)"
-                    );
-                }
-            }
-
-            if self.config.online.drop_slot_on_cutover {
-                self.report(
-                    MigrationStage::SourceCleanup,
-                    format!(
-                        "dropping replication slot `{}` on source",
-                        self.config.online.slot_name
-                    ),
-                )
-                .await;
-                if let Err(e) = wait_for_slot_inactive(
-                    &self.config.source.connection_string,
-                    &self.config.online.slot_name,
-                    self.reporter.as_ref(),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        "failed waiting for slot to become inactive (non-fatal)"
-                    );
-                }
-                if let Err(e) = drop_source_slot(
-                    &self.config.source.connection_string,
-                    &self.config.online.slot_name,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to drop replication slot (non-fatal)"
-                    );
-                }
-            }
+            cleanup_source_after_cutover(
+                &self.config.source.connection_string,
+                &self.config.online,
+                token.pub_auto_created,
+                self.reporter.as_ref(),
+            )
+            .await;
         }
 
         self.report(MigrationStage::Complete, "online migration finished")
@@ -709,6 +661,54 @@ impl MigrationOutcome {
     /// (operator-driven or auto). Always `false` for offline migrations.
     pub fn cutover_triggered(&self) -> bool {
         self.stats.map(|s| s.cutover_triggered).unwrap_or(false)
+    }
+}
+
+/// Post-cutover cleanup: drop auto-created publication and replication slot
+/// on the source. Non-fatal — errors are logged as warnings.
+pub async fn cleanup_source_after_cutover(
+    source_conn: &str,
+    online: &crate::config::OnlineOptions,
+    pub_auto_created: bool,
+    reporter: &dyn ProgressReporter,
+) {
+    if pub_auto_created {
+        reporter
+            .report(ProgressEvent::new(
+                MigrationStage::SourceCleanup,
+                format!(
+                    "dropping auto-created publication `{}` on source",
+                    online.publication
+                ),
+            ))
+            .await;
+        if let Err(e) = drop_source_publication(source_conn, &online.publication).await {
+            tracing::warn!(
+                error = %e,
+                "failed to drop auto-created publication (non-fatal)"
+            );
+        }
+    }
+
+    if online.drop_slot_on_cutover {
+        reporter
+            .report(ProgressEvent::new(
+                MigrationStage::SourceCleanup,
+                format!("dropping replication slot `{}` on source", online.slot_name),
+            ))
+            .await;
+        if let Err(e) = wait_for_slot_inactive(source_conn, &online.slot_name, reporter).await {
+            tracing::warn!(
+                error = %e,
+                "failed waiting for slot to become inactive (non-fatal)"
+            );
+        }
+        if let Err(e) = drop_source_slot(source_conn, &online.slot_name).await {
+            tracing::warn!(
+                error = %e,
+                "failed to drop replication slot (non-fatal)"
+            );
+        }
     }
 }
 

@@ -153,6 +153,11 @@ pub async fn verify_source_logical_replication_ready(source_conn: &str) -> Resul
 /// `"schema.table"` creates a single identifier that includes a literal dot.
 pub fn quote_qualified_name(name: &str) -> Result<String> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(MigrationError::config(format!(
+            "invalid qualified name: `{name}` (empty component)"
+        )));
+    }
     let quoted: std::result::Result<Vec<_>, _> =
         parts.iter().map(|p| pg_walstream::quote_ident(p)).collect();
     Ok(quoted?.join("."))
@@ -169,16 +174,21 @@ pub fn build_create_publication_sql(
     schemas: &[String],
 ) -> Result<String> {
     let pub_ident = pg_walstream::quote_ident(publication)?;
-    let scope = if !tables.is_empty() {
-        let quoted: std::result::Result<Vec<_>, _> =
-            tables.iter().map(|t| quote_qualified_name(t)).collect();
-        format!("FOR TABLE {}", quoted?.join(", "))
-    } else if !schemas.is_empty() {
-        let quoted: std::result::Result<Vec<_>, _> = schemas
-            .iter()
-            .map(|s| pg_walstream::quote_ident(s))
-            .collect();
-        format!("FOR TABLES IN SCHEMA {}", quoted?.join(", "))
+    let scope = if !tables.is_empty() || !schemas.is_empty() {
+        let mut scope_parts = Vec::new();
+        if !tables.is_empty() {
+            let quoted: std::result::Result<Vec<_>, _> =
+                tables.iter().map(|t| quote_qualified_name(t)).collect();
+            scope_parts.push(format!("TABLE {}", quoted?.join(", ")));
+        }
+        if !schemas.is_empty() {
+            let quoted: std::result::Result<Vec<_>, _> = schemas
+                .iter()
+                .map(|s| pg_walstream::quote_ident(s))
+                .collect();
+            scope_parts.push(format!("TABLES IN SCHEMA {}", quoted?.join(", ")));
+        }
+        format!("FOR {}", scope_parts.join(", "))
     } else {
         "FOR ALL TABLES".to_string()
     };
@@ -525,12 +535,14 @@ mod tests {
     }
 
     #[test]
-    fn build_publication_sql_tables_take_precedence_over_schemas() {
+    fn build_publication_sql_combines_tables_and_schemas() {
         let tables = vec!["public.users".to_string()];
         let schemas = vec!["app".to_string()];
         let sql = build_create_publication_sql("my_pub", &tables, &schemas).unwrap();
-        assert!(sql.contains("FOR TABLE"));
-        assert!(!sql.contains("FOR TABLES IN SCHEMA"));
+        assert_eq!(
+            sql,
+            "CREATE PUBLICATION \"my_pub\" FOR TABLE \"public\".\"users\", TABLES IN SCHEMA \"app\""
+        );
     }
 
     #[test]
@@ -562,5 +574,17 @@ mod tests {
         // Only splits on first dot: "schema.table.extra" -> "schema" + "table.extra"
         let result = quote_qualified_name("public.my.table").unwrap();
         assert_eq!(result, "\"public\".\"my.table\"");
+    }
+
+    #[test]
+    fn quote_qualified_name_rejects_trailing_dot() {
+        let result = quote_qualified_name("public.");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn quote_qualified_name_rejects_leading_dot() {
+        let result = quote_qualified_name(".table");
+        assert!(result.is_err());
     }
 }

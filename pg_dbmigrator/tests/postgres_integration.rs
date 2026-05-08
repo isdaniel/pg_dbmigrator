@@ -781,3 +781,106 @@ async fn drop_source_slot_is_idempotent() {
     let result = pg_dbmigrator::native_apply::drop_source_slot(&url, "integ_drop_slot").await;
     assert!(result.is_ok());
 }
+
+// ─── orchestrator::cleanup_source_after_cutover ─────────────────────────────
+
+#[tokio::test]
+async fn cleanup_source_after_cutover_drops_pub_and_slot() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Pre-create a publication and slot
+    client
+        .batch_execute("CREATE PUBLICATION integ_cleanup_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+    client
+        .batch_execute(
+            "SELECT pg_create_logical_replication_slot('integ_cleanup_slot', 'pgoutput')",
+        )
+        .await
+        .unwrap_or(());
+
+    let online = pg_dbmigrator::OnlineOptions {
+        publication: "integ_cleanup_pub".into(),
+        slot_name: "integ_cleanup_slot".into(),
+        drop_slot_on_cutover: true,
+        ..pg_dbmigrator::OnlineOptions::default()
+    };
+
+    let reporter = pg_dbmigrator::progress::CollectingReporter::new();
+    pg_dbmigrator::cleanup_source_after_cutover(&url, &online, true, &reporter).await;
+
+    // Verify publication was dropped
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'integ_cleanup_pub')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let exists: bool = row.get(0);
+    assert!(!exists, "publication should have been dropped");
+
+    // Verify slot was dropped
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = 'integ_cleanup_slot')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let exists: bool = row.get(0);
+    assert!(!exists, "slot should have been dropped");
+
+    // Check reporter emitted SourceCleanup events
+    let events = reporter.events().await;
+    assert!(events.len() >= 2);
+    assert!(events
+        .iter()
+        .all(|e| e.stage == pg_dbmigrator::MigrationStage::SourceCleanup));
+}
+
+#[tokio::test]
+async fn cleanup_source_after_cutover_skips_when_not_auto_created() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Pre-create a publication (simulate operator-created)
+    client
+        .batch_execute("CREATE PUBLICATION integ_keep_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+
+    let online = pg_dbmigrator::OnlineOptions {
+        publication: "integ_keep_pub".into(),
+        slot_name: "integ_absent_slot_xyz".into(),
+        drop_slot_on_cutover: false,
+        ..pg_dbmigrator::OnlineOptions::default()
+    };
+
+    let reporter = pg_dbmigrator::progress::CollectingReporter::new();
+    // pub_auto_created = false, drop_slot_on_cutover = false → should be a no-op
+    pg_dbmigrator::cleanup_source_after_cutover(&url, &online, false, &reporter).await;
+
+    // Publication should still exist
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'integ_keep_pub')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let exists: bool = row.get(0);
+    assert!(exists, "publication should NOT have been dropped");
+
+    // No events emitted
+    let events = reporter.events().await;
+    assert!(events.is_empty());
+
+    // Clean up
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_keep_pub")
+        .await
+        .ok();
+}

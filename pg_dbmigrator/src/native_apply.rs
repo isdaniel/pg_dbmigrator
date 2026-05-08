@@ -301,11 +301,8 @@ pub async fn drop_source_publication(source_conn: &str, publication: &str) -> Re
     let pub_ident = quote_ident(publication)?;
     let sql = format!("DROP PUBLICATION IF EXISTS {pub_ident}");
     info!(publication, "dropping auto-created publication on source");
-    if let Err(e) = client.batch_execute(&sql).await {
-        warn!(error = %e, publication, "failed to drop publication on source (continuing)");
-    } else {
-        info!(publication, "publication dropped on source");
-    }
+    client.batch_execute(&sql).await?;
+    info!(publication, "publication dropped on source");
     Ok(())
 }
 
@@ -332,11 +329,8 @@ pub async fn drop_source_slot(source_conn: &str, slot_name: &str) -> Result<()> 
          END $$;",
     );
     info!(slot_name, "dropping replication slot on source");
-    if let Err(e) = client.batch_execute(&sql).await {
-        warn!(error = %e, slot_name, "failed to drop replication slot on source (continuing)");
-    } else {
-        info!(slot_name, "replication slot dropped on source");
-    }
+    client.batch_execute(&sql).await?;
+    info!(slot_name, "cleanup of replication slot on source completed");
     Ok(())
 }
 
