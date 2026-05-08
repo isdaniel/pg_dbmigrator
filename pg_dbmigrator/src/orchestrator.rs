@@ -176,33 +176,26 @@ impl Migrator {
             .await?;
         }
 
-        // 0.5. Ensure the target database exists — pg_restore needs it.
+        // Run target-database check and source logical-replication validation in parallel — they hit different servers so there is no ordering dependency.
         self.report(
             MigrationStage::Validate,
             format!(
-                "ensuring target database `{}` exists",
+                "ensuring target database `{}` exists + verifying source logical replication",
                 self.config.target.database
             ),
         )
         .await;
-        ensure_target_database_exists(
-            &self.config.target.connection_string,
-            &self.config.target.database,
-        )
-        .await?;
+        let (target_db_result, source_repl_result) = tokio::join!(
+            ensure_target_database_exists(
+                &self.config.target.connection_string,
+                &self.config.target.database,
+            ),
+            verify_source_logical_replication_ready(&self.config.source.connection_string),
+        );
+        target_db_result?;
+        source_repl_result?;
 
-        // 0.6. Verify the source is configured for logical replication.
-        // Doing this *before* slot creation gives the operator a clean,
-        // actionable error instead of a confusing libpq error 30 s into
-        // CREATE_REPLICATION_SLOT.
-        self.report(
-            MigrationStage::Validate,
-            "verifying source is configured for logical replication",
-        )
-        .await;
-        verify_source_logical_replication_ready(&self.config.source.connection_string).await?;
-
-        // 0.7. Pre-dump: VACUUM ANALYZE on source.
+        // Pre-dump: VACUUM ANALYZE on source.
         let dump_path = self.dump_path_or_default("dump_online");
         let mut token = self.load_or_init_resume(&dump_path).await?;
 
