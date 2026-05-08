@@ -202,11 +202,9 @@ async fn apply_sequences_impl(
 /// Public for unit tests.
 pub fn build_batch_setval_sql(sequences: &[&SourceSequence]) -> Result<String> {
     let mut body = String::new();
-    body.push_str(
-        "CREATE TEMP TABLE IF NOT EXISTS _seq_sync_result (applied int) ON COMMIT DROP;\n",
-    );
+    body.push_str("CREATE TEMP TABLE IF NOT EXISTS _seq_sync_result (applied int);\n");
     body.push_str("TRUNCATE _seq_sync_result;\n");
-    body.push_str("DO $seq_sync$\nDECLARE\n  _applied int := 0;\nBEGIN\n");
+    body.push_str("DO $__pg_dbmigrator_seq_sync__$\nDECLARE\n  _applied int := 0;\nBEGIN\n");
     for seq in sequences {
         let last_value = seq.last_value.unwrap_or(0);
         let qualified = format!(
@@ -228,7 +226,7 @@ pub fn build_batch_setval_sql(sequences: &[&SourceSequence]) -> Result<String> {
         body.push_str("  END;\n");
     }
     body.push_str("  INSERT INTO _seq_sync_result VALUES (_applied);\n");
-    body.push_str("END;\n$seq_sync$;");
+    body.push_str("END;\n$__pg_dbmigrator_seq_sync__$;");
     Ok(body)
 }
 
@@ -475,8 +473,9 @@ mod tests {
         let refs: Vec<&SourceSequence> = seqs.iter().collect();
         let sql = build_batch_setval_sql(&refs).unwrap();
         assert!(sql.contains("CREATE TEMP TABLE IF NOT EXISTS _seq_sync_result"));
-        assert!(sql.contains("DO $seq_sync$"));
-        assert!(sql.ends_with("$seq_sync$;"));
+        assert!(!sql.contains("ON COMMIT DROP"));
+        assert!(sql.contains("DO $__pg_dbmigrator_seq_sync__$"));
+        assert!(sql.ends_with("$__pg_dbmigrator_seq_sync__$;"));
         assert!(sql.contains("PERFORM setval"));
         assert!(sql.contains("42::bigint"));
         assert!(sql.contains("100::bigint"));
@@ -517,7 +516,7 @@ mod tests {
     fn build_batch_setval_sql_empty_input() {
         let refs: Vec<&SourceSequence> = vec![];
         let sql = build_batch_setval_sql(&refs).unwrap();
-        assert!(sql.contains("DO $seq_sync$"));
+        assert!(sql.contains("DO $__pg_dbmigrator_seq_sync__$"));
         assert!(!sql.contains("PERFORM setval"));
         assert!(sql.contains("INSERT INTO _seq_sync_result VALUES (_applied)"));
     }
