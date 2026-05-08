@@ -145,6 +145,67 @@ pub async fn verify_source_logical_replication_ready(source_conn: &str) -> Resul
     Ok(())
 }
 
+/// Build the `CREATE PUBLICATION` SQL statement from the given parameters.
+///
+/// When both `tables` and `schemas` are empty, creates `FOR ALL TABLES`.
+/// When `tables` is non-empty, creates `FOR TABLE <t1>, <t2>, …`.
+/// When only `schemas` is non-empty, creates `FOR TABLES IN SCHEMA <s1>, <s2>, …`.
+pub fn build_create_publication_sql(
+    publication: &str,
+    tables: &[String],
+    schemas: &[String],
+) -> Result<String> {
+    let pub_ident = pg_walstream::quote_ident(publication)?;
+    let scope = if !tables.is_empty() {
+        let quoted: std::result::Result<Vec<_>, _> = tables
+            .iter()
+            .map(|t| pg_walstream::quote_ident(t))
+            .collect();
+        format!("FOR TABLE {}", quoted?.join(", "))
+    } else if !schemas.is_empty() {
+        let quoted: std::result::Result<Vec<_>, _> = schemas
+            .iter()
+            .map(|s| pg_walstream::quote_ident(s))
+            .collect();
+        format!("FOR TABLES IN SCHEMA {}", quoted?.join(", "))
+    } else {
+        "FOR ALL TABLES".to_string()
+    };
+    Ok(format!("CREATE PUBLICATION {pub_ident} {scope}"))
+}
+
+/// Ensure that a logical-replication publication with the given name exists
+/// on the source. If absent and `auto_create` is enabled, create it
+/// automatically.
+///
+/// Returns `Ok(true)` if the publication was auto-created, `Ok(false)` if
+/// it already existed.
+pub async fn ensure_publication_exists(
+    source_conn: &str,
+    publication: &str,
+    tables: &[String],
+    schemas: &[String],
+) -> Result<bool> {
+    let client = connect_with_sslmode(source_conn).await?;
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
+            &[&publication],
+        )
+        .await?;
+    let exists: bool = row.get(0);
+    if exists {
+        info!(publication, "publication already exists on source");
+        return Ok(false);
+    }
+
+    let sql = build_create_publication_sql(publication, tables, schemas)?;
+    info!(publication, sql = %sql, "auto-creating publication on source");
+    client.batch_execute(&sql).await?;
+    info!(publication, "publication created successfully");
+    Ok(true)
+}
+
 /// Rewrite a connection string so the path component (database name) points
 /// to the `postgres` maintenance database. Used to run admin commands like
 /// `CREATE DATABASE` which cannot target the database they are creating.
@@ -424,5 +485,46 @@ mod tests {
     #[test]
     fn required_tools_length() {
         assert_eq!(REQUIRED_TOOLS.len(), 2);
+    }
+
+    #[test]
+    fn build_publication_sql_all_tables() {
+        let sql = build_create_publication_sql("my_pub", &[], &[]).unwrap();
+        assert_eq!(sql, "CREATE PUBLICATION \"my_pub\" FOR ALL TABLES");
+    }
+
+    #[test]
+    fn build_publication_sql_specific_tables() {
+        let tables = vec!["public.users".to_string(), "public.orders".to_string()];
+        let sql = build_create_publication_sql("my_pub", &tables, &[]).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE PUBLICATION \"my_pub\" FOR TABLE \"public.users\", \"public.orders\""
+        );
+    }
+
+    #[test]
+    fn build_publication_sql_specific_schemas() {
+        let schemas = vec!["public".to_string(), "app".to_string()];
+        let sql = build_create_publication_sql("my_pub", &[], &schemas).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE PUBLICATION \"my_pub\" FOR TABLES IN SCHEMA \"public\", \"app\""
+        );
+    }
+
+    #[test]
+    fn build_publication_sql_tables_take_precedence_over_schemas() {
+        let tables = vec!["public.users".to_string()];
+        let schemas = vec!["app".to_string()];
+        let sql = build_create_publication_sql("my_pub", &tables, &schemas).unwrap();
+        assert!(sql.contains("FOR TABLE"));
+        assert!(!sql.contains("FOR TABLES IN SCHEMA"));
+    }
+
+    #[test]
+    fn build_publication_sql_quotes_special_chars() {
+        let sql = build_create_publication_sql("pub\"name", &[], &[]).unwrap();
+        assert!(sql.contains("\"pub\"\"name\""));
     }
 }

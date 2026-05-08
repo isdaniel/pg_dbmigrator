@@ -392,6 +392,12 @@ pub struct OnlineOptions {
     /// out-of-band sequence sync (e.g. application-level UUIDs).
     #[serde(default = "default_true")]
     pub sync_sequences_on_cutover: bool,
+    /// If `true` (default), automatically create the publication on the source if it does not already exist. The publication will be created as `FOR ALL TABLES` (or scoped by  `MigrationConfig::tables` / `MigrationConfig::schemas` if set). Publications auto-created by the migrator are tracked and dropped  after cutover.
+    #[serde(default = "default_true")]
+    pub auto_create_publication: bool,
+    /// If `true` (default), drop the replication slot on the source after a successful cutover. The slot is no longer needed once the target has caught up and the subscription is torn down.
+    #[serde(default = "default_true")]
+    pub drop_slot_on_cutover: bool,
     /// Configuration for the WAL apply worker.
     pub apply: ReplicationApplyConfig,
     /// Cutover knobs — when to declare the target "caught up" and how the
@@ -414,6 +420,8 @@ impl Default for OnlineOptions {
             drop_subscription_on_cutover: true,
             force_clean: false,
             sync_sequences_on_cutover: true,
+            auto_create_publication: true,
+            drop_slot_on_cutover: true,
             apply: ReplicationApplyConfig::default(),
             cutover: CutoverConfig::default(),
         }
@@ -928,6 +936,26 @@ mod tests {
         let opts = OnlineOptions::default();
         assert!(!opts.force_clean);
         assert!(opts.subscription_source_conn.is_none());
+    }
+
+    #[test]
+    fn online_options_default_auto_create_publication_and_drop_slot() {
+        let opts = OnlineOptions::default();
+        assert!(opts.auto_create_publication);
+        assert!(opts.drop_slot_on_cutover);
+    }
+
+    #[test]
+    fn serde_backwards_compat_missing_auto_create_and_drop_slot_defaults_true() {
+        let opts = OnlineOptions::default();
+        let mut json: serde_json::Value = serde_json::to_value(&opts).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("auto_create_publication");
+        json.as_object_mut().unwrap().remove("drop_slot_on_cutover");
+        let opts2: OnlineOptions = serde_json::from_value(json).unwrap();
+        assert!(opts2.auto_create_publication);
+        assert!(opts2.drop_slot_on_cutover);
     }
 
     #[test]

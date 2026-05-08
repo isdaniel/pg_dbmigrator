@@ -125,6 +125,8 @@ ONLINE_TESTS=(
     tests/integration/run_online_cancel_resume.sh
     tests/integration/run_online_multi_resume_sustained.sh
     tests/integration/run_online_sequence_sync.sh
+    tests/integration/run_online_auto_pub_lifecycle.sh
+    tests/integration/run_online_keep_slot.sh
 )
 
 case "$FILTER" in

@@ -228,11 +228,10 @@ impl CommandRunner for TokioCommandRunner {
     ) -> Result<()> {
         debug!(program, ?args, "spawning external command");
 
-        // For `pg_restore` we capture stderr (while still teeing it
-        // live to our own stderr) so we can build a categorized error
-        // summary on exit-1. Other commands keep the simpler inherit
-        // path — they have less verbose / more deterministic output.
-        let capture_stderr = program == "pg_restore";
+        // Capture stderr for `pg_restore` (error categorization) and
+        // `pg_dump` (table-level progress). Both emit useful structured
+        // lines on stderr when `--verbose` is active.
+        let capture_stderr = program == "pg_restore" || program == "pg_dump";
 
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args);
@@ -260,6 +259,7 @@ impl CommandRunner for TokioCommandRunner {
         // (a) tees every line straight to our own stderr so the
         // operator still sees live progress, and (b) accumulates a
         // bounded structured summary of error/warning lines.
+        let is_restore = program == "pg_restore";
         let stderr_task = if capture_stderr {
             child.stderr.take().map(|pipe| {
                 tokio::spawn(async move {
@@ -274,7 +274,10 @@ impl CommandRunner for TokioCommandRunner {
                                 let _ = sink.write_all(line.as_bytes()).await;
                                 let _ = sink.write_all(b"\n").await;
                                 let _ = sink.flush().await;
-                                ingest_pg_restore_stderr_line(&line, &mut summary);
+                                if is_restore {
+                                    ingest_pg_restore_stderr_line(&line, &mut summary);
+                                }
+                                emit_table_progress(&line);
                             }
                             Ok(None) => break,
                             Err(_) => break,
@@ -368,6 +371,24 @@ fn kill_child_group(pid: Option<u32>, sigkill: bool) {
 
 #[cfg(not(unix))]
 fn kill_child_group(_pid: Option<u32>, _sigkill: bool) {}
+
+/// Detect table-level progress lines from pg_dump/pg_restore verbose stderr
+/// and emit structured tracing events. Patterns:
+///   pg_dump: dumping contents of table "schema"."table"
+///   pg_restore: processing data for table "schema"."table"
+fn emit_table_progress(line: &str) {
+    if let Some(table) = line
+        .strip_prefix("pg_dump: dumping contents of table \"")
+        .and_then(|s| s.strip_suffix('"'))
+    {
+        info!(table, "pg_dump: dumping table");
+    } else if let Some(table) = line
+        .strip_prefix("pg_restore: processing data for table \"")
+        .and_then(|s| s.strip_suffix('"'))
+    {
+        info!(table, "pg_restore: restoring table");
+    }
+}
 
 /// Run `pg_dump` according to `req` using the supplied [`CommandRunner`].
 pub async fn run_pg_dump<R: CommandRunner + ?Sized>(
@@ -855,5 +876,25 @@ mod tests {
         let r = TokioCommandRunner;
         let dbg = format!("{:?}", r);
         assert!(dbg.contains("TokioCommandRunner"));
+    }
+
+    #[test]
+    fn emit_table_progress_detects_pg_dump_line() {
+        // Should not panic; emits tracing event (not assertable here but
+        // exercises the parsing path).
+        emit_table_progress(r#"pg_dump: dumping contents of table "public"."users""#);
+    }
+
+    #[test]
+    fn emit_table_progress_detects_pg_restore_line() {
+        emit_table_progress(r#"pg_restore: processing data for table "public"."orders""#);
+    }
+
+    #[test]
+    fn emit_table_progress_ignores_unrelated_lines() {
+        // Should not panic or emit anything for non-matching lines.
+        emit_table_progress("pg_dump: reading extensions");
+        emit_table_progress("pg_restore: connecting to database");
+        emit_table_progress("");
     }
 }

@@ -675,3 +675,109 @@ async fn maybe_analyze_target_runs_when_not_skipped() {
     let result = pg_dbmigrator::analyze::maybe_analyze_target(&config).await;
     assert!(result.is_ok());
 }
+
+// ─── preflight::ensure_publication_exists ────────────────────────────────────
+
+#[tokio::test]
+async fn ensure_publication_exists_creates_when_missing() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Clean up any leftover
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_auto_pub")
+        .await
+        .ok();
+
+    let created =
+        pg_dbmigrator::preflight::ensure_publication_exists(&url, "integ_auto_pub", &[], &[])
+            .await
+            .unwrap();
+    assert!(created, "publication should have been auto-created");
+
+    // Verify it exists now
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'integ_auto_pub')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let exists: bool = row.get(0);
+    assert!(exists);
+
+    // Clean up
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_auto_pub")
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn ensure_publication_exists_noop_when_present() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Pre-create the publication
+    client
+        .batch_execute("CREATE PUBLICATION integ_existing_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+
+    let created =
+        pg_dbmigrator::preflight::ensure_publication_exists(&url, "integ_existing_pub", &[], &[])
+            .await
+            .unwrap();
+    assert!(
+        !created,
+        "publication already existed, should not re-create"
+    );
+
+    // Clean up
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_existing_pub")
+        .await
+        .ok();
+}
+
+// ─── native_apply::drop_source_publication ──────────────────────────────────
+
+#[tokio::test]
+async fn drop_source_publication_is_idempotent() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Create a publication, then drop it twice — both should succeed
+    client
+        .batch_execute("CREATE PUBLICATION integ_drop_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+
+    let result = pg_dbmigrator::native_apply::drop_source_publication(&url, "integ_drop_pub").await;
+    assert!(result.is_ok());
+
+    // Second drop should also succeed (IF EXISTS)
+    let result = pg_dbmigrator::native_apply::drop_source_publication(&url, "integ_drop_pub").await;
+    assert!(result.is_ok());
+}
+
+// ─── native_apply::drop_source_slot ─────────────────────────────────────────
+
+#[tokio::test]
+async fn drop_source_slot_is_idempotent() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Create a slot, then drop it
+    client
+        .batch_execute("SELECT pg_create_logical_replication_slot('integ_drop_slot', 'pgoutput')")
+        .await
+        .unwrap_or(());
+
+    let result = pg_dbmigrator::native_apply::drop_source_slot(&url, "integ_drop_slot").await;
+    assert!(result.is_ok());
+
+    // Second drop should also succeed (slot absent → noop)
+    let result = pg_dbmigrator::native_apply::drop_source_slot(&url, "integ_drop_slot").await;
+    assert!(result.is_ok());
+}
