@@ -32,12 +32,17 @@ jobs:
       - uses: ./.github/actions/setup-integration
 
       - name: Run tests with coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # Serialize tests: the coverage job runs all unit + integration tests
+        # in one cargo invocation, and the integration suite shares a single
+        # source/target Postgres container pair. Concurrent integration tests
+        # mutate the same catalogs and race (e.g. "could not open relation
+        # with OID X"). Unit tests are fast enough that serialization is fine.
+        run: cargo llvm-cov --workspace --codecov --output-path codecov.json -- --test-threads=1
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
-          files: lcov.info
+          files: codecov.json
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
