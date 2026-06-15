@@ -422,7 +422,10 @@ async fn drop_table_indexes(client: &tokio_postgres::Client, table_idx: usize) -
                 .batch_execute(&format!("DROP INDEX {idx}"))
                 .await
                 .with_context(|| format!("failed to drop index {idx}"))?;
-            info!("[{tbl}] dropped {idx} in {:.1}s", t0.elapsed().as_secs_f64());
+            info!(
+                "[{tbl}] dropped {idx} in {:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
         }
     }
 
@@ -719,7 +722,10 @@ async fn run_online_benchmark(cli: &Cli) -> Result<f64> {
 
     let dump_dir = PathBuf::from(format!("/tmp/dump_online-{}", std::process::id()));
     if dump_dir.exists() {
-        info!("cleaning up previous dump directory: {}", dump_dir.display());
+        info!(
+            "cleaning up previous dump directory: {}",
+            dump_dir.display()
+        );
         std::fs::remove_dir_all(&dump_dir)
             .with_context(|| format!("failed to remove {}", dump_dir.display()))?;
     }

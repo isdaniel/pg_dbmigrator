@@ -15,6 +15,13 @@ runs:
         sudo apt-get update
         sudo apt-get install -y postgresql-client-17
 
+    - name: Prepend PostgreSQL 17 client to PATH
+      shell: bash
+      run: |
+        echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+        /usr/lib/postgresql/17/bin/pg_dump --version
+        /usr/lib/postgresql/17/bin/pg_restore --version
+
     - name: Clean up stale containers and free ports
       shell: bash
       run: |

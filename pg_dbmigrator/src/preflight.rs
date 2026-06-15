@@ -6,8 +6,10 @@
 use std::io;
 use std::process::ExitStatus;
 
+use async_trait::async_trait;
 use tracing::info;
 
+use crate::config::MigrationMode;
 use crate::error::{MigrationError, Result};
 use crate::tls::connect_with_sslmode;
 
@@ -15,6 +17,198 @@ use crate::tls::connect_with_sslmode;
 /// function. `pg_dump` is required for both modes; `pg_restore` is required
 /// for the restore phase.
 pub const REQUIRED_TOOLS: &[&str] = &["pg_dump", "pg_restore"];
+
+/// Snapshot of the target role's catalog state, used by
+/// [`target_role_privilege_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TargetRolePrivInfo {
+    pub target_major: u32,
+    pub has_create: bool,
+    pub is_super: bool,
+    pub has_sub_role: bool,
+}
+
+/// Abstracts the small set of process spawns and DB queries the preflight
+/// async wrappers need. The real implementation is [`PgProbe`]; tests
+/// supply a stub that returns predetermined values so the `verify_*_with_probe`
+/// orchestration can be exercised without a live PostgreSQL or `pg_dump`.
+#[async_trait]
+pub(crate) trait PreflightProbe: Send + Sync {
+    async fn capture_tool_version(&self, tool: &str) -> Result<String>;
+    async fn server_major_version(&self, conn: &str) -> Result<u32>;
+    async fn role_has_replication_or_super(&self, conn: &str) -> Result<bool>;
+    async fn target_role_privilege_info(&self, conn: &str) -> Result<TargetRolePrivInfo>;
+    async fn is_in_recovery(&self, conn: &str) -> Result<bool>;
+    async fn subscription_capacity_gucs(&self, conn: &str) -> Result<(i64, i64, i64)>;
+}
+
+/// Production [`PreflightProbe`] — spawns real processes and opens real
+/// PostgreSQL connections. Stateless; reuse a single value.
+pub(crate) struct PgProbe;
+
+#[async_trait]
+impl PreflightProbe for PgProbe {
+    async fn capture_tool_version(&self, tool: &str) -> Result<String> {
+        capture_tool_version(tool).await
+    }
+
+    async fn server_major_version(&self, conn: &str) -> Result<u32> {
+        server_major_version(conn).await
+    }
+
+    async fn role_has_replication_or_super(&self, conn: &str) -> Result<bool> {
+        let client = connect_with_sslmode(conn).await?;
+        // On AWS RDS the master user has neither `rolreplication` nor
+        // `rolsuper` set directly; replication is granted via membership in
+        // the `rds_replication` predefined role. The EXISTS subquery
+        // short-circuits to false on non-RDS servers where `rds_replication`
+        // doesn't exist, so this single query works everywhere.
+        let row = client
+            .query_one(
+                "SELECT \
+                   rolreplication OR rolsuper OR EXISTS ( \
+                     SELECT 1 FROM pg_roles \
+                     WHERE rolname = 'rds_replication' \
+                       AND pg_has_role(current_user, oid, 'MEMBER') \
+                   ) \
+                 FROM pg_roles WHERE rolname = current_user",
+                &[],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    async fn target_role_privilege_info(&self, conn: &str) -> Result<TargetRolePrivInfo> {
+        let client = connect_with_sslmode(conn).await?;
+
+        // Single round-trip: server version, CREATE privilege, superuser flag,
+        // and pg_create_subscription membership in one query. The EXISTS
+        // subquery against pg_roles short-circuits to false on pre-PG16
+        // servers (where the predefined role does not exist), so the same
+        // query works across all supported PostgreSQL versions.
+        //
+        // On PG16+, non-superusers need BOTH `pg_create_subscription`
+        // membership AND the `CREATEDB` role attribute to actually run
+        // CREATE SUBSCRIPTION — `has_sub_role` therefore requires both.
+        let row = client
+            .query_one(
+                "SELECT \
+                   current_setting('server_version_num')::integer AS svn, \
+                   has_database_privilege(current_user, current_database(), 'CREATE') AS has_create, \
+                   current_setting('is_superuser') = 'on' AS is_super, \
+                   ( \
+                     EXISTS ( \
+                       SELECT 1 FROM pg_roles \
+                       WHERE rolname = 'pg_create_subscription' \
+                         AND pg_has_role(current_user, oid, 'MEMBER') \
+                     ) \
+                     AND (SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user) \
+                   ) AS has_sub_role",
+                &[],
+            )
+            .await?;
+
+        let svn: i32 = row.get("svn");
+        let target_major: u32 = (svn / 10000) as u32;
+
+        Ok(TargetRolePrivInfo {
+            target_major,
+            has_create: row.get("has_create"),
+            is_super: row.get("is_super"),
+            has_sub_role: row.get("has_sub_role"),
+        })
+    }
+
+    async fn is_in_recovery(&self, conn: &str) -> Result<bool> {
+        // Try the target DB first so we still work on managed PostgreSQL
+        // services (Heroku, Render, etc.) where users typically lack
+        // access to the `postgres` maintenance database. Fall back to the
+        // maintenance DB only when the failure is specifically SQLSTATE
+        // 3D000 ("invalid_catalog_name" / database does not exist) — on
+        // network, firewall, or DNS errors we propagate immediately so we
+        // don't double the connect timeout.
+        let client = match connect_with_sslmode(conn).await {
+            Ok(c) => c,
+            Err(e) if is_undefined_database(&e) => {
+                connect_with_sslmode(&maintenance_connection_string(conn)).await?
+            }
+            Err(e) => return Err(e),
+        };
+        let row = client.query_one("SELECT pg_is_in_recovery()", &[]).await?;
+        Ok(row.get(0))
+    }
+
+    async fn subscription_capacity_gucs(&self, conn: &str) -> Result<(i64, i64, i64)> {
+        let client = connect_with_sslmode(conn).await?;
+        let row = client
+            .query_one(
+                "SELECT \
+                   current_setting('max_logical_replication_workers')::integer, \
+                   current_setting('max_worker_processes')::integer, \
+                   current_setting('max_sync_workers_per_subscription')::integer",
+                &[],
+            )
+            .await?;
+        let a: i32 = row.get(0);
+        let b: i32 = row.get(1);
+        let c: i32 = row.get(2);
+        Ok((a as i64, b as i64, c as i64))
+    }
+}
+
+/// Outcome of a single preflight check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightOutcome {
+    Pass,
+    Skip { reason: &'static str },
+}
+
+/// Collected outcomes for a preflight bundle, used to emit a single
+/// `MigrationStage::Validate` summary line for the operator.
+#[derive(Debug, Default)]
+pub struct PreflightReport {
+    items: Vec<(&'static str, PreflightOutcome)>,
+}
+
+impl PreflightReport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, name: &'static str, outcome: PreflightOutcome) {
+        self.items.push((name, outcome));
+    }
+
+    pub fn summary_line(&self) -> String {
+        let pass = self
+            .items
+            .iter()
+            .filter(|(_, o)| matches!(o, PreflightOutcome::Pass))
+            .count();
+        let skip = self
+            .items
+            .iter()
+            .filter(|(_, o)| matches!(o, PreflightOutcome::Skip { .. }))
+            .count();
+        if self.items.is_empty() {
+            return "preflight: 0 pass".to_string();
+        }
+        let names = self
+            .items
+            .iter()
+            .map(|(n, o)| match o {
+                PreflightOutcome::Pass => (*n).to_string(),
+                PreflightOutcome::Skip { .. } => format!("{n}[skip]"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if skip == 0 {
+            format!("preflight: {pass} pass ({names})")
+        } else {
+            format!("preflight: {pass} pass, {skip} skip ({names})")
+        }
+    }
+}
 
 /// Verify that every entry in [`REQUIRED_TOOLS`] is callable.
 ///
@@ -67,6 +261,192 @@ pub(crate) fn classify_version_check(
             format!("failed to spawn `{tool} --version`: {e}"),
         )),
     }
+}
+
+/// Parse the major version out of `pg_dump --version` / `pg_restore --version`
+/// stdout. Accepts plain "16.4", Ubuntu-suffixed
+/// "16.4 (Ubuntu 16.4-1.pgdg22.04+1)", and release-candidate "17rc1" forms.
+/// Also tolerates custom builds (EnterpriseDB, Postgres Pro, etc.) that drop
+/// the literal `(PostgreSQL)` marker by falling back to the first digit-led
+/// whitespace token in the output.
+///
+/// Returns `None` if the input does not contain a recognizable version.
+pub(crate) fn parse_pg_dump_version(stdout: &str) -> Option<u32> {
+    // Preferred path: token immediately after the literal `(PostgreSQL)`
+    // marker. Matching the marker (rather than just `)`) avoids false
+    // positives from leading warnings or text that happens to contain
+    // parenthesised groups (e.g. `warning: (ignored) ...`).
+    if let Some(after) = stdout.split("(PostgreSQL)").nth(1) {
+        if let Some(token) = after.split_whitespace().next() {
+            let digits: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<u32>() {
+                return Some(v);
+            }
+        }
+    }
+
+    // Fallback for custom distributions (EnterpriseDB, Postgres Pro) that
+    // omit the `(PostgreSQL)` marker — *or* for unusual formatting where
+    // the token immediately after the marker isn't a version (e.g.
+    // `(PostgreSQL) [custom] 16.4`). Narrow the search to the line that
+    // looks like a version banner (contains "dump"/"restore"/"version")
+    // so we don't pick up small numbers in leading warnings such as
+    // "warning: 1 configuration file ignored".
+    let scan_line = stdout
+        .lines()
+        .find(|line| {
+            let l = line.to_lowercase();
+            l.contains("dump") || l.contains("restore") || l.contains("version")
+        })
+        .unwrap_or(stdout);
+    scan_line.split_whitespace().find_map(|t| {
+        let leading: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+        leading.parse::<u32>().ok().filter(|v| *v < 100)
+    })
+}
+
+/// Pure decision: `pg_dump` only reads from the source, so its major version
+/// must be ≥ source server's major. It does **not** need to be ≥ target.
+/// This lets common upgrade patterns work — e.g. PG14 → PG16 with pg_dump 14
+/// + pg_restore 16 — which a single combined check would reject.
+pub(crate) fn decide_pg_dump_compat(pg_dump_major: u32, source_major: u32) -> Result<()> {
+    if pg_dump_major >= source_major {
+        return Ok(());
+    }
+    Err(MigrationError::config(format!(
+        "pg_dump is version {pg_dump_major}, but the source server is {source_major}. \
+         pg_dump must be at least as new as the source server. \
+         Install a matching client (e.g. `sudo apt install postgresql-client-{source_major}`) \
+         or adjust $PATH so the newer binary is found first."
+    )))
+}
+
+/// Pure decision: `pg_restore` writes to the target and reads the dump file,
+/// so its major version must be ≥ target server's major *and* ≥ the
+/// `pg_dump` version that produced the archive (newer dump formats can't be
+/// read by older `pg_restore`).
+pub(crate) fn decide_pg_restore_compat(
+    pg_restore_major: u32,
+    target_major: u32,
+    pg_dump_major: u32,
+) -> Result<()> {
+    if pg_restore_major < target_major {
+        return Err(MigrationError::config(format!(
+            "pg_restore is version {pg_restore_major}, but the target server is {target_major}. \
+             pg_restore must be at least as new as the target server. \
+             Install a matching client (e.g. `sudo apt install postgresql-client-{target_major}`) \
+             or adjust $PATH so the newer binary is found first."
+        )));
+    }
+    if pg_restore_major < pg_dump_major {
+        return Err(MigrationError::config(format!(
+            "pg_restore is version {pg_restore_major}, but pg_dump is version {pg_dump_major}. \
+             pg_restore must be at least as new as the pg_dump that produced the dump archive."
+        )));
+    }
+    Ok(())
+}
+
+/// Spawn `<tool> --version` and return its stdout as UTF-8.
+async fn capture_tool_version(tool: &str) -> Result<String> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    let output = Command::new(tool)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| MigrationError::missing_tool(tool, format!("failed to spawn: {e}")))?;
+    if !output.status.success() {
+        return Err(MigrationError::missing_tool(
+            tool,
+            format!("`{tool} --version` exited {}", output.status),
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| {
+        MigrationError::config(format!("`{tool} --version` returned non-UTF8 output: {e}"))
+    })
+}
+
+/// Read `server_version_num` from a live server and return the major version.
+///
+/// Tries the supplied connection first, then falls back to the maintenance
+/// (`postgres`) database only on SQLSTATE 3D000 ("database does not
+/// exist"). Other failures (network, firewall, DNS) propagate immediately
+/// so we don't double the connect timeout.
+async fn server_major_version(conn: &str) -> Result<u32> {
+    let client = match connect_with_sslmode(conn).await {
+        Ok(c) => c,
+        Err(e) if is_undefined_database(&e) => {
+            connect_with_sslmode(&maintenance_connection_string(conn)).await?
+        }
+        Err(e) => return Err(e),
+    };
+    let row = client
+        .query_one("SELECT current_setting('server_version_num')::integer", &[])
+        .await?;
+    let num: i32 = row.get(0);
+    // PG10+: 160004 -> major 16. PG9.x: 90624 -> major 9. Same formula works for both.
+    Ok((num / 10000) as u32)
+}
+
+/// `true` if `err` wraps a tokio_postgres error with SQLSTATE `3D000`
+/// (`invalid_catalog_name`), i.e. the target database does not exist.
+/// Used to decide whether falling back to the maintenance DB is safe.
+fn is_undefined_database(err: &MigrationError) -> bool {
+    match err {
+        MigrationError::Postgres(pg_err) => pg_err.code().map(|c| c.code()) == Some("3D000"),
+        _ => false,
+    }
+}
+
+/// Verify the local `pg_dump` (and `pg_restore`) binary major version is at
+/// least as new as the newest server it will talk to. This catches the
+/// common "I have pg_dump 14 but the source is PG16" footgun *before*
+/// pg_dump runs and fails several minutes in.
+pub async fn verify_pg_dump_version_compat(source_conn: &str, target_conn: &str) -> Result<()> {
+    verify_pg_dump_version_compat_with_probe(&PgProbe, source_conn, target_conn).await
+}
+
+/// Probe-based variant of [`verify_pg_dump_version_compat`] — exposed at
+/// crate level so unit tests can drive it with a stub probe.
+pub(crate) async fn verify_pg_dump_version_compat_with_probe<P: PreflightProbe + ?Sized>(
+    probe: &P,
+    source_conn: &str,
+    target_conn: &str,
+) -> Result<()> {
+    // The four probes are independent — fan them out so total preflight
+    // latency is bounded by the slowest one rather than the sum. The probe
+    // itself falls back to the maintenance DB if the target DB doesn't yet
+    // exist, so we can pass target_conn directly here.
+    let (pg_dump_out, pg_restore_out, source_major, target_major) = tokio::try_join!(
+        probe.capture_tool_version("pg_dump"),
+        probe.capture_tool_version("pg_restore"),
+        probe.server_major_version(source_conn),
+        probe.server_major_version(target_conn),
+    )?;
+    let pg_dump_major = parse_pg_dump_version(&pg_dump_out).ok_or_else(|| {
+        MigrationError::config(format!(
+            "could not parse pg_dump version from `{pg_dump_out}`"
+        ))
+    })?;
+    let pg_restore_major = parse_pg_dump_version(&pg_restore_out).ok_or_else(|| {
+        MigrationError::config(format!(
+            "could not parse pg_restore version from `{pg_restore_out}`"
+        ))
+    })?;
+    decide_pg_dump_compat(pg_dump_major, source_major)?;
+    decide_pg_restore_compat(pg_restore_major, target_major, pg_dump_major)?;
+    info!(
+        pg_dump_major,
+        pg_restore_major,
+        source_major,
+        target_major,
+        "pg_dump/pg_restore versions are compatible with source and target"
+    );
+    Ok(())
 }
 
 /// Confirm that a logical-replication publication with the given name exists
@@ -142,6 +522,36 @@ pub async fn verify_source_logical_replication_ready(source_conn: &str) -> Resul
     }
 
     info!("source is configured for logical replication (wal_level=logical)");
+    Ok(())
+}
+
+/// Verify the source role used by pg_dbmigrator can stream replication.
+/// Either the explicit `REPLICATION` attribute or `rolsuper` is sufficient —
+/// superusers bypass the `rolreplication` check inside the server. Without
+/// one of those, `CREATE_REPLICATION_SLOT` fails seconds into the run with
+/// a libpq-level error.
+///
+/// Online mode only — offline migrations never open a replication connection.
+pub async fn verify_source_replication_role(source_conn: &str) -> Result<()> {
+    verify_source_replication_role_with_probe(&PgProbe, source_conn).await
+}
+
+/// Probe-based variant of [`verify_source_replication_role`].
+pub(crate) async fn verify_source_replication_role_with_probe<P: PreflightProbe + ?Sized>(
+    probe: &P,
+    source_conn: &str,
+) -> Result<()> {
+    let has_repl = probe.role_has_replication_or_super(source_conn).await?;
+    if !has_repl {
+        return Err(MigrationError::config(
+            "the source role lacks the REPLICATION attribute (and is not a superuser), \
+             which is required to create a logical replication slot. \
+             Fix on the source: `ALTER ROLE \"<your_user>\" REPLICATION;` (must be \
+             run by a superuser)."
+                .to_string(),
+        ));
+    }
+    info!("source role can replicate (REPLICATION attribute or superuser)");
     Ok(())
 }
 
@@ -412,6 +822,274 @@ pub async fn ensure_pglogical_not_interfering(target_conn: &str) -> Result<()> {
 
     info!("pglogical is not in shared_preload_libraries — native logical replication will work");
     Ok(())
+}
+
+/// Pure decision: does the target role have the privileges needed for the
+/// given migration mode on a server of `target_major`?
+///
+/// - **Offline**: needs `CREATE` on the target database (for schema restore).
+/// - **Online**: same, plus the ability to create a subscription. PG16+
+///   exposes the `pg_create_subscription` predefined role; pre-PG16 there
+///   is no such role and the user must be a superuser.
+pub(crate) fn target_role_privilege_decision(
+    mode: MigrationMode,
+    target_major: u32,
+    has_create_on_db: bool,
+    is_superuser: bool,
+    has_pg_create_subscription_role: bool,
+) -> Result<()> {
+    if !has_create_on_db && !is_superuser {
+        return Err(MigrationError::config(
+            "the target role lacks CREATE privilege on the target database. \
+             Grant it on the target: \
+             `GRANT CREATE ON DATABASE \"<db>\" TO \"<user>\";`"
+                .to_string(),
+        ));
+    }
+    if matches!(mode, MigrationMode::Online) {
+        if target_major >= 16 {
+            if !is_superuser && !has_pg_create_subscription_role {
+                return Err(MigrationError::config(
+                    "the target role cannot create subscriptions. \
+                     On the target: `GRANT pg_create_subscription TO \"<user>\"; \
+                     ALTER ROLE \"<user>\" CREATEDB;` \
+                     (or make the role a superuser)."
+                        .to_string(),
+                ));
+            }
+        } else if !is_superuser {
+            return Err(MigrationError::config(
+                "the target server is pre-PG16 and online migration requires a \
+                 superuser role on the target (the `pg_create_subscription` \
+                 predefined role does not exist before PG16). \
+                 Either run as a superuser or upgrade the target to PG16+."
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify the target server is writable — i.e. it is not a hot standby.
+///
+/// pg_dbmigrator needs to `CREATE DATABASE`, `pg_restore`, and (online)
+/// `CREATE SUBSCRIPTION` on the target; a server in recovery rejects all
+/// writes with `cannot execute … in a read-only transaction`.
+pub async fn verify_target_not_in_recovery(target_conn: &str) -> Result<()> {
+    verify_target_not_in_recovery_with_probe(&PgProbe, target_conn).await
+}
+
+/// Probe-based variant of [`verify_target_not_in_recovery`].
+pub(crate) async fn verify_target_not_in_recovery_with_probe<P: PreflightProbe + ?Sized>(
+    probe: &P,
+    target_conn: &str,
+) -> Result<()> {
+    let in_recovery = probe.is_in_recovery(target_conn).await?;
+    if in_recovery {
+        return Err(MigrationError::config(
+            "the target server is a hot standby (in recovery). pg_dbmigrator \
+             requires a writable target. Promote the standby first (`pg_ctl promote` \
+             or `SELECT pg_promote();`) or point --target at a primary."
+                .to_string(),
+        ));
+    }
+    info!("target server is a primary (not in recovery)");
+    Ok(())
+}
+
+/// Minimum acceptable target-side subscription-related GUC values. These
+/// are the absolute floor required for `CREATE SUBSCRIPTION` to function
+/// at all — one logical-replication worker and two worker-process slots.
+/// pg_dbmigrator deliberately does **not** enforce the higher production
+/// recommendations (4/8) so we don't block migrations on resource-
+/// constrained targets like local Docker containers, CI runners, or small
+/// managed instances (e.g. RDS micro/nano tiers). Operators running large
+/// migrations should still raise these on the target for throughput.
+pub(crate) const RECOMMENDED_LRW: i64 = 1;
+pub(crate) const RECOMMENDED_MWP: i64 = 2;
+
+/// Pure decision: does the target have enough worker headroom to run our
+/// `CREATE SUBSCRIPTION` apply path? Each GUC is checked independently so
+/// the error message names the exact knob that needs raising.
+pub(crate) fn classify_subscription_capacity(
+    max_logical_replication_workers: i64,
+    max_worker_processes: i64,
+    _max_sync_workers_per_subscription: i64,
+) -> Result<()> {
+    if max_logical_replication_workers < RECOMMENDED_LRW {
+        return Err(MigrationError::config(format!(
+            "the target has max_logical_replication_workers={max_logical_replication_workers}, \
+             but pg_dbmigrator requires >= {RECOMMENDED_LRW}. \
+             `ALTER SYSTEM SET max_logical_replication_workers = {RECOMMENDED_LRW};` and restart \
+             the target."
+        )));
+    }
+    if max_worker_processes < RECOMMENDED_MWP {
+        return Err(MigrationError::config(format!(
+            "the target has max_worker_processes={max_worker_processes}, but pg_dbmigrator \
+             requires >= {RECOMMENDED_MWP}. \
+             `ALTER SYSTEM SET max_worker_processes = {RECOMMENDED_MWP};` and restart the target."
+        )));
+    }
+    Ok(())
+}
+
+/// Verify the target has enough logical-replication worker headroom for
+/// `CREATE SUBSCRIPTION` to make forward progress.
+pub async fn verify_target_subscription_capacity(target_conn: &str) -> Result<()> {
+    verify_target_subscription_capacity_with_probe(&PgProbe, target_conn).await
+}
+
+/// Probe-based variant of [`verify_target_subscription_capacity`].
+pub(crate) async fn verify_target_subscription_capacity_with_probe<P: PreflightProbe + ?Sized>(
+    probe: &P,
+    target_conn: &str,
+) -> Result<()> {
+    let (max_logical_replication_workers, max_worker_processes, max_sync_workers_per_subscription) =
+        probe.subscription_capacity_gucs(target_conn).await?;
+    classify_subscription_capacity(
+        max_logical_replication_workers,
+        max_worker_processes,
+        max_sync_workers_per_subscription,
+    )?;
+    info!(
+        max_logical_replication_workers,
+        max_worker_processes,
+        max_sync_workers_per_subscription,
+        "target has sufficient subscription worker capacity"
+    );
+    Ok(())
+}
+
+/// Verify the target role has the privileges needed for the chosen mode.
+pub async fn verify_target_role_privileges(target_conn: &str, mode: MigrationMode) -> Result<()> {
+    verify_target_role_privileges_with_probe(&PgProbe, target_conn, mode).await
+}
+
+/// Probe-based variant of [`verify_target_role_privileges`].
+pub(crate) async fn verify_target_role_privileges_with_probe<P: PreflightProbe + ?Sized>(
+    probe: &P,
+    target_conn: &str,
+    mode: MigrationMode,
+) -> Result<()> {
+    let info = probe.target_role_privilege_info(target_conn).await?;
+    target_role_privilege_decision(
+        mode,
+        info.target_major,
+        info.has_create,
+        info.is_super,
+        info.has_sub_role,
+    )?;
+    info!(target_major = info.target_major, mode = ?mode, "target role has required privileges");
+    Ok(())
+}
+
+impl PreflightReport {
+    pub fn names(&self) -> Vec<&'static str> {
+        self.items.iter().map(|(n, _)| *n).collect()
+    }
+}
+
+/// Static list of check names for the offline bundle, in order. Exposed so
+/// callers/tests can assert bundle composition without running the bundle.
+///
+/// Ordering invariant: every check that opens a connection to the *target
+/// database itself* (as opposed to the maintenance `postgres` DB) must run
+/// after `target_db_exists`, since the target DB may not yet exist on a
+/// first-run offline migration.
+pub fn offline_preflight_check_names() -> &'static [&'static str] {
+    &[
+        "pg_tools",
+        "version_compat",
+        "target_not_in_recovery",
+        "target_db_exists",
+        "target_role_privs",
+    ]
+}
+
+/// Static list of check names for the online bundle, in order.
+///
+/// Same ordering invariant as [`offline_preflight_check_names`]: checks that
+/// open the target DB directly run after `target_db_exists`.
+pub fn online_preflight_check_names() -> &'static [&'static str] {
+    &[
+        "pg_tools",
+        "version_compat",
+        "source_repl_role",
+        "target_not_in_recovery",
+        "target_db_exists",
+        "target_role_privs",
+        "source_logical_repl",
+        "target_sub_capacity",
+        "pglogical_clean",
+    ]
+}
+
+/// Run the offline preflight bundle. Fail-fast on the first failing check;
+/// otherwise return a `PreflightReport` for summary logging.
+pub async fn run_offline_preflight(
+    cfg: &crate::config::MigrationConfig,
+) -> Result<PreflightReport> {
+    let mut report = PreflightReport::new();
+
+    verify_pg_tools_installed().await?;
+    report.record("pg_tools", PreflightOutcome::Pass);
+
+    verify_pg_dump_version_compat(&cfg.source.connection_string, &cfg.target.connection_string)
+        .await?;
+    report.record("version_compat", PreflightOutcome::Pass);
+
+    // verify_target_not_in_recovery uses the maintenance DB internally, so
+    // it is safe to call before the target database has been created.
+    verify_target_not_in_recovery(&cfg.target.connection_string).await?;
+    report.record("target_not_in_recovery", PreflightOutcome::Pass);
+
+    // Create the target DB if missing before any check that connects to it
+    // directly (e.g. has_database_privilege only works on a DB that exists).
+    ensure_target_database_exists(&cfg.target.connection_string, &cfg.target.database).await?;
+    report.record("target_db_exists", PreflightOutcome::Pass);
+
+    verify_target_role_privileges(&cfg.target.connection_string, MigrationMode::Offline).await?;
+    report.record("target_role_privs", PreflightOutcome::Pass);
+
+    Ok(report)
+}
+
+/// Run the online preflight bundle. Fail-fast on the first failing check.
+pub async fn run_online_preflight(cfg: &crate::config::MigrationConfig) -> Result<PreflightReport> {
+    let mut report = PreflightReport::new();
+
+    verify_pg_tools_installed().await?;
+    report.record("pg_tools", PreflightOutcome::Pass);
+
+    verify_pg_dump_version_compat(&cfg.source.connection_string, &cfg.target.connection_string)
+        .await?;
+    report.record("version_compat", PreflightOutcome::Pass);
+
+    verify_source_replication_role(&cfg.source.connection_string).await?;
+    report.record("source_repl_role", PreflightOutcome::Pass);
+
+    // target_not_in_recovery uses the maintenance DB; safe before target_db_exists.
+    verify_target_not_in_recovery(&cfg.target.connection_string).await?;
+    report.record("target_not_in_recovery", PreflightOutcome::Pass);
+
+    // Create target DB before any check that connects to it directly.
+    ensure_target_database_exists(&cfg.target.connection_string, &cfg.target.database).await?;
+    report.record("target_db_exists", PreflightOutcome::Pass);
+
+    verify_target_role_privileges(&cfg.target.connection_string, MigrationMode::Online).await?;
+    report.record("target_role_privs", PreflightOutcome::Pass);
+
+    verify_source_logical_replication_ready(&cfg.source.connection_string).await?;
+    report.record("source_logical_repl", PreflightOutcome::Pass);
+
+    verify_target_subscription_capacity(&cfg.target.connection_string).await?;
+    report.record("target_sub_capacity", PreflightOutcome::Pass);
+
+    ensure_pglogical_not_interfering(&cfg.target.connection_string).await?;
+    report.record("pglogical_clean", PreflightOutcome::Pass);
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -781,5 +1459,608 @@ mod tests {
         assert!(sql.contains("\"public\""));
         assert!(sql.contains("\"app\""));
         assert!(!sql.contains("\"audit\""));
+    }
+
+    #[test]
+    fn preflight_report_summary_counts_pass_and_skip() {
+        let mut r = PreflightReport::new();
+        r.record("pg_tools", PreflightOutcome::Pass);
+        r.record("version_compat", PreflightOutcome::Pass);
+        r.record(
+            "source_repl_role",
+            PreflightOutcome::Skip {
+                reason: "offline mode",
+            },
+        );
+        assert_eq!(
+            r.summary_line(),
+            "preflight: 2 pass, 1 skip (pg_tools, version_compat, source_repl_role[skip])"
+        );
+    }
+
+    #[test]
+    fn preflight_report_summary_all_pass() {
+        let mut r = PreflightReport::new();
+        r.record("a", PreflightOutcome::Pass);
+        r.record("b", PreflightOutcome::Pass);
+        assert_eq!(r.summary_line(), "preflight: 2 pass (a, b)");
+    }
+
+    #[test]
+    fn preflight_report_summary_empty() {
+        let r = PreflightReport::new();
+        assert_eq!(r.summary_line(), "preflight: 0 pass");
+    }
+
+    #[test]
+    fn parse_pg_dump_version_plain() {
+        assert_eq!(
+            parse_pg_dump_version("pg_dump (PostgreSQL) 16.4\n"),
+            Some(16),
+        );
+    }
+
+    #[test]
+    fn parse_pg_dump_version_ubuntu_suffix() {
+        assert_eq!(
+            parse_pg_dump_version("pg_dump (PostgreSQL) 15.7 (Ubuntu 15.7-1.pgdg22.04+1)\n",),
+            Some(15),
+        );
+    }
+
+    #[test]
+    fn parse_pg_dump_version_release_candidate() {
+        assert_eq!(
+            parse_pg_dump_version("pg_dump (PostgreSQL) 17rc1\n"),
+            Some(17),
+        );
+    }
+
+    #[test]
+    fn parse_pg_dump_version_pg9_two_part_major() {
+        // Pre-PG10 used 9.6.24 etc; major is still "9" for our purposes.
+        assert_eq!(
+            parse_pg_dump_version("pg_dump (PostgreSQL) 9.6.24\n"),
+            Some(9),
+        );
+    }
+
+    #[test]
+    fn parse_pg_dump_version_garbage_returns_none() {
+        assert_eq!(parse_pg_dump_version(""), None);
+        assert_eq!(parse_pg_dump_version("not a version"), None);
+        assert_eq!(parse_pg_dump_version("pg_dump (PostgreSQL)"), None);
+    }
+
+    #[test]
+    fn decide_pg_dump_compat_newer_or_equal_passes() {
+        assert!(decide_pg_dump_compat(17, 15).is_ok());
+        assert!(decide_pg_dump_compat(15, 15).is_ok());
+    }
+
+    #[test]
+    fn decide_pg_dump_compat_older_than_source_fails() {
+        let err = decide_pg_dump_compat(14, 16).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pg_dump is version 14"), "msg: {msg}");
+        assert!(msg.contains("source server is 16"), "msg: {msg}");
+        assert!(msg.contains("postgresql-client-16"), "msg: {msg}");
+    }
+
+    #[test]
+    fn decide_pg_dump_compat_does_not_consider_target() {
+        // pg_dump 14 against source 14, target 16 — pg_dump is fine; the
+        // target's higher major only constrains pg_restore.
+        assert!(decide_pg_dump_compat(14, 14).is_ok());
+    }
+
+    #[test]
+    fn decide_pg_restore_compat_newer_or_equal_passes() {
+        // pg_restore 17 vs target 16, dump produced by pg_dump 15 — fine.
+        assert!(decide_pg_restore_compat(17, 16, 15).is_ok());
+        assert!(decide_pg_restore_compat(16, 16, 16).is_ok());
+    }
+
+    #[test]
+    fn decide_pg_restore_compat_older_than_target_fails() {
+        let err = decide_pg_restore_compat(14, 16, 14).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pg_restore is version 14"), "msg: {msg}");
+        assert!(msg.contains("target server is 16"), "msg: {msg}");
+    }
+
+    #[test]
+    fn decide_pg_restore_compat_older_than_pg_dump_fails() {
+        // pg_restore 15 against target 14 satisfies the target check, but
+        // the dump was produced by pg_dump 16 — pg_restore can't read it.
+        let err = decide_pg_restore_compat(15, 14, 16).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pg_restore is version 15"), "msg: {msg}");
+        assert!(msg.contains("pg_dump is version 16"), "msg: {msg}");
+    }
+
+    #[test]
+    fn pg_dump_and_pg_restore_compat_allow_cross_version_upgrade() {
+        // The motivating case: PG14 -> PG16 with pg_dump 14 + pg_restore 16.
+        // Both helpers must pass.
+        assert!(decide_pg_dump_compat(14, 14).is_ok());
+        assert!(decide_pg_restore_compat(16, 16, 14).is_ok());
+    }
+
+    #[test]
+    fn target_role_privilege_decision_offline_only_needs_create_db_priv() {
+        // Offline never touches subscriptions; only CREATE on database matters.
+        assert!(target_role_privilege_decision(
+            MigrationMode::Offline,
+            /*server_major*/ 14,
+            /*has_create_db*/ true,
+            /*is_super*/ false,
+            /*has_create_sub_role*/ false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn target_role_privilege_decision_offline_fails_without_create() {
+        let err = target_role_privilege_decision(MigrationMode::Offline, 14, false, false, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("CREATE"), "msg: {msg}");
+    }
+
+    #[test]
+    fn target_role_privilege_decision_online_pg16_passes_with_pg_create_subscription_member() {
+        assert!(
+            target_role_privilege_decision(MigrationMode::Online, 16, true, false, true).is_ok()
+        );
+    }
+
+    #[test]
+    fn target_role_privilege_decision_online_pg16_passes_with_superuser() {
+        assert!(
+            target_role_privilege_decision(MigrationMode::Online, 16, true, true, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn target_role_privilege_decision_online_pg16_fails_without_either() {
+        let err = target_role_privilege_decision(MigrationMode::Online, 16, true, false, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pg_create_subscription"), "msg: {msg}");
+    }
+
+    #[test]
+    fn target_role_privilege_decision_online_pg14_requires_superuser() {
+        let err = target_role_privilege_decision(MigrationMode::Online, 14, true, false, false)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("superuser"), "msg: {msg}");
+        assert!(
+            target_role_privilege_decision(MigrationMode::Online, 14, true, true, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn classify_subscription_capacity_fails_when_lrw_zero() {
+        let err = classify_subscription_capacity(0, 8, 2).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_logical_replication_workers"),
+            "msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_subscription_capacity_fails_when_mwp_zero() {
+        let err = classify_subscription_capacity(4, 0, 2).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("max_worker_processes"), "msg: {msg}");
+    }
+
+    #[test]
+    fn classify_subscription_capacity_passes_at_recommended_minimum() {
+        // RECOMMENDED_LRW = 1, RECOMMENDED_MWP = 2 — the absolute floor
+        // required for CREATE SUBSCRIPTION to function at all.
+        assert!(classify_subscription_capacity(1, 2, 1).is_ok());
+    }
+
+    #[test]
+    fn classify_subscription_capacity_passes_at_production_floor() {
+        // Production-recommended values (4 LRW / 8 MWP) — still well above
+        // the new absolute-minimum thresholds.
+        assert!(classify_subscription_capacity(4, 8, 2).is_ok());
+    }
+
+    #[test]
+    fn classify_subscription_capacity_passes_above_recommended() {
+        assert!(classify_subscription_capacity(16, 32, 4).is_ok());
+    }
+
+    #[test]
+    fn offline_preflight_includes_expected_checks() {
+        let names = offline_preflight_check_names();
+        assert_eq!(
+            names,
+            &[
+                "pg_tools",
+                "version_compat",
+                "target_not_in_recovery",
+                "target_db_exists",
+                "target_role_privs",
+            ]
+        );
+    }
+
+    #[test]
+    fn online_preflight_includes_expected_checks() {
+        let names = online_preflight_check_names();
+        assert_eq!(
+            names,
+            &[
+                "pg_tools",
+                "version_compat",
+                "source_repl_role",
+                "target_not_in_recovery",
+                "target_db_exists",
+                "target_role_privs",
+                "source_logical_repl",
+                "target_sub_capacity",
+                "pglogical_clean",
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_report_names_returns_recorded_in_order() {
+        let mut r = PreflightReport::new();
+        r.record("a", PreflightOutcome::Pass);
+        r.record("b", PreflightOutcome::Skip { reason: "x" });
+        r.record("c", PreflightOutcome::Pass);
+        assert_eq!(r.names(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn preflight_outcome_skip_equality() {
+        let a = PreflightOutcome::Skip { reason: "r" };
+        let b = PreflightOutcome::Skip { reason: "r" };
+        assert_eq!(a, b);
+        assert_ne!(a, PreflightOutcome::Pass);
+    }
+
+    #[test]
+    fn parse_pg_dump_version_enterprisedb_no_paren() {
+        // EnterpriseDB / Postgres Pro builds may print without the
+        // `(PostgreSQL)` marker. The fallback path scans for the first
+        // digit-led whitespace token.
+        assert_eq!(parse_pg_dump_version("edb_dump 15.4\n"), Some(15));
+        assert_eq!(parse_pg_dump_version("custom-tool 17 ee\n"), Some(17));
+    }
+
+    #[tokio::test]
+    async fn capture_tool_version_returns_version_for_pg_dump() {
+        // pg_dump is in PATH on any environment that can build/test pg_dbmigrator
+        // (the project lists it in REQUIRED_TOOLS and integration CI installs it).
+        let out = capture_tool_version("pg_dump")
+            .await
+            .expect("pg_dump exists");
+        assert!(out.contains("pg_dump"), "stdout: {out}");
+    }
+
+    #[tokio::test]
+    async fn capture_tool_version_errors_when_binary_missing() {
+        let err = capture_tool_version("pg_dbmigrator_definitely_not_a_real_binary_xyz_42")
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to spawn") || msg.contains("not found"),
+            "msg: {msg}"
+        );
+    }
+
+    // ----- Mock-probe driven tests for the async verify_*_with_probe wrappers.
+    // These exercise the orchestration around each pure decision helper
+    // without needing a live PostgreSQL or pg_dump binary.
+
+    use std::sync::Mutex;
+
+    /// Test double for [`PreflightProbe`]. Each field is the value the
+    /// corresponding trait method returns; unset fields cause the method
+    /// to panic — keep tests honest about which probe calls they exercise.
+    #[derive(Default)]
+    struct MockProbe {
+        tool_versions: Mutex<std::collections::HashMap<String, Result<String>>>,
+        source_major: Option<u32>,
+        target_major: Option<u32>,
+        role_has_repl_or_super: Option<bool>,
+        target_role_info: Option<TargetRolePrivInfo>,
+        in_recovery: Option<bool>,
+        sub_capacity: Option<(i64, i64, i64)>,
+    }
+
+    impl MockProbe {
+        fn with_tool(self, tool: &str, out: &str) -> Self {
+            self.tool_versions
+                .lock()
+                .unwrap()
+                .insert(tool.to_string(), Ok(out.to_string()));
+            self
+        }
+    }
+
+    #[async_trait]
+    impl PreflightProbe for MockProbe {
+        async fn capture_tool_version(&self, tool: &str) -> Result<String> {
+            let mut map = self.tool_versions.lock().unwrap();
+            match map.remove(tool) {
+                Some(r) => r,
+                None => panic!("MockProbe.capture_tool_version({tool}) not stubbed"),
+            }
+        }
+        async fn server_major_version(&self, conn: &str) -> Result<u32> {
+            // Distinguish source vs target by substring in the conn string.
+            if conn.contains("source") {
+                Ok(self.source_major.expect("source_major not stubbed"))
+            } else {
+                Ok(self.target_major.expect("target_major not stubbed"))
+            }
+        }
+        async fn role_has_replication_or_super(&self, _conn: &str) -> Result<bool> {
+            Ok(self
+                .role_has_repl_or_super
+                .expect("role_has_repl_or_super not stubbed"))
+        }
+        async fn target_role_privilege_info(&self, _conn: &str) -> Result<TargetRolePrivInfo> {
+            Ok(self.target_role_info.expect("target_role_info not stubbed"))
+        }
+        async fn is_in_recovery(&self, _conn: &str) -> Result<bool> {
+            Ok(self.in_recovery.expect("in_recovery not stubbed"))
+        }
+        async fn subscription_capacity_gucs(&self, _conn: &str) -> Result<(i64, i64, i64)> {
+            Ok(self.sub_capacity.expect("sub_capacity not stubbed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_pg_dump_version_compat_with_probe_passes_when_binary_dominates() {
+        let probe = MockProbe {
+            source_major: Some(16),
+            target_major: Some(17),
+            ..Default::default()
+        }
+        .with_tool("pg_dump", "pg_dump (PostgreSQL) 17.0\n")
+        .with_tool("pg_restore", "pg_restore (PostgreSQL) 17.0\n");
+        verify_pg_dump_version_compat_with_probe(&probe, "src://source", "tgt://target")
+            .await
+            .expect("should pass");
+    }
+
+    #[tokio::test]
+    async fn verify_pg_dump_version_compat_with_probe_fails_when_binary_too_old() {
+        let probe = MockProbe {
+            source_major: Some(17),
+            target_major: Some(17),
+            ..Default::default()
+        }
+        .with_tool("pg_dump", "pg_dump (PostgreSQL) 15.0\n")
+        .with_tool("pg_restore", "pg_restore (PostgreSQL) 15.0\n");
+        let err = verify_pg_dump_version_compat_with_probe(&probe, "src://source", "tgt://target")
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("postgresql-client-17"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn verify_pg_dump_version_compat_with_probe_rejects_unparseable_pg_dump() {
+        let probe = MockProbe {
+            source_major: Some(17),
+            target_major: Some(17),
+            ..Default::default()
+        }
+        .with_tool("pg_dump", "garbage output\n")
+        .with_tool("pg_restore", "pg_restore (PostgreSQL) 17.0\n");
+        let err = verify_pg_dump_version_compat_with_probe(&probe, "src://source", "tgt://target")
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("could not parse pg_dump version"),
+            "msg: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_pg_dump_version_compat_with_probe_rejects_unparseable_pg_restore() {
+        let probe = MockProbe {
+            source_major: Some(17),
+            target_major: Some(17),
+            ..Default::default()
+        }
+        .with_tool("pg_dump", "pg_dump (PostgreSQL) 17.0\n")
+        .with_tool("pg_restore", "not a version string");
+        let err = verify_pg_dump_version_compat_with_probe(&probe, "src://source", "tgt://target")
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("could not parse pg_restore version"),
+            "msg: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_source_replication_role_with_probe_passes_when_has_repl_or_super() {
+        let probe = MockProbe {
+            role_has_repl_or_super: Some(true),
+            ..Default::default()
+        };
+        verify_source_replication_role_with_probe(&probe, "src://source")
+            .await
+            .expect("should pass");
+    }
+
+    #[tokio::test]
+    async fn verify_source_replication_role_with_probe_fails_when_role_cannot_replicate() {
+        let probe = MockProbe {
+            role_has_repl_or_super: Some(false),
+            ..Default::default()
+        };
+        let err = verify_source_replication_role_with_probe(&probe, "src://source")
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("REPLICATION attribute"), "msg: {msg}");
+        assert!(msg.contains("ALTER ROLE"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn verify_target_not_in_recovery_with_probe_passes_for_primary() {
+        let probe = MockProbe {
+            in_recovery: Some(false),
+            ..Default::default()
+        };
+        verify_target_not_in_recovery_with_probe(&probe, "tgt://target")
+            .await
+            .expect("should pass");
+    }
+
+    #[tokio::test]
+    async fn verify_target_not_in_recovery_with_probe_fails_for_standby() {
+        let probe = MockProbe {
+            in_recovery: Some(true),
+            ..Default::default()
+        };
+        let err = verify_target_not_in_recovery_with_probe(&probe, "tgt://target")
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("hot standby"), "msg: {msg}");
+        assert!(msg.contains("pg_promote"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn verify_target_subscription_capacity_with_probe_passes_above_recommended() {
+        let probe = MockProbe {
+            sub_capacity: Some((8, 16, 4)),
+            ..Default::default()
+        };
+        verify_target_subscription_capacity_with_probe(&probe, "tgt://target")
+            .await
+            .expect("should pass");
+    }
+
+    #[tokio::test]
+    async fn verify_target_subscription_capacity_with_probe_fails_when_lrw_zero() {
+        let probe = MockProbe {
+            sub_capacity: Some((0, 16, 4)),
+            ..Default::default()
+        };
+        let err = verify_target_subscription_capacity_with_probe(&probe, "tgt://target")
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("max_logical_replication_workers"));
+    }
+
+    #[tokio::test]
+    async fn verify_target_subscription_capacity_with_probe_passes_at_floor() {
+        // (1, 2, 1) — exactly the absolute floor required by the trait.
+        let probe = MockProbe {
+            sub_capacity: Some((1, 2, 1)),
+            ..Default::default()
+        };
+        verify_target_subscription_capacity_with_probe(&probe, "tgt://target")
+            .await
+            .expect("should pass at the floor");
+    }
+
+    #[tokio::test]
+    async fn verify_target_role_privileges_with_probe_passes_for_pg16_member() {
+        let probe = MockProbe {
+            target_role_info: Some(TargetRolePrivInfo {
+                target_major: 16,
+                has_create: true,
+                is_super: false,
+                has_sub_role: true,
+            }),
+            ..Default::default()
+        };
+        verify_target_role_privileges_with_probe(&probe, "tgt://target", MigrationMode::Online)
+            .await
+            .expect("should pass");
+    }
+
+    #[tokio::test]
+    async fn verify_target_role_privileges_with_probe_passes_offline_with_create_only() {
+        let probe = MockProbe {
+            target_role_info: Some(TargetRolePrivInfo {
+                target_major: 14,
+                has_create: true,
+                is_super: false,
+                has_sub_role: false,
+            }),
+            ..Default::default()
+        };
+        verify_target_role_privileges_with_probe(&probe, "tgt://target", MigrationMode::Offline)
+            .await
+            .expect("should pass");
+    }
+
+    #[tokio::test]
+    async fn verify_target_role_privileges_with_probe_fails_pg15_non_super_online() {
+        let probe = MockProbe {
+            target_role_info: Some(TargetRolePrivInfo {
+                target_major: 15,
+                has_create: true,
+                is_super: false,
+                has_sub_role: false,
+            }),
+            ..Default::default()
+        };
+        let err =
+            verify_target_role_privileges_with_probe(&probe, "tgt://target", MigrationMode::Online)
+                .await
+                .unwrap_err();
+        assert!(format!("{err}").contains("superuser"));
+    }
+
+    #[tokio::test]
+    async fn verify_target_role_privileges_with_probe_fails_pg16_non_member_non_super_online() {
+        let probe = MockProbe {
+            target_role_info: Some(TargetRolePrivInfo {
+                target_major: 16,
+                has_create: true,
+                is_super: false,
+                has_sub_role: false,
+            }),
+            ..Default::default()
+        };
+        let err =
+            verify_target_role_privileges_with_probe(&probe, "tgt://target", MigrationMode::Online)
+                .await
+                .unwrap_err();
+        assert!(format!("{err}").contains("pg_create_subscription"));
+    }
+
+    #[tokio::test]
+    async fn verify_target_role_privileges_with_probe_fails_offline_without_create() {
+        let probe = MockProbe {
+            target_role_info: Some(TargetRolePrivInfo {
+                target_major: 16,
+                has_create: false,
+                is_super: false,
+                has_sub_role: false,
+            }),
+            ..Default::default()
+        };
+        let err = verify_target_role_privileges_with_probe(
+            &probe,
+            "tgt://target",
+            MigrationMode::Offline,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("CREATE"));
     }
 }

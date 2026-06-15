@@ -21,8 +21,8 @@ use crate::native_apply::{
     PgSubscriptionLagProvider,
 };
 use crate::preflight::{
-    ensure_pglogical_not_interfering, ensure_publication_exists, ensure_target_database_exists,
-    verify_pg_tools_installed, verify_publication_exists, verify_source_logical_replication_ready,
+    ensure_publication_exists, run_offline_preflight, run_online_preflight,
+    verify_publication_exists,
 };
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
 use crate::restore::{run_pg_restore, run_pg_restore_in_sections, RestoreRequest};
@@ -96,8 +96,19 @@ impl Migrator {
     /// migration.
     pub async fn run(&self, cancel: CancellationToken) -> Result<MigrationOutcome> {
         self.config.validate()?;
-        verify_pg_tools_installed().await?;
-        self.report(MigrationStage::Validate, "configuration valid")
+        // Preflight checks open DB connections that can hang on firewall /
+        // network issues. Race them against the cancel token so SIGINT is
+        // honoured immediately rather than waiting for the OS connect timeout.
+        let report = tokio::select! {
+            _ = cancel.cancelled() => return Err(MigrationError::Cancelled),
+            res = async {
+                match self.config.mode {
+                    MigrationMode::Offline => run_offline_preflight(&self.config).await,
+                    MigrationMode::Online => run_online_preflight(&self.config).await,
+                }
+            } => res?,
+        };
+        self.report(MigrationStage::Validate, report.summary_line())
             .await;
 
         match self.config.mode {
@@ -175,25 +186,6 @@ impl Migrator {
             )
             .await?;
         }
-
-        // Run target-database check and source logical-replication validation in parallel — they hit different servers so there is no ordering dependency.
-        self.report(
-            MigrationStage::Validate,
-            format!(
-                "ensuring target database `{}` exists + verifying source logical replication",
-                self.config.target.database
-            ),
-        )
-        .await;
-        let (target_db_result, source_repl_result) = tokio::join!(
-            ensure_target_database_exists(
-                &self.config.target.connection_string,
-                &self.config.target.database,
-            ),
-            verify_source_logical_replication_ready(&self.config.source.connection_string),
-        );
-        target_db_result?;
-        source_repl_result?;
 
         // Pre-dump: VACUUM ANALYZE on source.
         let dump_path = self.dump_path_or_default("dump_online");
@@ -351,12 +343,7 @@ impl Migrator {
         .await?;
 
         // 4.5. Verify pglogical is NOT interfering with native logical replication.
-        self.report(
-            MigrationStage::Validate,
-            "checking pglogical is not blocking native replication on target",
-        )
-        .await;
-        ensure_pglogical_not_interfering(&self.config.target.connection_string).await?;
+        // (handled by the online preflight bundle in Migrator::run)
 
         let stats = self.run_native_engine(cancel).await?;
         token.last_applied_lsn = Some(stats.last_applied_lsn);
@@ -768,7 +755,7 @@ mod tests {
         .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_test_dump"));
 
         migrator
-            .run(CancellationToken::new())
+            .run_offline(CancellationToken::new())
             .await
             .expect("offline migration should succeed");
 
@@ -783,7 +770,6 @@ mod tests {
             .into_iter()
             .map(|e| e.stage)
             .collect();
-        assert!(stages.contains(&MigrationStage::Validate));
         assert!(stages.contains(&MigrationStage::Dump));
         assert!(stages.contains(&MigrationStage::Restore));
         assert!(stages.contains(&MigrationStage::Complete));
@@ -803,7 +789,7 @@ mod tests {
             .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_split_dump"));
 
         migrator
-            .run(CancellationToken::new())
+            .run_offline(CancellationToken::new())
             .await
             .expect("split-section restore should succeed");
 
@@ -865,7 +851,10 @@ mod tests {
             .with_runner(runner.clone())
             .with_reporter(Arc::new(CollectingReporter::new()));
 
-        migrator.run(CancellationToken::new()).await.unwrap();
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .unwrap();
 
         let calls = runner.snapshot();
         assert_eq!(calls.len(), 1, "expected 1 call (restore only)");
@@ -1012,7 +1001,7 @@ mod tests {
             .with_reporter(reporter)
             .with_dump_path(temp_dir.path().join("cancel_test"));
 
-        let err = migrator.run(cancel).await.unwrap_err();
+        let err = migrator.run_offline(cancel).await.unwrap_err();
         assert!(matches!(err, MigrationError::Cancelled));
     }
 
@@ -1040,7 +1029,10 @@ mod tests {
             .with_runner(runner.clone())
             .with_reporter(Arc::new(CollectingReporter::new()));
 
-        migrator.run(CancellationToken::new()).await.unwrap();
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .unwrap();
         assert!(
             runner.snapshot().is_empty(),
             "neither dump nor restore should have been invoked"
@@ -1228,7 +1220,10 @@ mod tests {
             .with_runner(runner.clone())
             .with_reporter(Arc::new(CollectingReporter::new()));
 
-        migrator.run(CancellationToken::new()).await.unwrap();
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .unwrap();
 
         let calls = runner.snapshot();
         assert_eq!(calls.len(), 2, "expected 2 calls (dump+restore)");
@@ -1254,7 +1249,10 @@ mod tests {
             .with_runner(runner)
             .with_reporter(Arc::new(CollectingReporter::new()));
 
-        migrator.run(CancellationToken::new()).await.unwrap();
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .unwrap();
 
         // Even without --resume, the token should be saved for future use.
         let resume_path = crate::resume::default_resume_path(&dump_path);
@@ -1318,12 +1316,16 @@ mod tests {
             .with_reporter(reporter.clone())
             .with_dump_path(dir.path().join("dump"));
 
-        migrator.run(CancellationToken::new()).await.unwrap();
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .unwrap();
 
         let events = reporter.events().await;
         let stages: Vec<_> = events.iter().map(|e| e.stage).collect();
-        // Validate is always first, Complete is always last.
-        assert_eq!(*stages.first().unwrap(), MigrationStage::Validate);
+        // Dump is first (preflight bundle is bypassed in this unit test by
+        // calling run_offline directly), Complete is always last.
+        assert_eq!(*stages.first().unwrap(), MigrationStage::Dump);
         assert_eq!(*stages.last().unwrap(), MigrationStage::Complete);
         // Dump comes before Restore in the sequence.
         let dump_pos = stages
@@ -1369,7 +1371,10 @@ mod tests {
         .with_reporter(reporter.clone())
         .with_dump_path(dir.path().join("dump"));
 
-        migrator.run(CancellationToken::new()).await.unwrap();
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .unwrap();
 
         let stages: Vec<_> = reporter
             .events()
@@ -1408,7 +1413,10 @@ mod tests {
             .with_runner(runner)
             .with_reporter(reporter.clone());
 
-        migrator.run(CancellationToken::new()).await.unwrap();
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .unwrap();
 
         let stages: Vec<_> = reporter
             .events()
@@ -1451,7 +1459,10 @@ mod tests {
             .with_runner(runner)
             .with_reporter(reporter.clone());
 
-        migrator.run(CancellationToken::new()).await.unwrap();
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .unwrap();
 
         let stages: Vec<_> = reporter
             .events()

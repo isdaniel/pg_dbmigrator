@@ -1106,3 +1106,111 @@ async fn cleanup_source_after_cutover_skips_when_not_auto_created() {
         .await
         .ok();
 }
+
+// ─── slot/snapshot handoff regression guard ──────────────────────────────────
+
+/// Verifies the slot+snapshot stay alive across a simulated pg_dump phase
+/// and that `wait_for_slot_inactive` returns once the holding stream is
+/// dropped. Regression guard for the snapshot-handoff sequence.
+#[tokio::test(flavor = "multi_thread")]
+async fn online_slot_handoff_survives_dump_phase() {
+    let Some(source) = source_url() else {
+        eprintln!("skipped: PG_SOURCE_URL not set");
+        return;
+    };
+
+    use pg_dbmigrator::native_apply::wait_for_slot_inactive;
+    use pg_dbmigrator::progress::CollectingReporter;
+    use pg_dbmigrator::snapshot::prepare_replication_slot;
+    use pg_dbmigrator::OnlineOptions;
+    use std::time::Duration;
+
+    let slot_name = format!("pg_dbm_handoff_{}", std::process::id());
+    let publication = format!("pg_dbm_handoff_pub_{}", std::process::id());
+
+    // Best-effort cleanup from a previous run.
+    let cleanup_client = connect_with_sslmode(&source).await.expect("connect");
+    cleanup_client
+        .batch_execute(&format!(
+            "SELECT pg_drop_replication_slot('{slot}') \
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}')",
+            slot = slot_name.replace('\'', "''"),
+        ))
+        .await
+        .ok();
+    cleanup_client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {}", publication))
+        .await
+        .ok();
+    cleanup_client
+        .batch_execute(&format!(
+            "CREATE PUBLICATION {} FOR ALL TABLES",
+            publication
+        ))
+        .await
+        .ok();
+
+    let online = OnlineOptions {
+        slot_name: slot_name.clone(),
+        publication: publication.clone(),
+        ..OnlineOptions::default()
+    };
+
+    // 1. Prepare slot + snapshot.
+    let prepared = match prepare_replication_slot(&source, &online).await {
+        Ok(p) => p,
+        Err(e) => {
+            // If the source is not configured for logical replication we
+            // cannot exercise the handoff — skip rather than fail.
+            eprintln!("skipped: prepare_replication_slot failed: {e}");
+            cleanup_client
+                .batch_execute(&format!("DROP PUBLICATION IF EXISTS {}", publication))
+                .await
+                .ok();
+            return;
+        }
+    };
+    assert!(
+        prepared.snapshot_name.is_some(),
+        "exported snapshot should be present on a freshly created slot"
+    );
+
+    // 2. Simulate pg_dump running while we hold the stream.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 3. Slot must still exist while we hold the stream. The `active` flag in
+    // pg_replication_slots only flips true on START_REPLICATION (not on
+    // CREATE_REPLICATION_SLOT), so we only assert existence here — the
+    // regression we're guarding against is the slot/snapshot disappearing
+    // mid-flow, not the active accounting.
+    let client = connect_with_sslmode(&source).await.expect("connect");
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[&slot_name],
+        )
+        .await
+        .expect("query pg_replication_slots");
+    let exists: bool = row.get(0);
+    assert!(exists, "slot should still exist while stream is held");
+
+    // 4. Drop the stream — emulates orchestrator handing off to native apply.
+    drop(prepared.stream);
+
+    // 5. wait_for_slot_inactive should succeed within its internal timeout.
+    let reporter = CollectingReporter::new();
+    wait_for_slot_inactive(&source, &slot_name, &reporter)
+        .await
+        .expect("slot did not transition to inactive");
+
+    // 6. Cleanup.
+    let _ = client
+        .batch_execute(&format!(
+            "SELECT pg_drop_replication_slot('{}')",
+            slot_name.replace('\'', "''")
+        ))
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {}", publication))
+        .await;
+}
