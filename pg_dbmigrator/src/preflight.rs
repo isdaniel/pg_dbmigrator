@@ -40,6 +40,14 @@ pub(crate) trait PreflightProbe: Send + Sync {
     async fn target_role_privilege_info(&self, conn: &str) -> Result<TargetRolePrivInfo>;
     async fn is_in_recovery(&self, conn: &str) -> Result<bool>;
     async fn subscription_capacity_gucs(&self, conn: &str) -> Result<(i64, i64, i64)>;
+    /// Return `(source_installed, target_available)`: the extension names
+    /// installed on the source (`pg_extension`) and the extension names
+    /// available for installation on the target (`pg_available_extensions`).
+    async fn installed_and_available_extensions(
+        &self,
+        source_conn: &str,
+        target_conn: &str,
+    ) -> Result<(Vec<String>, Vec<String>)>;
 }
 
 /// Production [`PreflightProbe`] — spawns real processes and opens real
@@ -153,6 +161,24 @@ impl PreflightProbe for PgProbe {
         let b: i32 = row.get(1);
         let c: i32 = row.get(2);
         Ok((a as i64, b as i64, c as i64))
+    }
+
+    async fn installed_and_available_extensions(
+        &self,
+        source_conn: &str,
+        target_conn: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let (source, target) = tokio::try_join!(
+            connect_with_sslmode(source_conn),
+            connect_with_sslmode(target_conn),
+        )?;
+        let (installed_rows, available_rows) = tokio::try_join!(
+            source.query("SELECT extname::text FROM pg_extension", &[]),
+            target.query("SELECT name::text FROM pg_available_extensions", &[]),
+        )?;
+        let installed: Vec<String> = installed_rows.iter().map(|r| r.get(0)).collect();
+        let available: Vec<String> = available_rows.iter().map(|r| r.get(0)).collect();
+        Ok((installed, available))
     }
 }
 
@@ -984,6 +1010,79 @@ pub(crate) async fn verify_target_role_privileges_with_probe<P: PreflightProbe +
     Ok(())
 }
 
+/// Pure decision: every extension installed on the source must be available
+/// (installable) on the target, else `pg_restore`'s `CREATE EXTENSION` fails
+/// partway through the restore. Returns the missing extension names in the
+/// error so the operator can install the matching `-contrib` package.
+pub(crate) fn decide_extensions_available(
+    source_installed: &[String],
+    target_available: &[String],
+) -> Result<()> {
+    let available: std::collections::HashSet<&str> =
+        target_available.iter().map(|s| s.as_str()).collect();
+    let missing: Vec<&str> = source_installed
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|e| !available.contains(e))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(MigrationError::config(format!(
+        "the source has extension(s) not available on the target: {}. \
+         Install the matching package(s) on the target (e.g. \
+         `postgresql-<major>-<ext>` / the extension's contrib package) so \
+         `pg_restore`'s CREATE EXTENSION succeeds, or exclude the objects \
+         that depend on them.",
+        missing.join(", ")
+    )))
+}
+
+/// Verify every source-installed extension is installable on the target.
+pub async fn verify_target_extensions_available(
+    source_conn: &str,
+    target_conn: &str,
+) -> Result<()> {
+    verify_target_extensions_available_with_probe(&PgProbe, source_conn, target_conn).await
+}
+
+/// Probe-based variant of [`verify_target_extensions_available`] — exposed at
+/// crate level so unit tests can drive it with a stub probe. Fetches the
+/// source-installed and target-available extension names via the probe, then
+/// delegates the (pure) comparison to [`decide_extensions_available`].
+pub(crate) async fn verify_target_extensions_available_with_probe<P: PreflightProbe + ?Sized>(
+    probe: &P,
+    source_conn: &str,
+    target_conn: &str,
+) -> Result<()> {
+    let (installed, available) = probe
+        .installed_and_available_extensions(source_conn, target_conn)
+        .await?;
+    decide_extensions_available(&installed, &available)?;
+    info!("all source extensions are available on the target");
+    Ok(())
+}
+
+/// Resolve the extension-availability preflight outcome. On success →
+/// Pass. On failure, if `allow_restore_errors` is set the missing
+/// extensions are non-fatal (the user opted into tolerating un-portable
+/// extension state) → warn + Skip; otherwise the error propagates.
+pub(crate) fn resolve_extension_preflight(
+    result: Result<()>,
+    allow_restore_errors: bool,
+) -> Result<PreflightOutcome> {
+    match result {
+        Ok(()) => Ok(PreflightOutcome::Pass),
+        Err(MigrationError::Config(msg)) if allow_restore_errors => {
+            tracing::warn!(error = %msg, "some source extensions are not available on the target (continuing because --allow-restore-errors is set)");
+            Ok(PreflightOutcome::Skip {
+                reason: "missing extensions allowed by --allow-restore-errors",
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl PreflightReport {
     pub fn names(&self) -> Vec<&'static str> {
         self.items.iter().map(|(n, _)| *n).collect()
@@ -1004,6 +1103,7 @@ pub fn offline_preflight_check_names() -> &'static [&'static str] {
         "target_not_in_recovery",
         "target_db_exists",
         "target_role_privs",
+        "extensions_available",
     ]
 }
 
@@ -1019,6 +1119,7 @@ pub fn online_preflight_check_names() -> &'static [&'static str] {
         "target_not_in_recovery",
         "target_db_exists",
         "target_role_privs",
+        "extensions_available",
         "source_logical_repl",
         "target_sub_capacity",
         "pglogical_clean",
@@ -1052,6 +1153,16 @@ pub async fn run_offline_preflight(
     verify_target_role_privileges(&cfg.target.connection_string, MigrationMode::Offline).await?;
     report.record("target_role_privs", PreflightOutcome::Pass);
 
+    let ext_outcome = resolve_extension_preflight(
+        verify_target_extensions_available(
+            &cfg.source.connection_string,
+            &cfg.target.connection_string,
+        )
+        .await,
+        cfg.allow_restore_errors,
+    )?;
+    report.record("extensions_available", ext_outcome);
+
     Ok(report)
 }
 
@@ -1080,6 +1191,16 @@ pub async fn run_online_preflight(cfg: &crate::config::MigrationConfig) -> Resul
     verify_target_role_privileges(&cfg.target.connection_string, MigrationMode::Online).await?;
     report.record("target_role_privs", PreflightOutcome::Pass);
 
+    let ext_outcome = resolve_extension_preflight(
+        verify_target_extensions_available(
+            &cfg.source.connection_string,
+            &cfg.target.connection_string,
+        )
+        .await,
+        cfg.allow_restore_errors,
+    )?;
+    report.record("extensions_available", ext_outcome);
+
     verify_source_logical_replication_ready(&cfg.source.connection_string).await?;
     report.record("source_logical_repl", PreflightOutcome::Pass);
 
@@ -1096,6 +1217,61 @@ pub async fn run_online_preflight(cfg: &crate::config::MigrationConfig) -> Resul
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn extensions_ok_when_all_available_on_target() {
+        let src = vec!["plpgsql".to_string(), "postgis".to_string()];
+        let tgt = vec![
+            "plpgsql".to_string(),
+            "postgis".to_string(),
+            "hstore".to_string(),
+        ];
+        assert!(decide_extensions_available(&src, &tgt).is_ok());
+    }
+
+    #[test]
+    fn extensions_error_names_missing_extension() {
+        let src = vec!["plpgsql".to_string(), "timescaledb".to_string()];
+        let tgt = vec!["plpgsql".to_string()];
+        let err = decide_extensions_available(&src, &tgt).unwrap_err();
+        match err {
+            MigrationError::Config(msg) => assert!(msg.contains("timescaledb")),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_extension_returns_pass_when_ok() {
+        let outcome = resolve_extension_preflight(Ok(()), false).unwrap();
+        assert_eq!(outcome, PreflightOutcome::Pass);
+    }
+
+    #[test]
+    fn resolve_extension_returns_skip_when_error_and_allowed() {
+        let result = Err(MigrationError::config("missing ext foo"));
+        let outcome = resolve_extension_preflight(result, true).unwrap();
+        match outcome {
+            PreflightOutcome::Skip { reason } => {
+                assert!(reason.contains("--allow-restore-errors"));
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_extension_returns_err_when_error_and_not_allowed() {
+        let result = Err(MigrationError::config("missing ext foo"));
+        assert!(resolve_extension_preflight(result, false).is_err());
+    }
+
+    #[test]
+    fn resolve_extension_propagates_non_config_error_even_when_allowed() {
+        // A fatal (non-Config) error such as a connection/query failure must
+        // NOT be swallowed by --allow-restore-errors; only missing-extension
+        // (Config) errors are skippable.
+        let result = Err(MigrationError::apply("boom"));
+        assert!(resolve_extension_preflight(result, true).is_err());
+    }
 
     fn ok_status() -> ExitStatus {
         ExitStatus::from_raw(0)
@@ -1688,6 +1864,7 @@ mod tests {
                 "target_not_in_recovery",
                 "target_db_exists",
                 "target_role_privs",
+                "extensions_available",
             ]
         );
     }
@@ -1704,6 +1881,7 @@ mod tests {
                 "target_not_in_recovery",
                 "target_db_exists",
                 "target_role_privs",
+                "extensions_available",
                 "source_logical_repl",
                 "target_sub_capacity",
                 "pglogical_clean",
@@ -1777,6 +1955,7 @@ mod tests {
         target_role_info: Option<TargetRolePrivInfo>,
         in_recovery: Option<bool>,
         sub_capacity: Option<(i64, i64, i64)>,
+        extensions: Option<(Vec<String>, Vec<String>)>,
     }
 
     impl MockProbe {
@@ -1819,6 +1998,13 @@ mod tests {
         }
         async fn subscription_capacity_gucs(&self, _conn: &str) -> Result<(i64, i64, i64)> {
             Ok(self.sub_capacity.expect("sub_capacity not stubbed"))
+        }
+        async fn installed_and_available_extensions(
+            &self,
+            _source_conn: &str,
+            _target_conn: &str,
+        ) -> Result<(Vec<String>, Vec<String>)> {
+            Ok(self.extensions.clone().expect("extensions not stubbed"))
         }
     }
 
@@ -2062,5 +2248,39 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{err}").contains("CREATE"));
+    }
+
+    #[tokio::test]
+    async fn verify_target_extensions_available_with_probe_passes_when_all_available() {
+        let probe = MockProbe {
+            extensions: Some((
+                vec!["plpgsql".to_string(), "hstore".to_string()],
+                vec![
+                    "plpgsql".to_string(),
+                    "hstore".to_string(),
+                    "postgis".to_string(),
+                ],
+            )),
+            ..Default::default()
+        };
+        verify_target_extensions_available_with_probe(&probe, "src://source", "tgt://target")
+            .await
+            .expect("all source extensions available on target");
+    }
+
+    #[tokio::test]
+    async fn verify_target_extensions_available_with_probe_fails_when_missing() {
+        let probe = MockProbe {
+            extensions: Some((
+                vec!["plpgsql".to_string(), "timescaledb".to_string()],
+                vec!["plpgsql".to_string()],
+            )),
+            ..Default::default()
+        };
+        let err =
+            verify_target_extensions_available_with_probe(&probe, "src://source", "tgt://target")
+                .await
+                .unwrap_err();
+        assert!(format!("{err}").contains("timescaledb"), "err: {err}");
     }
 }

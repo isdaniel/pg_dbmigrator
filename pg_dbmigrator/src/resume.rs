@@ -57,6 +57,8 @@ pub enum CompletedStage {
     Restore,
     /// Post-restore `ANALYZE` on the target completed.
     Analyze,
+    /// Post-restore row-count verification completed.
+    Verify,
 }
 
 /// Persisted state used by [`crate::Migrator::run`] when `--resume` is set.
@@ -104,6 +106,7 @@ impl ResumeToken {
         let mode = match cfg.mode {
             MigrationMode::Offline => "offline",
             MigrationMode::Online => "online",
+            MigrationMode::Verify => "verify",
         };
         Self {
             schema_version: RESUME_SCHEMA_VERSION,
@@ -204,6 +207,7 @@ impl ResumeToken {
         let mode = match cfg.mode {
             MigrationMode::Offline => "offline",
             MigrationMode::Online => "online",
+            MigrationMode::Verify => "verify",
         };
         if self.mode != mode {
             return Err(MigrationError::config(format!(
@@ -234,6 +238,7 @@ pub fn config_hash(cfg: &MigrationConfig) -> String {
     match cfg.mode {
         MigrationMode::Offline => 0u8.hash(&mut h),
         MigrationMode::Online => 1u8.hash(&mut h),
+        MigrationMode::Verify => 2u8.hash(&mut h),
     }
     // Endpoints — host / port / database (NOT the password).
     cfg.source.host.hash(&mut h);

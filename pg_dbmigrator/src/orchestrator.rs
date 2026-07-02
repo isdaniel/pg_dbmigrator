@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::analyze::{maybe_analyze_target, maybe_vacuum_source};
-use crate::config::{MigrationConfig, MigrationMode};
+use crate::config::{MigrationConfig, MigrationMode, VerifyMode};
 use crate::cutover::CutoverHandle;
 use crate::dump::{run_pg_dump, CommandRunner, DumpFormat, DumpRequest, TokioCommandRunner};
 use crate::error::{MigrationError, Result};
@@ -30,6 +30,7 @@ use crate::resume::{default_resume_path, CompletedStage, ResumeToken};
 use crate::sequences::sync_sequences;
 use crate::snapshot::prepare_replication_slot;
 use crate::tls::connect_with_sslmode;
+use crate::verify::verify_row_counts;
 
 /// High-level migration driver.
 #[derive(Debug)]
@@ -96,6 +97,27 @@ impl Migrator {
     /// migration.
     pub async fn run(&self, cancel: CancellationToken) -> Result<MigrationOutcome> {
         self.config.validate()?;
+
+        // Standalone verify mode: a read-only count comparison. It skips the
+        // offline/online preflight bundles (which create the target DB and are
+        // irrelevant to a read-only compare) and is always strict — a mismatch
+        // is fatal and yields a non-zero exit.
+        if self.config.mode == MigrationMode::Verify {
+            let report = verify_row_counts(&self.config, &cancel).await?;
+            self.report(MigrationStage::Verify, report.summary_line())
+                .await;
+            if !report.is_ok() {
+                return Err(MigrationError::config(format!(
+                    "verification failed: {}",
+                    report.summary_line()
+                )));
+            }
+            return Ok(MigrationOutcome {
+                stats: None,
+                dump_path: std::path::PathBuf::new(),
+            });
+        }
+
         // Preflight checks open DB connections that can hang on firewall /
         // network issues. Race them against the cancel token so SIGINT is
         // honoured immediately rather than waiting for the OS connect timeout.
@@ -105,6 +127,10 @@ impl Migrator {
                 match self.config.mode {
                     MigrationMode::Offline => run_offline_preflight(&self.config).await,
                     MigrationMode::Online => run_online_preflight(&self.config).await,
+                    // Verify is handled by the early return above and never
+                    // reaches this match; delegate to the offline preflight to
+                    // keep the match exhaustive without a panic.
+                    MigrationMode::Verify => run_offline_preflight(&self.config).await,
                 }
             } => res?,
         };
@@ -114,6 +140,10 @@ impl Migrator {
         match self.config.mode {
             MigrationMode::Offline => self.run_offline(cancel).await,
             MigrationMode::Online => self.run_online(cancel).await,
+            // Verify is handled by the early return above and never reaches
+            // this match; delegate to the offline path to keep the match
+            // exhaustive without a panic.
+            MigrationMode::Verify => self.run_offline(cancel).await,
         }
     }
 
@@ -160,6 +190,8 @@ impl Migrator {
         }
 
         self.run_target_analyze_stage(&mut token, &dump_path).await;
+
+        self.run_verify_stage(&cancel).await?;
 
         self.report(MigrationStage::Complete, "offline migration finished")
             .await;
@@ -345,7 +377,7 @@ impl Migrator {
         // 4.5. Verify pglogical is NOT interfering with native logical replication.
         // (handled by the online preflight bundle in Migrator::run)
 
-        let stats = self.run_native_engine(cancel).await?;
+        let stats = self.run_native_engine(cancel.clone()).await?;
         token.last_applied_lsn = Some(stats.last_applied_lsn);
         self.save_resume(&token, &dump_path).await;
 
@@ -397,6 +429,13 @@ impl Migrator {
                 }
             }
         }
+
+        // NOTE: online mode does NOT run an automatic row-count verification.
+        // Cutover (Ctrl+C) stops the apply worker but does not freeze source
+        // writes, so an automatic count(*) compare would show spurious
+        // mismatches. Readiness is signalled by the lag heartbeat, not row
+        // counts. After the operator quiesces source writes and lag has
+        // drained, run verification manually via `--mode verify`.
 
         // 6. Post-cutover cleanup: drop auto-created publication and slot.
         if stats.cutover_triggered {
@@ -622,6 +661,31 @@ impl Migrator {
         }
     }
 
+    /// Run the row-count verification step. Used by OFFLINE mode (after
+    /// restore) and the standalone `--mode verify` command; ONLINE mode does
+    /// not auto-verify (see the note in [`Self::run_online`]). Reports a
+    /// summary. On mismatch: warns when `verify` is `Warn` (default) or returns
+    /// an error when it is `Strict`. Skipped entirely when `verify` is `Off`.
+    /// Threads `cancel` through to [`verify_row_counts`] so a long verify can be
+    /// aborted.
+    async fn run_verify_stage(&self, cancel: &CancellationToken) -> Result<()> {
+        if self.config.verify == VerifyMode::Off {
+            self.report(MigrationStage::Verify, "skipped (--verify off)")
+                .await;
+            return Ok(());
+        }
+        let report = verify_row_counts(&self.config, cancel).await?;
+        self.report(MigrationStage::Verify, report.summary_line())
+            .await;
+        if !report.is_ok() && self.config.verify == VerifyMode::Strict {
+            return Err(MigrationError::config(format!(
+                "verification failed: {} — see warnings above",
+                report.summary_line()
+            )));
+        }
+        Ok(())
+    }
+
     async fn report(&self, stage: MigrationStage, message: impl Into<String>) {
         self.reporter
             .report(ProgressEvent::new(stage, message.into()))
@@ -738,6 +802,7 @@ mod tests {
             target: EndpointConfig::parse("postgres://u:p@dst/db").unwrap(),
             skip_analyze: true,
             skip_source_vacuum: true,
+            verify: VerifyMode::Off,
             ..MigrationConfig::default()
         }
     }
