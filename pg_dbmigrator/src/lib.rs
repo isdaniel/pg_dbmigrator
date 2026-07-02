@@ -52,6 +52,7 @@ pub mod resume;
 pub mod sequences;
 pub mod snapshot;
 pub mod tls;
+pub mod verify;
 
 pub use config::{
     CutoverConfig, EndpointConfig, MigrationConfig, MigrationMode, OnlineOptions,
@@ -62,3 +63,4 @@ pub use error::{MigrationError, Result};
 pub use orchestrator::{cleanup_source_after_cutover, Migrator};
 pub use progress::{JsonReporter, MigrationStage, ProgressEvent, ProgressReporter};
 pub use resume::{CompletedStage, ResumeToken, RESUME_SCHEMA_VERSION};
+pub use verify::{verify_row_counts, TableCount, VerifyReport};

@@ -227,6 +227,19 @@ pub struct Cli {
     #[arg(long)]
     pub skip_source_vacuum: bool,
 
+    /// Skip the automatic post-restore row-count verification. By default
+    /// pg_dbmigrator compares per-table `count(*)` between source and target
+    /// after restore (offline) / after cutover (online) and warns on any
+    /// mismatch. Pass this to skip that step entirely.
+    #[arg(long)]
+    pub skip_verify: bool,
+
+    /// Turn a verification mismatch into a hard error (non-zero exit) instead
+    /// of a warning. Use in CI/scripts to gate cutover on a clean verify.
+    /// `--mode verify` is always strict regardless of this flag.
+    #[arg(long)]
+    pub verify_strict: bool,
+
     /// Verbose logging.
     #[arg(long)]
     pub verbose: bool,
@@ -244,6 +257,7 @@ pub struct Cli {
 pub enum ModeArg {
     Offline,
     Online,
+    Verify,
 }
 
 impl From<ModeArg> for MigrationMode {
@@ -251,6 +265,7 @@ impl From<ModeArg> for MigrationMode {
         match value {
             ModeArg::Offline => MigrationMode::Offline,
             ModeArg::Online => MigrationMode::Online,
+            ModeArg::Verify => MigrationMode::Verify,
         }
     }
 }
@@ -330,6 +345,8 @@ impl Cli {
             no_table_access_method: self.no_table_access_method,
             skip_analyze: self.skip_analyze,
             skip_source_vacuum: self.skip_source_vacuum,
+            skip_verify: self.skip_verify,
+            verify_strict: self.verify_strict,
         })
     }
 }
@@ -771,6 +788,40 @@ mod tests {
         ]);
         let cfg = cli.into_config().unwrap();
         assert!(!cfg.online.drop_slot_on_cutover);
+    }
+
+    #[test]
+    fn into_config_verify_mode_and_flags() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "verify",
+            "--source",
+            "postgres://u:p@src/db",
+            "--target",
+            "postgres://u:p@dst/db",
+            "--verify-strict",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.mode, pg_dbmigrator::MigrationMode::Verify);
+        assert!(cfg.verify_strict);
+        assert!(!cfg.skip_verify);
+    }
+
+    #[test]
+    fn into_config_skip_verify() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "offline",
+            "--source",
+            "postgres://u:p@src/db",
+            "--target",
+            "postgres://u:p@dst/db",
+            "--skip-verify",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.skip_verify);
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::resume::{default_resume_path, CompletedStage, ResumeToken};
 use crate::sequences::sync_sequences;
 use crate::snapshot::prepare_replication_slot;
 use crate::tls::connect_with_sslmode;
+use crate::verify::verify_row_counts;
 
 /// High-level migration driver.
 #[derive(Debug)]
@@ -96,6 +97,27 @@ impl Migrator {
     /// migration.
     pub async fn run(&self, cancel: CancellationToken) -> Result<MigrationOutcome> {
         self.config.validate()?;
+
+        // Standalone verify mode: a read-only count comparison. It skips the
+        // offline/online preflight bundles (which create the target DB and are
+        // irrelevant to a read-only compare) and is always strict — a mismatch
+        // is fatal and yields a non-zero exit.
+        if self.config.mode == MigrationMode::Verify {
+            let report = verify_row_counts(&self.config).await?;
+            self.report(MigrationStage::Verify, report.summary_line())
+                .await;
+            if !report.is_ok() {
+                return Err(MigrationError::config(format!(
+                    "verification failed: {}",
+                    report.summary_line()
+                )));
+            }
+            return Ok(MigrationOutcome {
+                stats: None,
+                dump_path: std::path::PathBuf::new(),
+            });
+        }
+
         // Preflight checks open DB connections that can hang on firewall /
         // network issues. Race them against the cancel token so SIGINT is
         // honoured immediately rather than waiting for the OS connect timeout.
@@ -105,6 +127,10 @@ impl Migrator {
                 match self.config.mode {
                     MigrationMode::Offline => run_offline_preflight(&self.config).await,
                     MigrationMode::Online => run_online_preflight(&self.config).await,
+                    // Verify is handled by the early return above and never
+                    // reaches this match; delegate to the offline preflight to
+                    // keep the match exhaustive without a panic.
+                    MigrationMode::Verify => run_offline_preflight(&self.config).await,
                 }
             } => res?,
         };
@@ -114,6 +140,10 @@ impl Migrator {
         match self.config.mode {
             MigrationMode::Offline => self.run_offline(cancel).await,
             MigrationMode::Online => self.run_online(cancel).await,
+            // Verify is handled by the early return above and never reaches
+            // this match; delegate to the offline path to keep the match
+            // exhaustive without a panic.
+            MigrationMode::Verify => self.run_offline(cancel).await,
         }
     }
 
@@ -160,6 +190,8 @@ impl Migrator {
         }
 
         self.run_target_analyze_stage(&mut token, &dump_path).await;
+
+        self.run_verify_stage().await?;
 
         self.report(MigrationStage::Complete, "offline migration finished")
             .await;
@@ -398,6 +430,8 @@ impl Migrator {
             }
         }
 
+        self.run_verify_stage().await?;
+
         // 6. Post-cutover cleanup: drop auto-created publication and slot.
         if stats.cutover_triggered {
             cleanup_source_after_cutover(
@@ -622,6 +656,27 @@ impl Migrator {
         }
     }
 
+    /// Run the row-count verification step. Reports a summary. On mismatch:
+    /// warns (default) or returns an error when `verify_strict` is set.
+    /// Skipped entirely when `skip_verify` is set.
+    async fn run_verify_stage(&self) -> Result<()> {
+        if self.config.skip_verify {
+            self.report(MigrationStage::Verify, "skipped (--skip-verify)")
+                .await;
+            return Ok(());
+        }
+        let report = verify_row_counts(&self.config).await?;
+        self.report(MigrationStage::Verify, report.summary_line())
+            .await;
+        if !report.is_ok() && self.config.verify_strict {
+            return Err(MigrationError::config(format!(
+                "verification failed: {} — see warnings above",
+                report.summary_line()
+            )));
+        }
+        Ok(())
+    }
+
     async fn report(&self, stage: MigrationStage, message: impl Into<String>) {
         self.reporter
             .report(ProgressEvent::new(stage, message.into()))
@@ -738,6 +793,7 @@ mod tests {
             target: EndpointConfig::parse("postgres://u:p@dst/db").unwrap(),
             skip_analyze: true,
             skip_source_vacuum: true,
+            skip_verify: true,
             ..MigrationConfig::default()
         }
     }

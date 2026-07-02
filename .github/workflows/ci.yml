@@ -322,6 +322,66 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
 
+  integration-offline-verify:
+    name: Integration test (offline, auto row-count verify after restore)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-integration
+
+      - name: Run offline verify e2e
+        run: bash tests/integration/run_offline_verify.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  integration-verify-mode:
+    name: Integration test (--mode verify, clean match exits 0 / drift exits non-zero)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-integration
+
+      - name: Run verify-mode e2e
+        run: bash tests/integration/run_verify_mode.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  integration-online-verify:
+    name: Integration test (online, auto row-count verify after cutover)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-integration
+
+      - name: Run online verify e2e
+        run: bash tests/integration/run_online_verify.sh
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
   publish:
     name: Publish to crates.io
     if: startsWith(github.ref, 'refs/tags/v')
@@ -341,6 +401,9 @@ jobs:
       - integration-online-sequence-sync
       - integration-online-auto-pub-lifecycle
       - integration-online-keep-slot
+      - integration-offline-verify
+      - integration-verify-mode
+      - integration-online-verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
