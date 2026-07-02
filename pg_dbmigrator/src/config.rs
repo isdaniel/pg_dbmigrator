@@ -124,6 +124,12 @@ pub struct MigrationConfig {
     /// just recently run maintenance manually.
     #[serde(default)]
     pub skip_source_vacuum: bool,
+    /// Controls the automatic post-restore row-count verification step:
+    /// `Off` skips it, `Warn` (default) logs mismatches and continues, and
+    /// `Strict` treats a mismatch as a hard error (non-zero exit). Ignored
+    /// when `mode == Verify`, which is always strict.
+    #[serde(default)]
+    pub verify: VerifyMode,
     /// If `true`, attempt to resume a previous run by reading the
     /// resume token at [`Self::resume_file`] (default
     /// `<dump_path>.resume.json`). Stages already marked complete in the
@@ -196,6 +202,7 @@ impl Default for MigrationConfig {
             no_table_access_method: false,
             skip_analyze: false,
             skip_source_vacuum: false,
+            verify: VerifyMode::default(),
             resume: false,
             resume_file: None,
             dump_path: None,
@@ -239,6 +246,22 @@ pub enum MigrationMode {
     /// Snapshot-based `pg_dump` + `pg_restore` followed by ongoing logical
     /// replication apply through `pg_walstream`.
     Online,
+    /// Compare per-table row counts between source and target only. No dump,
+    /// restore, or replication. Exits non-zero on any mismatch.
+    Verify,
+}
+
+/// Controls the automatic post-migration row-count verification step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyMode {
+    /// Skip verification entirely.
+    Off,
+    /// Run verification; log a warning on any mismatch but continue. Default.
+    #[default]
+    Warn,
+    /// Run verification; a mismatch is a hard error (non-zero exit).
+    Strict,
 }
 
 /// Choose what kind of dump to produce.
@@ -982,6 +1005,28 @@ mod tests {
         let cfg2: MigrationConfig = serde_json::from_str(&json).unwrap();
         assert!(cfg2.skip_analyze);
         assert!(cfg2.skip_source_vacuum);
+    }
+
+    #[test]
+    fn migration_config_default_verify_is_warn() {
+        let cfg = MigrationConfig::default();
+        assert_eq!(cfg.verify, VerifyMode::Warn);
+    }
+
+    #[test]
+    fn verify_mode_serde_roundtrip() {
+        for mode in [VerifyMode::Off, VerifyMode::Warn, VerifyMode::Strict] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: VerifyMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, mode);
+        }
+    }
+
+    #[test]
+    fn migration_mode_verify_serde_roundtrip() {
+        let json = serde_json::to_string(&MigrationMode::Verify).unwrap();
+        let back: MigrationMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MigrationMode::Verify);
     }
 
     #[test]

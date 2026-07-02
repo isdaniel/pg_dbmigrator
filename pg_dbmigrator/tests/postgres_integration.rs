@@ -1214,3 +1214,437 @@ async fn online_slot_handoff_survives_dump_phase() {
         .batch_execute(&format!("DROP PUBLICATION IF EXISTS {}", publication))
         .await;
 }
+
+// ─── verify::verify_row_counts + Migrator verify mode ────────────────────────
+
+use pg_dbmigrator::{EndpointConfig, MigrationConfig, MigrationMode};
+use tokio_util::sync::CancellationToken;
+
+/// Build a `MigrationConfig` in verify mode from the two live URLs, optionally
+/// restricted to a single schema so cross-test tables don't interfere.
+fn verify_config(source: &str, target: &str, schemas: Vec<String>) -> MigrationConfig {
+    MigrationConfig {
+        mode: MigrationMode::Verify,
+        source: EndpointConfig::parse(source).expect("parse source url"),
+        target: EndpointConfig::parse(target).expect("parse target url"),
+        schemas,
+        ..MigrationConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn verify_row_counts_ok_when_counts_match() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    let target = connect_with_sslmode(&target_url_val).await.unwrap();
+
+    let ddl = "CREATE TABLE IF NOT EXISTS public.vrc_match_t (id int PRIMARY KEY); \
+               INSERT INTO public.vrc_match_t VALUES (1), (2), (3);";
+    source
+        .batch_execute("DROP TABLE IF EXISTS public.vrc_match_t")
+        .await
+        .ok();
+    target
+        .batch_execute("DROP TABLE IF EXISTS public.vrc_match_t")
+        .await
+        .ok();
+    source.batch_execute(ddl).await.unwrap();
+    target.batch_execute(ddl).await.unwrap();
+
+    let cfg = verify_config(&source_url_val, &target_url_val, vec!["public".to_string()]);
+    let report = pg_dbmigrator::verify::verify_row_counts(&cfg, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(report.is_ok(), "expected all tables to match");
+    let ours = report
+        .rows()
+        .iter()
+        .find(|r| r.table == "vrc_match_t")
+        .expect("our table should be in the report");
+    assert_eq!(ours.source, 3);
+    assert_eq!(ours.target, 3);
+
+    source
+        .batch_execute("DROP TABLE IF EXISTS public.vrc_match_t")
+        .await
+        .ok();
+    target
+        .batch_execute("DROP TABLE IF EXISTS public.vrc_match_t")
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn verify_row_counts_reports_mismatch_on_drift() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    let target = connect_with_sslmode(&target_url_val).await.unwrap();
+
+    let schema = "vrc_drift_s";
+    let ddl = |extra: &str| {
+        format!(
+            "CREATE SCHEMA IF NOT EXISTS {schema}; \
+             CREATE TABLE IF NOT EXISTS {schema}.t (id int PRIMARY KEY); \
+             INSERT INTO {schema}.t VALUES (1), (2){extra};"
+        )
+    };
+    source
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+    target
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+    source.batch_execute(&ddl("")).await.unwrap();
+    // Target has an extra row → drift.
+    target.batch_execute(&ddl(", (3)")).await.unwrap();
+
+    let cfg = verify_config(&source_url_val, &target_url_val, vec![schema.to_string()]);
+    let report = pg_dbmigrator::verify::verify_row_counts(&cfg, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(!report.is_ok(), "expected a mismatch");
+    assert_eq!(report.mismatches().len(), 1);
+
+    source
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+    target
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn verify_row_counts_reports_missing_target_table_as_mismatch() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    let target = connect_with_sslmode(&target_url_val).await.unwrap();
+
+    // Source has the table in a dedicated schema; target lacks the schema
+    // entirely (exercises the UNDEFINED_SCHEMA/UNDEFINED_TABLE branch).
+    let schema = "vrc_missing_s";
+    source
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+    target
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+    source
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema}; \
+             CREATE TABLE {schema}.only_on_source (id int PRIMARY KEY); \
+             INSERT INTO {schema}.only_on_source VALUES (1), (2);"
+        ))
+        .await
+        .unwrap();
+
+    let cfg = verify_config(&source_url_val, &target_url_val, vec![schema.to_string()]);
+    // Missing target table must be reported as a mismatch (target=0), not error.
+    let report = pg_dbmigrator::verify::verify_row_counts(&cfg, &CancellationToken::new())
+        .await
+        .expect("missing target table should not be a hard error");
+    let ours = report
+        .rows()
+        .iter()
+        .find(|r| r.table == "only_on_source")
+        .expect("our source-only table should be listed");
+    assert_eq!(ours.source, 2);
+    // Missing target table is flagged with the -1 sentinel (never a real
+    // count(*)), so it always mismatches — even against an empty source.
+    assert_eq!(ours.target, -1);
+    assert_eq!(report.mismatches().len(), 1);
+
+    source
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn verify_row_counts_flags_empty_source_table_missing_on_target() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+
+    // A UNIQUE schema with an EMPTY table (0 rows) on the SOURCE only. With the
+    // old `0` sentinel this read as 0 (source) == 0 (missing target) → a false
+    // MATCH; with the `-1` sentinel the missing table always mismatches.
+    let schema = format!("vrc_empty_missing_{}", std::process::id());
+    source
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+    source
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema}; \
+             CREATE TABLE {schema}.empty_only_on_source (id int PRIMARY KEY);"
+        ))
+        .await
+        .unwrap();
+
+    let cfg = verify_config(&source_url_val, &target_url_val, vec![schema.clone()]);
+    let report = pg_dbmigrator::verify::verify_row_counts(&cfg, &CancellationToken::new())
+        .await
+        .expect("missing target table should not be a hard error");
+    assert!(
+        !report.is_ok(),
+        "empty source table missing on target must be flagged as a mismatch"
+    );
+
+    source
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn verify_row_counts_handles_schema_with_dot() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    let target = connect_with_sslmode(&target_url_val).await.unwrap();
+
+    // A schema name containing a literal dot must be quoted. This exercises
+    // the rsplit_once path: split on the LAST '.' so `"ten.ant".t` resolves
+    // to schema="ten.ant", table="t" (both label and query target it).
+    let ddl = "CREATE SCHEMA IF NOT EXISTS \"ten.ant\"; \
+               CREATE TABLE IF NOT EXISTS \"ten.ant\".t (id int PRIMARY KEY); \
+               INSERT INTO \"ten.ant\".t VALUES (1), (2), (3);";
+    source
+        .batch_execute("DROP SCHEMA IF EXISTS \"ten.ant\" CASCADE")
+        .await
+        .ok();
+    target
+        .batch_execute("DROP SCHEMA IF EXISTS \"ten.ant\" CASCADE")
+        .await
+        .ok();
+    source.batch_execute(ddl).await.unwrap();
+    target.batch_execute(ddl).await.unwrap();
+
+    let cfg = verify_config(
+        &source_url_val,
+        &target_url_val,
+        vec!["ten.ant".to_string()],
+    );
+    let report = pg_dbmigrator::verify::verify_row_counts(&cfg, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(report.is_ok(), "expected all tables to match");
+    let ours = report
+        .rows()
+        .iter()
+        .find(|r| r.schema == "ten.ant" && r.table == "t")
+        .expect("dotted-schema table should be in the report");
+    assert_eq!(ours.source, 3);
+    assert_eq!(ours.target, 3);
+
+    source
+        .batch_execute("DROP SCHEMA IF EXISTS \"ten.ant\" CASCADE")
+        .await
+        .ok();
+    target
+        .batch_execute("DROP SCHEMA IF EXISTS \"ten.ant\" CASCADE")
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn verify_row_counts_errs_when_cancelled() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    // Ensure at least one source table exists so the loop body is reached.
+    let schema = "vrc_cancel_s";
+    source
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+    source
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema}; \
+             CREATE TABLE {schema}.t (id int PRIMARY KEY); \
+             INSERT INTO {schema}.t VALUES (1);"
+        ))
+        .await
+        .unwrap();
+
+    let cfg = verify_config(&source_url_val, &target_url_val, vec![schema.to_string()]);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let err = pg_dbmigrator::verify::verify_row_counts(&cfg, &cancel)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, pg_dbmigrator::MigrationError::Cancelled),
+        "expected Cancelled, got {err:?}"
+    );
+
+    source
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .await
+        .ok();
+}
+
+// ─── preflight::verify_target_extensions_available (live) ────────────────────
+
+#[tokio::test]
+async fn verify_target_extensions_available_passes_on_vanilla() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+    // Both vanilla PG images ship plpgsql; the target has it available.
+    pg_dbmigrator::preflight::verify_target_extensions_available(&source_url_val, &target_url_val)
+        .await
+        .expect("plpgsql should be available on the target");
+}
+
+// ─── Migrator::run standalone verify mode ────────────────────────────────────
+
+#[tokio::test]
+async fn migrator_run_verify_ok_when_counts_match() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    let target = connect_with_sslmode(&target_url_val).await.unwrap();
+
+    let schema = "mrv_ok_s";
+    let ddl = format!(
+        "CREATE SCHEMA IF NOT EXISTS {schema}; \
+         CREATE TABLE IF NOT EXISTS {schema}.t (id int PRIMARY KEY); \
+         INSERT INTO {schema}.t VALUES (1), (2);"
+    );
+    for c in [&source, &target] {
+        c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await
+            .ok();
+        c.batch_execute(&ddl).await.unwrap();
+    }
+
+    let cfg = verify_config(&source_url_val, &target_url_val, vec![schema.to_string()]);
+    let outcome = pg_dbmigrator::Migrator::new(cfg)
+        .run(CancellationToken::new())
+        .await;
+    assert!(outcome.is_ok(), "verify run should succeed: {outcome:?}");
+
+    for c in [&source, &target] {
+        c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await
+            .ok();
+    }
+}
+
+#[tokio::test]
+async fn migrator_run_verify_errs_on_drift() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    let target = connect_with_sslmode(&target_url_val).await.unwrap();
+
+    let schema = "mrv_drift_s";
+    let base = format!(
+        "CREATE SCHEMA IF NOT EXISTS {schema}; \
+         CREATE TABLE IF NOT EXISTS {schema}.t (id int PRIMARY KEY);"
+    );
+    for c in [&source, &target] {
+        c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await
+            .ok();
+        c.batch_execute(&base).await.unwrap();
+    }
+    source
+        .batch_execute(&format!("INSERT INTO {schema}.t VALUES (1), (2)"))
+        .await
+        .unwrap();
+    target
+        .batch_execute(&format!("INSERT INTO {schema}.t VALUES (1)"))
+        .await
+        .unwrap();
+
+    let cfg = verify_config(&source_url_val, &target_url_val, vec![schema.to_string()]);
+    let outcome = pg_dbmigrator::Migrator::new(cfg)
+        .run(CancellationToken::new())
+        .await;
+    assert!(outcome.is_err(), "verify run should fail on drift");
+
+    for c in [&source, &target] {
+        c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await
+            .ok();
+    }
+}
+
+#[tokio::test]
+async fn migrator_offline_run_covers_auto_verify() {
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    let target = connect_with_sslmode(&target_url_val).await.unwrap();
+
+    // Dedicated unique schema so the scoped offline dump/restore doesn't
+    // touch (or race with) objects other tests are using.
+    let schema = "moff_verify_s";
+    for c in [&source, &target] {
+        c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await
+            .ok();
+    }
+    source
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema}; \
+             CREATE TABLE {schema}.t (id int PRIMARY KEY, v text); \
+             INSERT INTO {schema}.t VALUES (1, 'a'), (2, 'b'), (3, 'c');"
+        ))
+        .await
+        .unwrap();
+
+    // Full offline migration scoped to our schema. verify=Warn so the
+    // auto verify step (run_offline -> run_verify_stage -> verify_row_counts)
+    // is exercised end-to-end. jobs:1 keeps it a single custom-format dump.
+    let cfg = MigrationConfig {
+        mode: MigrationMode::Offline,
+        source: EndpointConfig::parse(&source_url_val).unwrap(),
+        target: EndpointConfig::parse(&target_url_val).unwrap(),
+        verify: pg_dbmigrator::VerifyMode::Warn,
+        jobs: 1,
+        schemas: vec![schema.to_string()],
+        ..MigrationConfig::default()
+    };
+
+    let outcome = pg_dbmigrator::Migrator::new(cfg)
+        .run(CancellationToken::new())
+        .await;
+    assert!(
+        outcome.is_ok(),
+        "offline migration with auto verify should succeed: {outcome:?}"
+    );
+
+    // Restore reproduced the rows on the target.
+    let row = target
+        .query_one(&format!("SELECT count(*) FROM {schema}.t"), &[])
+        .await
+        .unwrap();
+    let n: i64 = row.get(0);
+    assert_eq!(n, 3, "target should have the 3 restored rows");
+
+    for c in [&source, &target] {
+        c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await
+            .ok();
+    }
+}

@@ -49,6 +49,12 @@ Validate → SourceVacuum → PrepareSnapshot → Dump → Restore → Analyze �
 * `SourceCleanup` (after cutover) drops auto-created publications and
   replication slots on the source — see the next section.
 
+Online mode does **not** run an automatic row-count verification. Cutover
+stops the apply worker but does not freeze source writes, so an automatic
+`count(*)` compare would show spurious mismatches (readiness is signalled by
+the lag heartbeat, not row counts). Verify manually once the source is
+quiesced — see [Verify](#verify).
+
 ## Install / build
 
 ```bash
@@ -75,6 +81,11 @@ By default, `VACUUM ANALYZE` runs on the source before `pg_dump` and
 `ANALYZE` runs on the target after `pg_restore`. Disable with
 `--skip-source-vacuum` / `--skip-analyze` if you manage maintenance
 externally.
+
+Before the dump runs, offline migrations also pre-flight the target role's
+privileges and extension availability (source extensions must be installable
+on the target), so a misconfigured target fails fast with a clear error
+instead of stalling inside `pg_restore`.
 
 ### Online
 
@@ -109,8 +120,9 @@ pg_dbmigrator \
 ```
 
 Before the dump runs, the migrator pre-flights the source:
-`wal_level = 'logical'`, `max_replication_slots > 0`, and
-`max_wal_senders > 0`. A misconfigured source fails fast with a clear
+`wal_level = 'logical'`, `max_replication_slots > 0`,
+`max_wal_senders > 0`, and extension availability (source extensions must be
+installable on the target). A misconfigured source fails fast with a clear
 error instead of stalling later inside `CREATE_REPLICATION_SLOT`.
 
 At cutover, the migrator runs `setval(...)` on every sequence in the
@@ -130,6 +142,33 @@ pg_dbmigrator --mode offline \
     --exclude-schema audit \
     --exclude-table public.large_log
 ```
+
+### Verify
+
+Compare per-table row counts between source and target.
+
+In **offline** mode this runs automatically after restore; a mismatch is
+logged as a warning by default. Use `--verify strict` to make a mismatch a
+hard error (non-zero exit) for CI, or `--verify off` to skip the step.
+
+In **online** mode verification is **manual**, not automatic. Online cutover
+stops the apply worker but does not freeze source writes, so an automatic
+row-count compare would almost always show a spurious mismatch — readiness is
+signalled by the lag heartbeat (`CaughtUp`), not by row counts. Once the
+operator has quiesced source writes and lag has drained, run verification
+explicitly with `--mode verify` (below).
+
+Standalone (read-only, no dump/restore) — always exits non-zero on mismatch:
+
+```bash
+pg_dbmigrator --mode verify \
+    --source 'postgres://user:pw@src/db' \
+    --target 'postgres://user:pw@dst/db' \
+    --schema app
+```
+
+Honours `--schema` / `--table` / `--exclude-schema` / `--exclude-table` so the
+verified object set matches what you migrated.
 
 ## Publication / replication resource lifecycle
 
@@ -202,6 +241,7 @@ only when you have a specific reason.
 | Auto-detect `--jobs` | `--jobs N` | Clamps to `[1, 8]` based on host CPU count. |
 | Pre-dump `VACUUM ANALYZE` | `--skip-source-vacuum` | Clean heap pages + fresh stats before dump. |
 | Post-restore `ANALYZE` | `--skip-analyze` | Fresh planner stats on target immediately after restore. |
+| Row-count verify | `--verify <off\|warn\|strict>` | Governs the **offline** auto verify step (per-table `count(*)`, source vs target, after restore). `off` skips it; `warn` (default) logs mismatches and continues; `strict` makes a mismatch a hard (non-zero exit) error. Online mode has no auto verify — verify manually via `--mode verify`. |
 
 ## Benchmark
 

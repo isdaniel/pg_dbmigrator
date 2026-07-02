@@ -7,7 +7,7 @@ use clap::{Parser, ValueEnum};
 use pg_dbmigrator::config::{default_jobs, DumpScope};
 use pg_dbmigrator::{
     CutoverConfig, EndpointConfig, MigrationConfig, MigrationMode, OnlineOptions,
-    ReplicationApplyConfig,
+    ReplicationApplyConfig, VerifyMode,
 };
 
 /// pg_dbmigrator — PostgreSQL → PostgreSQL database migration tool.
@@ -227,6 +227,12 @@ pub struct Cli {
     #[arg(long)]
     pub skip_source_vacuum: bool,
 
+    /// Post-migration row-count verification behaviour. `off` skips it;
+    /// `warn` (default) logs mismatches and continues; `strict` makes a
+    /// mismatch a hard error (non-zero exit). `--mode verify` is always strict.
+    #[arg(long, value_enum, default_value_t = VerifyModeArg::Warn)]
+    pub verify: VerifyModeArg,
+
     /// Verbose logging.
     #[arg(long)]
     pub verbose: bool,
@@ -244,6 +250,7 @@ pub struct Cli {
 pub enum ModeArg {
     Offline,
     Online,
+    Verify,
 }
 
 impl From<ModeArg> for MigrationMode {
@@ -251,6 +258,7 @@ impl From<ModeArg> for MigrationMode {
         match value {
             ModeArg::Offline => MigrationMode::Offline,
             ModeArg::Online => MigrationMode::Online,
+            ModeArg::Verify => MigrationMode::Verify,
         }
     }
 }
@@ -269,6 +277,27 @@ impl From<DumpScopeArg> for DumpScope {
             DumpScopeArg::All => DumpScope::All,
             DumpScopeArg::SchemaOnly => DumpScope::SchemaOnly,
             DumpScopeArg::DataOnly => DumpScope::DataOnly,
+        }
+    }
+}
+
+/// CLI-friendly mirror of [`VerifyMode`].
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum VerifyModeArg {
+    /// Skip verification entirely.
+    Off,
+    /// Run verification; warn on mismatch and continue (default).
+    Warn,
+    /// Run verification; a mismatch is a hard error (non-zero exit).
+    Strict,
+}
+
+impl From<VerifyModeArg> for VerifyMode {
+    fn from(value: VerifyModeArg) -> Self {
+        match value {
+            VerifyModeArg::Off => VerifyMode::Off,
+            VerifyModeArg::Warn => VerifyMode::Warn,
+            VerifyModeArg::Strict => VerifyMode::Strict,
         }
     }
 }
@@ -330,6 +359,7 @@ impl Cli {
             no_table_access_method: self.no_table_access_method,
             skip_analyze: self.skip_analyze,
             skip_source_vacuum: self.skip_source_vacuum,
+            verify: self.verify.into(),
         })
     }
 }
@@ -771,6 +801,54 @@ mod tests {
         ]);
         let cfg = cli.into_config().unwrap();
         assert!(!cfg.online.drop_slot_on_cutover);
+    }
+
+    #[test]
+    fn into_config_verify_mode_strict() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "verify",
+            "--source",
+            "postgres://u:p@src/db",
+            "--target",
+            "postgres://u:p@dst/db",
+            "--verify",
+            "strict",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.mode, pg_dbmigrator::MigrationMode::Verify);
+        assert_eq!(cfg.verify, VerifyMode::Strict);
+    }
+
+    #[test]
+    fn into_config_verify_off() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--mode",
+            "offline",
+            "--source",
+            "postgres://u:p@src/db",
+            "--target",
+            "postgres://u:p@dst/db",
+            "--verify",
+            "off",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.verify, VerifyMode::Off);
+    }
+
+    #[test]
+    fn into_config_verify_defaults_to_warn() {
+        let cli = parse_args(&[
+            "pg_dbmigrator",
+            "--source",
+            "postgres://u:p@src/db",
+            "--target",
+            "postgres://u:p@dst/db",
+        ]);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.verify, VerifyMode::Warn);
     }
 
     #[test]

@@ -6,16 +6,17 @@
 
 **Modes**: `Offline` (pg_dump → pg_restore) | `Online` (slot+snapshot → dump → restore → CREATE SUBSCRIPTION → WAL apply → cutover)
 
-**Pipeline**: `Validate → SourceVacuum → PrepareSnapshot* → Dump → Restore → Analyze → StreamApply* → Lag* → CaughtUp* → Cutover* → SourceCleanup* → Complete`
-(`*` = online-only; SourceVacuum/Analyze skippable via `--skip-source-vacuum`/`--skip-analyze`)
+**Pipeline**: `Validate → SourceVacuum → PrepareSnapshot* → Dump → Restore → Analyze → StreamApply* → Lag* → CaughtUp* → Cutover* → SourceCleanup* → Complete` (offline also runs `Verify` after Analyze)
+(`*` = online-only; SourceVacuum/Analyze skippable via `--skip-source-vacuum`/`--skip-analyze`; `Verify` = offline auto-step + standalone `--mode verify`, controlled via `--verify <off|warn|strict>`; online does NOT auto-verify)
 
 ### Offline mode
 
-1. Pre-flight: verify pg_dump/pg_restore on PATH, validate config
+1. Pre-flight: verify pg_dump/pg_restore on PATH, validate config, check target-role privileges + extension availability (source extensions must be installable on the target)
 2. `VACUUM ANALYZE` on source (skip with `--skip-source-vacuum`)
 3. `pg_dump` (directory format, parallel `--jobs`, `--compress=lz4:1`)
 4. `pg_restore` — split-section by default (pre-data → data → post-data for index-free COPY)
 5. `ANALYZE` on target (skip with `--skip-analyze`)
+6. Row-count verify (`--verify <off|warn|strict>`, default `warn`)
 
 ### Online mode
 
@@ -28,6 +29,8 @@
 7. **Lag polling**: polls `pg_current_wal_flush_lsn()` on source every `poll_interval`, emits `Lag` heartbeat (lag_bytes, source_lsn, applied_lsn)
 8. **CaughtUp**: when lag ≤ `lag_threshold_bytes`, one-shot advisory event fires
 9. **Cutover**: operator presses Ctrl+C → sequence sync → source cleanup → done
+
+Online mode does **not** auto-verify. Cutover stops the apply worker but does not freeze source writes, so an automatic row-count compare would show spurious mismatches. Verify manually via `--mode verify` once the source is quiesced.
 
 ### Cutover logic
 
@@ -78,6 +81,7 @@ docker-compose.test.yml           # source :55432, target :55433
 | `progress.rs` | `ProgressReporter` trait + Tracing/Collecting impls |
 | `preflight.rs` | Source validation, `ensure_publication_exists` (auto-create) |
 | `sequences.rs` | Source→target setval at cutover (batched PL/pgSQL for single round-trip) |
+| `verify.rs` | Post-migration per-table row-count compare (source vs target); pure `VerifyReport` diff |
 | `resume.rs` | Resume token persistence |
 | `tls.rs` | TLS-aware connection helper |
 
@@ -88,6 +92,7 @@ docker-compose.test.yml           # source :55432, target :55433
 3. **Resume preserves replication origin**: subscription is disabled/re-enabled (not dropped/recreated) to avoid duplicate-key violations.
 4. **Sequence sync at cutover**: migrator runs setval() on all target sequences after cutover.
 5. **Publication lifecycle**: auto-created publications are tracked (`pub_auto_created`) and dropped after cutover; pre-existing ones are never dropped.
+6. **Verify is offline-auto + manual**: OFFLINE mode auto-verifies after restore; ONLINE mode does NOT auto-verify (cutover doesn't freeze source writes, so counts race). Online verification is manual via standalone `--mode verify` once the source is quiesced.
 
 ### Performance optimizations
 
@@ -162,6 +167,8 @@ docker-compose.test.yml           # source :55432, target :55433
 | `run_offline_resume.sh` | Cancel + resume token |
 | `run_offline_sigint_cancel.sh` | SIGINT mid-dump → fast cancel |
 | `run_offline_analyze.sh` | VACUUM ANALYZE + ANALYZE |
+| `run_offline_verify.sh` | Offline row-count verify after restore |
+| `run_verify_mode.sh` | Standalone `--mode verify` (read-only, strict) |
 | `run_online.sh` | Full online: two CaughtUp + cutover |
 | `run_online_updates.sh` | DML during dump+restore |
 | `run_online_sustained.sh` | 60s mutations + equality gate |
