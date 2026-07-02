@@ -115,6 +115,8 @@ OFFLINE_TESTS=(
     tests/integration/run_offline_resume.sh
     tests/integration/run_offline_sigint_cancel.sh
     tests/integration/run_offline_analyze.sh
+    tests/integration/run_offline_verify.sh
+    tests/integration/run_verify_mode.sh
 )
 
 ONLINE_TESTS=(
@@ -127,6 +129,7 @@ ONLINE_TESTS=(
     tests/integration/run_online_sequence_sync.sh
     tests/integration/run_online_auto_pub_lifecycle.sh
     tests/integration/run_online_keep_slot.sh
+    tests/integration/run_online_verify.sh
 )
 
 case "$FILTER" in

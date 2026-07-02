@@ -40,6 +40,8 @@ pub enum MigrationStage {
     /// Post-cutover cleanup of auto-created publications and replication slots
     /// on the source.
     SourceCleanup,
+    /// Post-migration row-count verification (source vs target).
+    Verify,
     /// All work completed.
     Complete,
 }
@@ -261,6 +263,7 @@ mod tests {
             MigrationStage::CaughtUp,
             MigrationStage::Cutover,
             MigrationStage::SourceCleanup,
+            MigrationStage::Verify,
             MigrationStage::Complete,
         ];
         for stage in stages {

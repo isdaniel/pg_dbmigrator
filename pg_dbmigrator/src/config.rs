@@ -124,6 +124,15 @@ pub struct MigrationConfig {
     /// just recently run maintenance manually.
     #[serde(default)]
     pub skip_source_vacuum: bool,
+    /// Skip the automatic post-restore row-count verification step. Default
+    /// `false` (verification runs). Ignored when `mode == Verify`.
+    #[serde(default)]
+    pub skip_verify: bool,
+    /// Treat a verification mismatch during a migration as a hard error
+    /// (non-zero exit) instead of a warning. Default `false`. Standalone
+    /// `--mode verify` is always strict regardless of this flag.
+    #[serde(default)]
+    pub verify_strict: bool,
     /// If `true`, attempt to resume a previous run by reading the
     /// resume token at [`Self::resume_file`] (default
     /// `<dump_path>.resume.json`). Stages already marked complete in the
@@ -196,6 +205,8 @@ impl Default for MigrationConfig {
             no_table_access_method: false,
             skip_analyze: false,
             skip_source_vacuum: false,
+            skip_verify: false,
+            verify_strict: false,
             resume: false,
             resume_file: None,
             dump_path: None,
@@ -239,6 +250,9 @@ pub enum MigrationMode {
     /// Snapshot-based `pg_dump` + `pg_restore` followed by ongoing logical
     /// replication apply through `pg_walstream`.
     Online,
+    /// Compare per-table row counts between source and target only. No dump,
+    /// restore, or replication. Exits non-zero on any mismatch.
+    Verify,
 }
 
 /// Choose what kind of dump to produce.
@@ -982,6 +996,20 @@ mod tests {
         let cfg2: MigrationConfig = serde_json::from_str(&json).unwrap();
         assert!(cfg2.skip_analyze);
         assert!(cfg2.skip_source_vacuum);
+    }
+
+    #[test]
+    fn migration_config_default_verify_flags_off() {
+        let cfg = MigrationConfig::default();
+        assert!(!cfg.skip_verify);
+        assert!(!cfg.verify_strict);
+    }
+
+    #[test]
+    fn migration_mode_verify_serde_roundtrip() {
+        let json = serde_json::to_string(&MigrationMode::Verify).unwrap();
+        let back: MigrationMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MigrationMode::Verify);
     }
 
     #[test]

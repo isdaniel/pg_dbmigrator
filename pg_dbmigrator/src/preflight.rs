@@ -984,6 +984,58 @@ pub(crate) async fn verify_target_role_privileges_with_probe<P: PreflightProbe +
     Ok(())
 }
 
+/// Pure decision: every extension installed on the source must be available
+/// (installable) on the target, else `pg_restore`'s `CREATE EXTENSION` fails
+/// partway through the restore. Returns the missing extension names in the
+/// error so the operator can install the matching `-contrib` package.
+pub(crate) fn decide_extensions_available(
+    source_installed: &[String],
+    target_available: &[String],
+) -> Result<()> {
+    let available: std::collections::HashSet<&str> =
+        target_available.iter().map(|s| s.as_str()).collect();
+    let missing: Vec<&str> = source_installed
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|e| !available.contains(e))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(MigrationError::config(format!(
+        "the source has extension(s) not available on the target: {}. \
+         Install the matching package(s) on the target (e.g. \
+         `postgresql-<major>-<ext>` / the extension's contrib package) so \
+         `pg_restore`'s CREATE EXTENSION succeeds, or exclude the objects \
+         that depend on them.",
+        missing.join(", ")
+    )))
+}
+
+/// Verify every source-installed extension is installable on the target.
+pub async fn verify_target_extensions_available(
+    source_conn: &str,
+    target_conn: &str,
+) -> Result<()> {
+    let source = connect_with_sslmode(source_conn).await?;
+    let target = connect_with_sslmode(target_conn).await?;
+    let installed: Vec<String> = source
+        .query("SELECT extname::text FROM pg_extension", &[])
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let available: Vec<String> = target
+        .query("SELECT name::text FROM pg_available_extensions", &[])
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    decide_extensions_available(&installed, &available)?;
+    info!("all source extensions are available on the target");
+    Ok(())
+}
+
 impl PreflightReport {
     pub fn names(&self) -> Vec<&'static str> {
         self.items.iter().map(|(n, _)| *n).collect()
@@ -1004,6 +1056,7 @@ pub fn offline_preflight_check_names() -> &'static [&'static str] {
         "target_not_in_recovery",
         "target_db_exists",
         "target_role_privs",
+        "extensions_available",
     ]
 }
 
@@ -1019,6 +1072,7 @@ pub fn online_preflight_check_names() -> &'static [&'static str] {
         "target_not_in_recovery",
         "target_db_exists",
         "target_role_privs",
+        "extensions_available",
         "source_logical_repl",
         "target_sub_capacity",
         "pglogical_clean",
@@ -1052,6 +1106,13 @@ pub async fn run_offline_preflight(
     verify_target_role_privileges(&cfg.target.connection_string, MigrationMode::Offline).await?;
     report.record("target_role_privs", PreflightOutcome::Pass);
 
+    verify_target_extensions_available(
+        &cfg.source.connection_string,
+        &cfg.target.connection_string,
+    )
+    .await?;
+    report.record("extensions_available", PreflightOutcome::Pass);
+
     Ok(report)
 }
 
@@ -1080,6 +1141,13 @@ pub async fn run_online_preflight(cfg: &crate::config::MigrationConfig) -> Resul
     verify_target_role_privileges(&cfg.target.connection_string, MigrationMode::Online).await?;
     report.record("target_role_privs", PreflightOutcome::Pass);
 
+    verify_target_extensions_available(
+        &cfg.source.connection_string,
+        &cfg.target.connection_string,
+    )
+    .await?;
+    report.record("extensions_available", PreflightOutcome::Pass);
+
     verify_source_logical_replication_ready(&cfg.source.connection_string).await?;
     report.record("source_logical_repl", PreflightOutcome::Pass);
 
@@ -1096,6 +1164,28 @@ pub async fn run_online_preflight(cfg: &crate::config::MigrationConfig) -> Resul
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn extensions_ok_when_all_available_on_target() {
+        let src = vec!["plpgsql".to_string(), "postgis".to_string()];
+        let tgt = vec![
+            "plpgsql".to_string(),
+            "postgis".to_string(),
+            "hstore".to_string(),
+        ];
+        assert!(decide_extensions_available(&src, &tgt).is_ok());
+    }
+
+    #[test]
+    fn extensions_error_names_missing_extension() {
+        let src = vec!["plpgsql".to_string(), "timescaledb".to_string()];
+        let tgt = vec!["plpgsql".to_string()];
+        let err = decide_extensions_available(&src, &tgt).unwrap_err();
+        match err {
+            MigrationError::Config(msg) => assert!(msg.contains("timescaledb")),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
 
     fn ok_status() -> ExitStatus {
         ExitStatus::from_raw(0)
@@ -1688,6 +1778,7 @@ mod tests {
                 "target_not_in_recovery",
                 "target_db_exists",
                 "target_role_privs",
+                "extensions_available",
             ]
         );
     }
@@ -1704,6 +1795,7 @@ mod tests {
                 "target_not_in_recovery",
                 "target_db_exists",
                 "target_role_privs",
+                "extensions_available",
                 "source_logical_repl",
                 "target_sub_capacity",
                 "pglogical_clean",

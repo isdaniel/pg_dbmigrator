@@ -24,7 +24,7 @@ slot we created with `EXPORT_SNAPSHOT` before `pg_dump` ran.
 ### Online migration phases
 
 ```
-Validate → SourceVacuum → PrepareSnapshot → Dump → Restore → Analyze → StreamApply → (Lag heartbeat …) → CaughtUp → Cutover → SourceCleanup → Complete
+Validate → SourceVacuum → PrepareSnapshot → Dump → Restore → Analyze → StreamApply → (Lag heartbeat …) → CaughtUp → Cutover → SourceCleanup → Verify → Complete
 ```
 
 * `Validate` pre-flights the source (`wal_level = 'logical'`,
@@ -48,6 +48,10 @@ Validate → SourceVacuum → PrepareSnapshot → Dump → Restore → Analyze �
   `CaughtUp` event is emitted (“ready for cutover”).
 * `SourceCleanup` (after cutover) drops auto-created publications and
   replication slots on the source — see the next section.
+* `Verify` compares per-table `count(*)` between source and target once the
+  counts are stable. A mismatch is logged as a warning by default; pass
+  `--verify-strict` to make it a hard (non-zero exit) error, or `--skip-verify`
+  to skip the step.
 
 ## Install / build
 
@@ -75,6 +79,11 @@ By default, `VACUUM ANALYZE` runs on the source before `pg_dump` and
 `ANALYZE` runs on the target after `pg_restore`. Disable with
 `--skip-source-vacuum` / `--skip-analyze` if you manage maintenance
 externally.
+
+Before the dump runs, offline migrations also pre-flight the target role's
+privileges and extension availability (source extensions must be installable
+on the target), so a misconfigured target fails fast with a clear error
+instead of stalling inside `pg_restore`.
 
 ### Online
 
@@ -109,8 +118,9 @@ pg_dbmigrator \
 ```
 
 Before the dump runs, the migrator pre-flights the source:
-`wal_level = 'logical'`, `max_replication_slots > 0`, and
-`max_wal_senders > 0`. A misconfigured source fails fast with a clear
+`wal_level = 'logical'`, `max_replication_slots > 0`,
+`max_wal_senders > 0`, and extension availability (source extensions must be
+installable on the target). A misconfigured source fails fast with a clear
 error instead of stalling later inside `CREATE_REPLICATION_SLOT`.
 
 At cutover, the migrator runs `setval(...)` on every sequence in the
@@ -130,6 +140,25 @@ pg_dbmigrator --mode offline \
     --exclude-schema audit \
     --exclude-table public.large_log
 ```
+
+### Verify
+
+Compare per-table row counts between source and target. Runs automatically
+after restore (offline) and after cutover (online); a mismatch is logged as a
+warning by default. Use `--verify-strict` to make a mismatch a hard error
+(non-zero exit) for CI, or `--skip-verify` to skip the step.
+
+Standalone (read-only, no dump/restore) — always exits non-zero on mismatch:
+
+```bash
+pg_dbmigrator --mode verify \
+    --source 'postgres://user:pw@src/db' \
+    --target 'postgres://user:pw@dst/db' \
+    --schema app
+```
+
+Honours `--schema` / `--table` / `--exclude-schema` / `--exclude-table` so the
+verified object set matches what you migrated.
 
 ## Publication / replication resource lifecycle
 
@@ -202,6 +231,8 @@ only when you have a specific reason.
 | Auto-detect `--jobs` | `--jobs N` | Clamps to `[1, 8]` based on host CPU count. |
 | Pre-dump `VACUUM ANALYZE` | `--skip-source-vacuum` | Clean heap pages + fresh stats before dump. |
 | Post-restore `ANALYZE` | `--skip-analyze` | Fresh planner stats on target immediately after restore. |
+| Row-count verify | `--skip-verify` | Compare per-table `count(*)` source vs target; warn on mismatch. |
+| Verify warns only | `--verify-strict` | Make a verify mismatch a hard (non-zero exit) error. |
 
 ## Benchmark
 
