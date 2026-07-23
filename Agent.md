@@ -34,7 +34,7 @@ Online mode does **not** auto-verify. Cutover stops the apply worker but does no
 
 ### Cutover logic
 
-1. First Ctrl+C → `CutoverHandle::request()` → apply loop exits on next poll
+1. First Ctrl+C → `CutoverHandle::request()` → apply loop wakes immediately (Notify) and exits before its next lag poll
 2. `ALTER SUBSCRIPTION ... DISABLE` + `DROP SUBSCRIPTION` (unless `--keep-subscription`)
 3. `sync_sequences()` — setval() on all target sequences (PG logical replication doesn't replay nextval())
 4. Source cleanup: drop auto-created publication + drop slot (unless `--keep-slot`)
@@ -100,6 +100,7 @@ docker-compose.test.yml           # source :55432, target :55433
 - **Batched sequence sync**: `apply_sequences_to_target()` builds a single PL/pgSQL `DO` block with per-sequence exception handling, reducing N round-trips to 1. Falls back to individual statements if the batch fails.
 - **Split-section restore**: pre-data → data → post-data for index-free COPY (30-60% faster index rebuild).
 - **LZ4 compression**: default `lz4:1` for dump archives (fast compress/decompress).
+- **Instant cutover wake**: `CutoverHandle::request()` (SIGINT) sets an `AtomicBool` *and* fires a `tokio::sync::Notify`; the apply loop's poll `select!` parks on `cutover_handle.notified()` alongside its sleep, so cutover is acted on within the in-flight lag sample instead of after a full `poll_interval` (up to `fast_poll_interval`, ~1s). The `is_requested()` check runs *before* the next lag-sample round-trip, so no wasted network round-trip on cutover.
 
 ---
 
@@ -129,7 +130,7 @@ docker-compose.test.yml           # source :55432, target :55433
 
 6. **Contract with pg_walstream**
    - Slot creation before dump. START_REPLICATION only after dump.
-   - Pinned at `0.6.3` via workspace dep. Verify `ChangeEvent`/`EventType` compatibility before bumping.
+   - Pinned at `0.8.1` via workspace dep. Verify `ChangeEvent`/`EventType` compatibility before bumping.
    - Used functions: `quote_ident`, `quote_literal`, `parse_lsn`, `format_lsn`, `build_create_subscription_sql`, `build_disable_subscription_sql`, `build_detach_slot_sql`, `build_drop_subscription_sql`, `LogicalReplicationStream`, `ReplicationStreamConfig`, `CreateSubscriptionOptions`.
    - pg_walstream has NO publication SQL builders — publication SQL in `preflight.rs` is hand-rolled (necessary).
 
@@ -236,7 +237,7 @@ make integration                 # e2e, requires Docker
 - **Small workspace** — most files are 200–400 lines. Read the entire file before editing. Use grep to confirm blast radius.
 - **Validate after editing** — run `cargo test -p pg_dbmigrator` after every change.
 - **New stage / mode** → must update ALL of: `MigrationStage` enum, `Migrator` entry point, CLI args, README, and this file.
-- **pg_walstream** pinned at `0.6.3` via workspace dep. Do NOT vendor/fork — propose changes upstream.
+- **pg_walstream** pinned at `0.8.1` via workspace dep. Do NOT vendor/fork — propose changes upstream.
 - **Library/CLI boundary** — library returns `pg_dbmigrator::Result<T>` only. `anyhow` is CLI/examples only.
 - **Versions** — all dependency versions live in workspace `Cargo.toml` under `[workspace.dependencies]`. Crate manifests use `xxx.workspace = true`.
 
