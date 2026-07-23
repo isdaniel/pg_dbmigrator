@@ -552,6 +552,118 @@ async fn native_apply_with_cancel_exits_cleanly() {
         .ok();
 }
 
+// ─── Full online apply loop reaches the cutover break ────────────────────────
+
+/// Drives `run_native_apply` with cutover requested up front so the loop takes the `is_requested()` break path on its first iteration. This is the only  test that exercises the cutover branch (`stats.cutover_triggered = true` +  the `Cutover` progress event); the sibling cancel test asserts the opposite.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_apply_triggers_cutover_when_requested() {
+    use pg_dbmigrator::cutover::CutoverHandle;
+    use pg_dbmigrator::native_apply::{run_native_apply, SubscriptionLagProvider};
+    use pg_dbmigrator::progress::CollectingReporter;
+    use pg_dbmigrator::OnlineOptions;
+    use tokio_util::sync::CancellationToken;
+
+    let source_url_val = skip_without_pg!(source_url());
+    let target_url_val = skip_without_pg!(target_url());
+    let sub_source_url = skip_without_pg!(subscription_source_url());
+
+    let source = connect_with_sslmode(&source_url_val).await.unwrap();
+    let target = connect_with_sslmode(&target_url_val).await.unwrap();
+
+    source
+        .batch_execute("CREATE PUBLICATION integ_cutover_pub FOR ALL TABLES")
+        .await
+        .unwrap_or(());
+
+    let online = OnlineOptions {
+        slot_name: "integ_cutover_slot".into(),
+        publication: "integ_cutover_pub".into(),
+        subscription_name: "integ_cutover_sub".into(),
+        drop_subscription_on_cutover: true,
+        ..OnlineOptions::default()
+    };
+
+    source
+        .batch_execute(
+            "SELECT pg_create_logical_replication_slot('integ_cutover_slot', 'pgoutput')",
+        )
+        .await
+        .unwrap_or(());
+
+    // Always "caught up" so the loop never blocks on lag; cutover is what ends it.
+    #[derive(Debug)]
+    struct CaughtUpProvider;
+    #[async_trait::async_trait]
+    impl SubscriptionLagProvider for CaughtUpProvider {
+        async fn sample(&self) -> pg_dbmigrator::Result<(u64, u64)> {
+            Ok((100, 100))
+        }
+    }
+
+    let reporter = CollectingReporter::new();
+    let cutover = CutoverHandle::new();
+    // Request BEFORE the call: the first loop iteration must break via cutover.
+    assert!(!cutover.request());
+
+    let result = run_native_apply(
+        &target,
+        &CaughtUpProvider,
+        &online,
+        &sub_source_url,
+        cutover,
+        &reporter,
+        CancellationToken::new(),
+    )
+    .await;
+
+    match result {
+        Ok(stats) => {
+            assert!(
+                stats.cutover_triggered,
+                "loop should have exited via the cutover break path"
+            );
+        }
+        Err(e) => {
+            // Tolerated only for environments where CREATE SUBSCRIPTION can't
+            // establish (target can't reach source); the coverage CI can, so
+            // the Ok branch above is what exercises the cutover lines there.
+            let msg = e.to_string();
+            assert!(
+                msg.contains("subscription")
+                    || msg.contains("slot")
+                    || msg.contains("does not exist"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    // Cleanup
+    target
+        .batch_execute(
+            "DO $$ BEGIN \
+               IF EXISTS (SELECT 1 FROM pg_subscription WHERE subname = 'integ_cutover_sub') THEN \
+                 EXECUTE 'ALTER SUBSCRIPTION integ_cutover_sub DISABLE'; \
+                 EXECUTE 'ALTER SUBSCRIPTION integ_cutover_sub SET (slot_name = NONE)'; \
+                 EXECUTE 'DROP SUBSCRIPTION integ_cutover_sub'; \
+               END IF; \
+             END $$;",
+        )
+        .await
+        .ok();
+    source
+        .batch_execute(
+            "SELECT pg_drop_replication_slot(slot_name) \
+             FROM pg_replication_slots \
+             WHERE slot_name = 'integ_cutover_slot'",
+        )
+        .await
+        .ok();
+    source
+        .batch_execute("DROP PUBLICATION IF EXISTS integ_cutover_pub")
+        .await
+        .ok();
+}
+
 // ─── preflight::verify_pg_tools_installed (live) ─────────────────────────────
 
 #[tokio::test]
