@@ -15,14 +15,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::Notify;
+
 /// Operator-facing handle for triggering cutover.
 ///
-/// Cheaply clonable — the inner state is shared via `Arc<AtomicBool>`. Hand a
-/// clone to whatever signal handler / UI / RPC endpoint the customer uses,
-/// and keep the original around to plumb into the apply loop.
+/// Cheaply clonable — the inner state is shared via `Arc`. Hand a clone to whatever signal handler / UI / RPC endpoint the customer uses, and keep the original around to plumb into the apply loop.
 #[derive(Debug, Clone, Default)]
 pub struct CutoverHandle {
     requested: Arc<AtomicBool>,
+    /// Wakes an apply loop that is parked between lag polls so cutover is acted on immediately instead of after the poll interval elapses.
+    notify: Arc<Notify>,
 }
 
 impl CutoverHandle {
@@ -33,13 +35,23 @@ impl CutoverHandle {
 
     /// Mark cutover as requested. Returns the previous state — `true` means
     /// cutover was already requested (idempotent).
+    ///
+    /// Also wakes the apply loop if it is currently sleeping between lag polls, so cutover latency is bounded by the in-flight sample rather than the full poll interval.
     pub fn request(&self) -> bool {
-        self.requested.swap(true, Ordering::SeqCst)
+        let prev = self.requested.swap(true, Ordering::SeqCst);
+        // `notify_one` stores a permit when no task is parked yet, so a request that races ahead of the loop's next `notified()` await is not lost (the apply loop is the single consumer).
+        self.notify.notify_one();
+        prev
     }
 
     /// Returns whether cutover has been requested.
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
+    }
+
+    /// Resolve once cutover has been requested. Resolves immediately if a request arrived before this future was awaited (permit stored by [`CutoverHandle::request`]). Lets the apply loop park on cutover alongside its poll-interval sleep in a `tokio::select!`.
+    pub async fn notified(&self) {
+        self.notify.notified().await;
     }
 }
 
@@ -152,6 +164,35 @@ mod tests {
         let h2 = h1.clone();
         h1.request();
         assert!(h2.is_requested());
+    }
+
+    #[tokio::test]
+    async fn notified_resolves_immediately_when_requested_before_await() {
+        let h = CutoverHandle::new();
+        h.request();
+        // request() stored a notify permit, so notified() must not block even
+        // though nothing was parked when request() ran.
+        tokio::time::timeout(std::time::Duration::from_millis(500), h.notified())
+            .await
+            .expect("notified() should resolve immediately after a prior request()");
+        assert!(h.is_requested());
+    }
+
+    #[tokio::test]
+    async fn notified_wakes_on_concurrent_request() {
+        let h = CutoverHandle::new();
+        let waiter = {
+            let h = h.clone();
+            tokio::spawn(async move { h.notified().await })
+        };
+        // Let the waiter park (permit semantics make this robust even if it
+        // hasn't parked yet), then request cutover from the other handle.
+        tokio::task::yield_now().await;
+        assert!(!h.request());
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should be woken by request()")
+            .expect("waiter task panicked");
     }
 
     #[test]

@@ -428,9 +428,26 @@ pub async fn run_native_apply(
             tokio::select! {
                 _ = tokio::time::sleep(current_interval - last_poll.elapsed()) => {}
                 _ = cancel.cancelled() => continue,
+                // Cutover is the latency-critical moment: wake immediately instead of waiting out the (up to `poll_interval`) sleep.
+                _ = cutover_handle.notified() => {}
+            }
+            if cancel.is_cancelled() {
+                continue;
             }
         }
         last_poll = Instant::now();
+
+        // Check cutover BEFORE spending a lag-sample round-trip. A request that arrived while we slept is handled by the `notified()` arm above; one that arrived during the previous `sample()` is caught by the stored notify permit waking the next iteration's select!.
+        if cutover_handle.is_requested() {
+            stats.cutover_triggered = true;
+            reporter
+                .report(ProgressEvent::new(
+                    MigrationStage::Cutover,
+                    "cutover requested — disabling subscription",
+                ))
+                .await;
+            break Ok(());
+        }
 
         match lag_provider.sample().await {
             Ok((source_lsn, confirmed_lsn)) => {
@@ -472,17 +489,6 @@ pub async fn run_native_apply(
             Err(e) => {
                 warn!(error = %e, "lag poll failed");
             }
-        }
-
-        if cutover_handle.is_requested() {
-            stats.cutover_triggered = true;
-            reporter
-                .report(ProgressEvent::new(
-                    MigrationStage::Cutover,
-                    "cutover requested — disabling subscription",
-                ))
-                .await;
-            break Ok(());
         }
     };
 

@@ -19,9 +19,18 @@ wait_for_pg "$TARGET_URL" "target"
 setup_online_test
 build_example online_migration_example
 
-echo "==> launching migrator with slow=10s fast=200ms threshold=64"
+echo "==> launching migrator with slow=10s fast=200ms threshold=1MB"
 export PG_DBMIGRATOR_POLL_SECS=10
 export PG_DBMIGRATOR_FAST_POLL_MS=200
+# Use a generous lag threshold (1 MiB) so the "caught up → fast cadence"
+# branch is met deterministically. This test has no source mutations, so the
+# only lag is the residual WAL gap at subscription creation (tens to a few
+# hundred bytes, environment-dependent). With the default 64-byte threshold
+# that residual can sit just above the line, pinning the loop on the slow
+# 10s cadence and yielding zero heartbeats in the 3s window. A 1 MiB
+# threshold is far below any real replication backlog but comfortably absorbs
+# the idle residual, so the fast-cadence switch is exercised reliably.
+export PG_DBMIGRATOR_LAG_THRESHOLD_BYTES=1048576
 export PG_DBMIGRATOR_MAX_RUNTIME_SECS=300
 launch_online_migrator "$LOG_FILE"
 
