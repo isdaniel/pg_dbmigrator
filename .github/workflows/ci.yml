@@ -362,6 +362,30 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
 
+  integration-rust:
+    name: Integration test (Rust postgres_integration.rs — live PG, incl. cutover-triggered apply loop)
+    runs-on: ubuntu-latest
+    env:
+      PG_SOURCE_URL: "postgresql://migrator:migrator@localhost:55432/appdb"
+      PG_TARGET_URL: "postgresql://migrator:migrator@localhost:55433/appdb"
+      PG_SUBSCRIPTION_SOURCE_URL: "postgresql://migrator:migrator@source-db:5432/appdb"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-integration
+
+      - name: Run Rust integration tests (serialized — shared source/target PG pair)
+        run: cargo test -p pg_dbmigrator --test postgres_integration --locked -- --test-threads=1
+
+      - name: Show docker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
   publish:
     name: Publish to crates.io
     if: startsWith(github.ref, 'refs/tags/v')
@@ -383,6 +407,7 @@ jobs:
       - integration-online-keep-slot
       - integration-offline-verify
       - integration-verify-mode
+      - integration-rust
     runs-on: ubuntu-latest
     permissions:
       contents: write
