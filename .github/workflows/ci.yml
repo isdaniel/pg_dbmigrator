@@ -383,12 +383,99 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
+  lint-shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+      # install.sh is POSIX sh on purpose: it has to run under dash, bash-as-sh
+      # and busybox ash. Lint it as sh so bashisms are caught here rather than
+      # on a user's Alpine box.
+      - run: shellcheck -s sh install.sh
+      - run: shellcheck -s bash tests/integration/run_install_script.sh
 
-  release:
-    name: Auto-tag, publish to crates.io, and release
+  # Builds the binary the install.sh smoke tests below actually install, so a
+  # PR that breaks the musl build or the packaging layout fails here instead of
+  # at release time. Both arches, because the aarch64 tarball is published too
+  # and nothing else would ever exercise it.
+  build-musl:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          # Native arm64 runner -- free for public repos, so no cross toolchain
+          # and no qemu.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/build-musl
+        with:
+          target: ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: musl-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/pg_dbmigrator
+          retention-days: 1
+
+  # install.sh is the only code here that runs on strangers' machines, and it is
+  # the first thing a user touches. Six legs: two arches x three distros, which
+  # cover the three /bin/sh implementations (dash, bash-as-sh, busybox ash) and
+  # the three package-manager paths (PGDG apt, PGDG yum, apk).
+  install-script-test:
+    name: install.sh (${{ matrix.arch }}, ${{ matrix.image }})
+    needs: build-musl
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ["ubuntu:22.04", "rockylinux/rockylinux:9", "alpine:3"]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: musl-${{ matrix.target }}
+          path: prebuilt
+
+      - name: Run install.sh end-to-end
+        env:
+          IMAGES: ${{ matrix.image }}
+          PG_DBMIGRATOR_MUSL_BIN: prebuilt/pg_dbmigrator
+        run: |
+          chmod +x prebuilt/pg_dbmigrator
+          bash tests/integration/run_install_script.sh '${{ matrix.arch }}'
+
+  # Release runs in three jobs so the GitHub Release stays a draft until every
+  # artifact is uploaded: publishing first would leave install.sh 404ing for
+  # however long the builds take. cargo publish goes last because it is the only
+  # irreversible step -- a failed aarch64 build must not strand a version on
+  # crates.io that has no binaries.
+  release-prepare:
+    name: Guard version and open a draft release
     if: github.ref == 'refs/heads/main'
     needs:
       - build-and-unit-test
+      - lint-shell
+      - install-script-test
       - integration-offline
       - integration-online
       - integration-online-updates
@@ -412,11 +499,11 @@ jobs:
     concurrency:
       group: release
       cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      already: ${{ steps.guard.outputs.already }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
 
       - name: Derive version and tag from Cargo.toml
         id: ver
@@ -425,30 +512,117 @@ jobs:
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Derived tag: v${VERSION}"
 
-      - name: Skip if this version was already released
+      - name: Skip if this version was already published
         id: guard
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
-            echo "already=true" >> "$GITHUB_OUTPUT"
-            echo "Release ${{ steps.ver.outputs.tag }} already exists — nothing to do."
-          else
+          TAG='${{ steps.ver.outputs.tag }}'
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
             echo "already=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = 'true' ]; then
+            # Leftover from a run that died mid-flight. Nobody could have
+            # downloaded it, so start clean rather than uploading on top.
+            echo "Deleting stale draft $TAG"
+            gh release delete "$TAG" --yes
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG is already published -- nothing to do."
           fi
 
-      - name: Publish pg_dbmigrator to crates.io
-        if: steps.guard.outputs.already == 'false'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p pg_dbmigrator --locked
-
-      - name: Create tag + GitHub Release
+      - name: Create draft release
         if: steps.guard.outputs.already == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ steps.ver.outputs.tag }}" \
+          gh release create '${{ steps.ver.outputs.tag }}' \
+            --draft \
             --target "$GITHUB_SHA" \
-            --title "Release ${{ steps.ver.outputs.tag }}" \
+            --title 'Release ${{ steps.ver.outputs.tag }}' \
             --generate-notes
+
+  release-build:
+    name: Package ${{ matrix.target }}
+    needs: release-prepare
+    if: needs.release-prepare.outputs.already == 'false'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/build-musl
+        with:
+          target: ${{ matrix.target }}
+
+      # Layout must match [package.metadata.binstall] in pg_dbmigrator/Cargo.toml
+      # and the tarball name install.sh constructs.
+      - name: Package tarball
+        run: |
+          TAG='${{ needs.release-prepare.outputs.tag }}'
+          mkdir -p dist/stage
+          cp 'target/${{ matrix.target }}/release/pg_dbmigrator' LICENSE README.md dist/stage/
+          tar -czf "dist/pg_dbmigrator-${TAG}-${{ matrix.target }}.tar.gz" -C dist/stage pg_dbmigrator LICENSE README.md
+          rm -rf dist/stage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          retention-days: 1
+
+  release-publish:
+    name: Upload assets, publish crate, un-draft
+    needs:
+      - release-prepare
+      - release-build
+    if: needs.release-prepare.outputs.already == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Both arches build on separate runners, so checksums.txt can only be
+      # produced here, once every tarball has landed.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz | sed 's| \./| |' > checksums.txt
+          cat checksums.txt
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload '${{ needs.release-prepare.outputs.tag }}' dist/* --clobber
+
+      # Irreversible, so it runs only after every binary exists.
+      - name: Publish pg_dbmigrator to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p pg_dbmigrator --locked
+
+      - name: Publish the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit '${{ needs.release-prepare.outputs.tag }}' --draft=false

@@ -68,6 +68,84 @@ async fn connect_target_with_sslmode_disable() {
     assert!(ver.contains("PostgreSQL"));
 }
 
+// ─── preflight::recommended_client_major ─────────────────────────────────────
+
+/// `install.sh` calls this through `--print-client-major` to pick a
+/// `postgresql-client` package, so it has to work against real servers over
+/// the wire protocol — no `pg_dump` on the box at that point.
+#[tokio::test]
+async fn recommended_client_major_matches_the_newer_live_server() {
+    let source = skip_without_pg!(source_url());
+    let target = skip_without_pg!(target_url());
+
+    let major = pg_dbmigrator::preflight::recommended_client_major(&source, &target)
+        .await
+        .unwrap();
+
+    // Don't hardcode the compose stack's version: assert the contract instead,
+    // so bumping docker-compose.test.yml doesn't break this.
+    let source_client = connect_with_sslmode(&append_sslmode_disable(&source))
+        .await
+        .unwrap();
+    let target_client = connect_with_sslmode(&append_sslmode_disable(&target))
+        .await
+        .unwrap();
+    let read_major = |row: tokio_postgres::Row| (row.get::<_, i32>(0) / 10000) as u32;
+    let source_major = read_major(
+        source_client
+            .query_one("SELECT current_setting('server_version_num')::integer", &[])
+            .await
+            .unwrap(),
+    );
+    let target_major = read_major(
+        target_client
+            .query_one("SELECT current_setting('server_version_num')::integer", &[])
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(
+        major,
+        source_major.max(target_major),
+        "recommended client must be the newer of source {source_major} / target {target_major}"
+    );
+}
+
+/// End-to-end guard on the contract `install.sh` depends on: the binary must
+/// put the bare integer on stdout and every log line on stderr. Regressing
+/// that (e.g. by letting the tracing subscriber default back to stdout) makes
+/// the installer silently fall back to the newest client instead of the one
+/// the servers actually need.
+#[test]
+fn print_client_major_puts_only_the_number_on_stdout() {
+    let source = skip_without_pg!(source_url());
+    let target = skip_without_pg!(target_url());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pg_dbmigrator"))
+        .args([
+            "--print-client-major",
+            "--source",
+            &source,
+            "--target",
+            &target,
+        ])
+        .output()
+        .expect("failed to run the pg_dbmigrator binary");
+
+    assert!(
+        out.status.success(),
+        "exit {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8(out.stdout).expect("stdout should be UTF-8");
+    let major: u32 = stdout.trim().parse().unwrap_or_else(|e| {
+        panic!("stdout must be a bare integer, got {stdout:?}: {e}");
+    });
+    assert!(major >= 9, "implausible major {major}");
+}
+
 // ─── preflight::verify_source_logical_replication_ready ──────────────────────
 
 #[tokio::test]
@@ -671,8 +749,9 @@ async fn verify_pg_tools_installed_succeeds_in_ci() {
     // In CI with PostgreSQL client tools available this should pass.
     // On bare workstations without pg tools it may fail, but since we
     // skip_without_pg this only runs in CI.
-    let _url = skip_without_pg!(source_url());
-    pg_dbmigrator::preflight::verify_pg_tools_installed()
+    let source = skip_without_pg!(source_url());
+    let target = skip_without_pg!(target_url());
+    pg_dbmigrator::preflight::verify_pg_tools_installed(&source, &target)
         .await
         .unwrap();
 }

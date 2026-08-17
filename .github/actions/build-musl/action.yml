@@ -1,0 +1,46 @@
+name: Build static musl binary
+description: >
+  Build the pg_dbmigrator CLI for a musl target and assert the result is fully
+  static. Shared by the install.sh smoke tests and the release build so the
+  thing users download is produced the same way in both places.
+
+inputs:
+  target:
+    description: Rust target triple, e.g. x86_64-unknown-linux-musl
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.target }}
+
+    # ring and aws-lc-rs compile C, so a musl target needs a musl C compiler.
+    # Without this the build dies inside their build scripts, not in our code.
+    # musl-tools supplies <arch>-linux-musl-gcc, which is the name cc-rs looks
+    # for -- the CC_<target> override most guides recommend is unnecessary.
+    - name: Install musl toolchain
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq musl-tools
+
+    - name: cargo build --release --target ${{ inputs.target }}
+      shell: bash
+      run: cargo build --release --locked --target '${{ inputs.target }}' -p pg_dbmigrator --bin pg_dbmigrator
+
+    # Accept either static form: the x86_64 build comes out `static-pie linked`
+    # and the aarch64 one `statically linked`. What matters is that neither is
+    # dynamically linked, so the tarball runs on any glibc or musl distro.
+    - name: Assert the binary is fully static
+      shell: bash
+      run: |
+        out=$(file 'target/${{ inputs.target }}/release/pg_dbmigrator')
+        echo "$out"
+        grep -Eq 'static-pie linked|statically linked' <<<"$out"
+        ! grep -q 'dynamically linked' <<<"$out"
