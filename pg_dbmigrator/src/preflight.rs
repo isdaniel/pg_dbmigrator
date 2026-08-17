@@ -238,14 +238,39 @@ impl PreflightReport {
 
 /// Verify that every entry in [`REQUIRED_TOOLS`] is callable.
 ///
-/// Returns the first missing tool as a [`MigrationError::MissingTool`] with a
-/// concrete install hint. If all tools succeed, returns `Ok(())`.
-pub async fn verify_pg_tools_installed() -> Result<()> {
+/// Returns the first missing tool as a [`MigrationError::MissingTool`]. On the
+/// failure path only, the servers are asked what they actually run so the error
+/// can name the major version to install instead of guessing one — the client
+/// binaries are missing but the wire protocol still works. If that probe also
+/// fails (unreachable server, bad credentials) the error is returned unchanged
+/// and the generic hint on [`MigrationError::MissingTool`] carries the advice.
+pub async fn verify_pg_tools_installed(source_conn: &str, target_conn: &str) -> Result<()> {
     for tool in REQUIRED_TOOLS {
         let outcome = spawn_version_check(tool).await;
-        classify_version_check(tool, outcome)?;
+        if let Err(err) = classify_version_check(tool, outcome) {
+            let major = recommended_client_major(source_conn, target_conn)
+                .await
+                .ok();
+            return Err(name_required_major(err, major));
+        }
     }
     Ok(())
+}
+
+/// Fold a probed server major into a [`MigrationError::MissingTool`] reason. Pure, so the message is unit-testable without a live server.
+pub(crate) fn name_required_major(err: MigrationError, major: Option<u32>) -> MigrationError {
+    match (err, major) {
+        (MigrationError::MissingTool { tool, reason }, Some(major)) => {
+            MigrationError::missing_tool(
+                tool,
+                format!(
+                    "{reason}; source and target run PostgreSQL {major}, \
+                 so install the {major} client (e.g. `postgresql-client-{major}`)"
+                ),
+            )
+        }
+        (err, _) => err,
+    }
 }
 
 /// Spawn `<tool> --version` with stdio silenced and return the raw outcome.
@@ -434,6 +459,33 @@ fn is_undefined_database(err: &MigrationError) -> bool {
 /// pg_dump runs and fails several minutes in.
 pub async fn verify_pg_dump_version_compat(source_conn: &str, target_conn: &str) -> Result<()> {
     verify_pg_dump_version_compat_with_probe(&PgProbe, source_conn, target_conn).await
+}
+
+/// The PostgreSQL client major version that fits a source/target pair: the
+/// newer of the two servers.
+///
+/// `pg_dump` must be at least as new as the source and `pg_restore` at least
+/// as new as the target, so their maximum is the single client major that
+/// satisfies both. `install.sh` reaches this through `--print-client-major` to
+/// choose a `postgresql-client` package — over the wire protocol, because at
+/// that point no client binary exists yet.
+pub async fn recommended_client_major(source_conn: &str, target_conn: &str) -> Result<u32> {
+    recommended_client_major_with_probe(&PgProbe, source_conn, target_conn).await
+}
+
+/// Probe-based variant of [`recommended_client_major`] — exposed at crate
+/// level so unit tests can drive it with a stub probe.
+pub(crate) async fn recommended_client_major_with_probe<P: PreflightProbe + ?Sized>(
+    probe: &P,
+    source_conn: &str,
+    target_conn: &str,
+) -> Result<u32> {
+    let (source_major, target_major) = tokio::try_join!(
+        probe.server_major_version(source_conn),
+        probe.server_major_version(target_conn),
+    )?;
+    info!(source_major, target_major, "probed server versions");
+    Ok(source_major.max(target_major))
 }
 
 /// Probe-based variant of [`verify_pg_dump_version_compat`] — exposed at
@@ -1133,7 +1185,7 @@ pub async fn run_offline_preflight(
 ) -> Result<PreflightReport> {
     let mut report = PreflightReport::new();
 
-    verify_pg_tools_installed().await?;
+    verify_pg_tools_installed(&cfg.source.connection_string, &cfg.target.connection_string).await?;
     report.record("pg_tools", PreflightOutcome::Pass);
 
     verify_pg_dump_version_compat(&cfg.source.connection_string, &cfg.target.connection_string)
@@ -1170,7 +1222,7 @@ pub async fn run_offline_preflight(
 pub async fn run_online_preflight(cfg: &crate::config::MigrationConfig) -> Result<PreflightReport> {
     let mut report = PreflightReport::new();
 
-    verify_pg_tools_installed().await?;
+    verify_pg_tools_installed(&cfg.source.connection_string, &cfg.target.connection_string).await?;
     report.record("pg_tools", PreflightOutcome::Pass);
 
     verify_pg_dump_version_compat(&cfg.source.connection_string, &cfg.target.connection_string)
@@ -1294,9 +1346,43 @@ mod tests {
             MigrationError::MissingTool { tool, reason } => {
                 assert_eq!(tool, "pg_dump");
                 assert!(reason.contains("not found in $PATH"));
+                // This runs before any server has been contacted, so the
+                // reason must not name a PostgreSQL version it cannot know.
+                assert!(
+                    !reason.contains("postgresql-client-"),
+                    "must not guess a client version: {reason}"
+                );
             }
             other => panic!("expected MissingTool, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn name_required_major_uses_the_probed_version() {
+        let err = MigrationError::missing_tool("pg_dump", "not found in $PATH");
+        let msg = name_required_major(err, Some(16)).to_string();
+        assert!(msg.contains("PostgreSQL 16"), "msg: {msg}");
+        assert!(msg.contains("postgresql-client-16"), "msg: {msg}");
+    }
+
+    #[test]
+    fn name_required_major_leaves_the_error_alone_when_the_probe_failed() {
+        // Unreachable servers must not turn into an invented recommendation.
+        let err = MigrationError::missing_tool("pg_restore", "not found in $PATH");
+        let msg = name_required_major(err, None).to_string();
+        assert!(msg.contains("not found in $PATH"), "msg: {msg}");
+        assert!(
+            !msg.contains("postgresql-client-1"),
+            "must not name a version without a probe: {msg}"
+        );
+    }
+
+    #[test]
+    fn name_required_major_ignores_other_error_variants() {
+        let err = MigrationError::config("something else");
+        let msg = name_required_major(err, Some(18)).to_string();
+        assert!(msg.contains("something else"), "msg: {msg}");
+        assert!(!msg.contains("PostgreSQL 18"), "msg: {msg}");
     }
 
     #[test]
@@ -1347,7 +1433,8 @@ mod tests {
         // Sanity test for the live path. CI hosts typically have these
         // tools; if they don't, the dump/restore tests would already be
         // useless. We tolerate either result so this test never blocks.
-        let _ = verify_pg_tools_installed().await;
+        let _ =
+            verify_pg_tools_installed("postgres:///nonexistent", "postgres:///nonexistent").await;
     }
 
     #[test]
@@ -1732,9 +1819,16 @@ mod tests {
 
     #[test]
     fn decide_pg_restore_compat_newer_or_equal_passes() {
+        // Same major on both sides is always fine.
+        assert!(decide_pg_restore_compat(16, 16, 16).is_ok());
         // pg_restore 17 vs target 16, dump produced by pg_dump 15 — fine.
         assert!(decide_pg_restore_compat(17, 16, 15).is_ok());
-        assert!(decide_pg_restore_compat(16, 16, 16).is_ok());
+        // A newer client than the target is allowed: it costs an ignored
+        // `SET transaction_timeout` error on pre-17 targets, not lost data.
+        // install.sh picks the right major up front so this is rare.
+        assert!(decide_pg_restore_compat(18, 16, 16).is_ok());
+        assert!(decide_pg_restore_compat(18, 17, 16).is_ok());
+        assert!(decide_pg_restore_compat(17, 17, 15).is_ok());
     }
 
     #[test]
@@ -2074,6 +2168,68 @@ mod tests {
             msg.contains("could not parse pg_restore version"),
             "msg: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn recommended_client_major_takes_the_newer_server() {
+        // Upgrade direction: a PG14 source into a PG16 target needs a 16
+        // client -- pg_restore must be at least as new as the target.
+        let probe = MockProbe {
+            source_major: Some(14),
+            target_major: Some(16),
+            ..Default::default()
+        };
+        let major = recommended_client_major_with_probe(&probe, "src://source", "tgt://target")
+            .await
+            .expect("should probe");
+        assert_eq!(major, 16);
+    }
+
+    #[tokio::test]
+    async fn recommended_client_major_takes_the_source_when_it_is_newer() {
+        // Downgrade direction: pg_dump still has to read a PG18 source, so the
+        // client cannot drop to the target's 15.
+        let probe = MockProbe {
+            source_major: Some(18),
+            target_major: Some(15),
+            ..Default::default()
+        };
+        let major = recommended_client_major_with_probe(&probe, "src://source", "tgt://target")
+            .await
+            .expect("should probe");
+        assert_eq!(major, 18);
+    }
+
+    #[tokio::test]
+    async fn recommended_client_major_when_both_servers_match() {
+        let probe = MockProbe {
+            source_major: Some(17),
+            target_major: Some(17),
+            ..Default::default()
+        };
+        let major = recommended_client_major_with_probe(&probe, "src://source", "tgt://target")
+            .await
+            .expect("should probe");
+        assert_eq!(major, 17);
+    }
+
+    #[tokio::test]
+    async fn recommended_client_major_never_below_either_server() {
+        // Whatever the pair, the answer must satisfy both compatibility rules
+        // that decide_pg_dump_compat / decide_pg_restore_compat enforce later.
+        for (src, tgt) in [(13u32, 18u32), (18, 13), (16, 16), (9, 17)] {
+            let probe = MockProbe {
+                source_major: Some(src),
+                target_major: Some(tgt),
+                ..Default::default()
+            };
+            let major = recommended_client_major_with_probe(&probe, "src://source", "tgt://target")
+                .await
+                .expect("should probe");
+            assert!(major >= src && major >= tgt, "{major} for ({src}, {tgt})");
+            decide_pg_dump_compat(major, src).expect("pg_dump must accept the source");
+            decide_pg_restore_compat(major, tgt, major).expect("pg_restore must accept the target");
+        }
     }
 
     #[tokio::test]

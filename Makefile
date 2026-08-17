@@ -1,5 +1,6 @@
 .PHONY: check build format audit test doc-check before-git-push deps-check deps-bump deps-bump-dry \
-       integration integration-offline integration-online
+       integration integration-offline integration-online \
+       integration-install integration-install-arm64
 
 deps-check:
 	@echo "=== Checking for outdated dependencies ==="
@@ -49,3 +50,14 @@ integration-offline:
 
 integration-online:
 	bash tests/integration/run_all.sh online
+
+# install.sh end-to-end: builds a static musl binary, serves it as a fake
+# release, then installs it in clean ubuntu/rocky/alpine containers.
+integration-install:
+	bash tests/integration/run_install_script.sh x86_64
+
+# Same, for aarch64. Needs a cross toolchain and qemu on an x86_64 host:
+#   cargo install cross --locked
+#   docker run --privileged --rm tonistiigi/binfmt --install arm64
+integration-install-arm64:
+	bash tests/integration/run_install_script.sh aarch64

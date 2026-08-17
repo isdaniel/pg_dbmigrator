@@ -55,14 +55,70 @@ stops the apply worker but does not freeze source writes, so an automatic
 the lag heartbeat, not row counts). Verify manually once the source is
 quiesced — see [Verify](#verify).
 
-## Install / build
+## Install
+
+`pg_dbmigrator` shells out to `pg_dump` and `pg_restore`, so it needs a PostgreSQL client at least as new as your **source** server. The install script sets both up in one command.
+
+### One-liner
 
 ```bash
-# Install the CLI from source. Produces a binary called `pg_dbmigrator`.
+curl -fsSL https://raw.githubusercontent.com/isdaniel/pg_dbmigrator/main/install.sh | sh
+```
+
+Installs a static binary to `~/.local/bin` (no root), then installs `postgresql-client` for your distro (needs root, via passwordless `sudo`/`doas`).
+
+If you pass the connection strings, the installer asks the servers what they run — over the wire protocol, so this works before any client exists — and installs the client matching the **newer of source and target** rather than simply the newest available. That is the floor `pg_dump` needs, and stopping there avoids a newer `pg_restore` emitting settings an older target does not recognise. An existing `pg_dump` is left alone unless it is older than what the servers require.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/isdaniel/pg_dbmigrator/main/install.sh \
+  | PG_DBMIGRATOR_SOURCE='postgres://…/src' \
+    PG_DBMIGRATOR_TARGET='postgres://…/dst' sh
+```
+
+Supports Ubuntu, Debian, RHEL/Rocky/AlmaLinux, Amazon Linux 2023, Alpine, openSUSE/SLES and Fedora, on x86_64 and aarch64. On Debian/Ubuntu and RHEL-likes it pulls the client from [apt.postgresql.org][pgdg] / [yum.postgresql.org][pgdg] rather than the distro repos, whose clients are often too old to dump a modern server (Ubuntu 22.04 ships PG 14, RHEL 9 ships PG 13 — both refuse a PG 17 source).
+
+Tunable with environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PG_DBMIGRATOR_VERSION` | latest | pin a release, e.g. `v0.2.1` |
+| `PG_DBMIGRATOR_BIN_DIR` | `~/.local/bin` | where the binary goes |
+| `PG_DBMIGRATOR_SKIP_DEPS` | `0` | `1` = do not touch `pg_dump`/`pg_restore` |
+| `PG_DBMIGRATOR_SOURCE` | — | source URI, probed for its major version |
+| `PG_DBMIGRATOR_TARGET` | — | target URI, probed for its major version |
+| `PG_MAJOR` | newest (`18`) | force a client major, skipping the probe |
+| `PG_DBMIGRATOR_BASE_URL` | GitHub Releases | internal mirror / air-gapped install |
+
+### With cargo-binstall (prebuilt binary, no compile)
+
+```bash
+cargo binstall pg_dbmigrator
+```
+
+### From source
+
+```bash
 cargo install pg_dbmigrator
+```
+
+### Manual download
+
+Grab a tarball and `checksums.txt` from the [releases page][releases], verify, and drop the binary anywhere on `$PATH`:
+
+```bash
+sha256sum -c checksums.txt
+tar -xzf pg_dbmigrator-v0.2.1-x86_64-unknown-linux-musl.tar.gz
+```
+
+Binaries are statically linked against musl, so one build runs on any glibc or musl distro.
+
+```bash
 pg_dbmigrator --help
 pg_dbmigrator --mode offline --source '…' --target '…' --jobs 4
 ```
+
+[pgdg]: https://www.postgresql.org/download/
+[releases]: https://github.com/isdaniel/pg_dbmigrator/releases
 
 ## CLI
 

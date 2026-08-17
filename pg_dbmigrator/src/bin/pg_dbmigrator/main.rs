@@ -18,6 +18,19 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
+
+    // Short-circuit before building a MigrationConfig: this only needs two
+    // connections, and it has to work when no pg_dump exists yet -- install.sh
+    // calls it to decide which client to install. Tracing goes to stderr, so
+    // stdout carries nothing but the number.
+    if cli.print_client_major {
+        let major = pg_dbmigrator::preflight::recommended_client_major(&cli.source, &cli.target)
+            .await
+            .context("failed to read the source/target server versions")?;
+        println!("{major}");
+        return Ok(());
+    }
+
     let json_progress = cli.json;
     let config = cli
         .into_config()
@@ -105,6 +118,7 @@ fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 }
 

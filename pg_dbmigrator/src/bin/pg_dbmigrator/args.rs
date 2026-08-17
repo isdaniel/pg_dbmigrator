@@ -243,6 +243,16 @@ pub struct Cli {
     /// `RUST_LOG=warn,pg_dbmigrator=warn` to silence stderr for clean piping.
     #[arg(long)]
     pub json: bool,
+
+    /// Connect to source and target, print the PostgreSQL client major version
+    /// that fits both (the newer of the two servers) on stdout, and exit
+    /// without migrating. `install.sh` uses this to decide which
+    /// `postgresql-client` package to install: the newer server dictates the
+    /// floor for `pg_dump`, and staying at that version rather than the newest
+    /// available avoids a newer `pg_restore` emitting settings the older
+    /// target does not recognise.
+    #[arg(long)]
+    pub print_client_major: bool,
 }
 
 /// CLI-friendly mirror of [`MigrationMode`].

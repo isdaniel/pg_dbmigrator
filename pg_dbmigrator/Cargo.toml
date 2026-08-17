@@ -10,6 +10,13 @@ readme.workspace = true
 keywords.workspace = true
 categories = ["database", "command-line-utilities"]
 
+# Lets `cargo binstall pg_dbmigrator` fetch the release tarball instead of
+# compiling. Must stay in sync with the packaging step in .github/workflows/ci.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
 [lib]
 name = "pg_dbmigrator"
 path = "src/lib.rs"
