@@ -73,9 +73,14 @@ pub struct MigrationConfig {
     /// accepts `gzip:N`, `lz4:N`, `zstd:N`, or `none`; older versions
     /// accept `0..=9`. Trades a small amount of source-side CPU for a 3–10×
     /// reduction in archive size — a clear win whenever the source ↔
-    /// migrator hop crosses a region or VPN boundary. Default `lz4:1`
-    /// (negligible CPU overhead, 3–5× size reduction on typical data).
-    /// Pass `--dump-compress none` to disable.
+    /// migrator hop crosses a region or VPN boundary. Library callers get
+    /// `lz4:1` (negligible CPU overhead, 3–5× size reduction on typical
+    /// data) from both [`Default`] and serde; the CLI does not apply that
+    /// default — it leaves this `None` unless `--dump-compress` is passed.
+    /// `None` omits `--compress` altogether, letting `pg_dump` fall back to
+    /// its format's own default. That is also the portable way to turn
+    /// compression off: the `none` spec needs `pg_dump` 16+, and PG ≤ 15
+    /// accepts only a bare digit (`0`).
     #[serde(default = "default_compress")]
     pub dump_compress: Option<String>,
     /// Pass `--no-sync` to `pg_dump`. Default `true`. The dump archive

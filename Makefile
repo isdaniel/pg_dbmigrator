@@ -9,12 +9,10 @@ deps-check:
 deps-bump:
 	@echo "=== Bumping dependencies to latest compatible versions ==="
 	cargo update
-	@echo "=== Verifying build (main crate) ==="
-	cargo check --all-features
-	@echo "=== Verifying build (load-tests) ==="
-	cargo check --manifest-path load-tests/Cargo.toml --all-features
+	@echo "=== Verifying build (workspace) ==="
+	cargo check --workspace --all-targets
 	@echo "=== Running tests ==="
-	cargo test --features libpq
+	cargo test --workspace
 	@echo "Done. Review changes with: git diff Cargo.lock"
 
 deps-bump-dry:

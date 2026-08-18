@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "BSD-3-Clause"
 authors = ["danielshih"]
@@ -23,29 +23,29 @@ categories = ["database", "command-line-utilities"]
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4"] }
-futures = "0.3.33"
+futures = "0.3.34"
 
 # Logging / errors / serialization
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 anyhow = "1.0.104"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 url = "2.5.8"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 
 # CLI
-clap = { version = "4.6.4", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
 
 # Replication library (this workspace's sibling)
 pg_walstream = { version = "0.8.1", features = ["rustls-tls"] }
 
 # TLS for tokio-postgres
 tokio-postgres-rustls = "0.14"
-rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
 rustls-native-certs = "0.8.4"
 
 # Unix signal helpers (process-group SIGTERM/SIGKILL on cancel).

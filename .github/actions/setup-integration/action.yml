@@ -12,7 +12,24 @@ runs:
           https://www.postgresql.org/media/keys/ACCC4CF8.asc
         echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
           | sudo tee /etc/apt/sources.list.d/pgdg.list
-        sudo apt-get update
+
+        # apt-get update exits non-zero if ANY index fails, and apt.postgresql.org
+        # periodically serves a Packages file whose size disagrees with the Release
+        # it just published ("File has unexpected size ... Mirror sync in progress?").
+        # That window is short and entirely on their side, so retry rather than fail
+        # one leg of a 20-job matrix on someone else's mirror state.
+        for attempt in 1 2 3 4 5; do
+          if sudo apt-get update -o Acquire::Retries=3; then
+            break
+          fi
+          if [ "$attempt" -eq 5 ]; then
+            echo "::error::apt-get update still failing after 5 attempts"
+            exit 1
+          fi
+          echo "apt-get update failed (attempt ${attempt}/5) — retrying in 15s"
+          sleep 15
+        done
+
         sudo apt-get install -y postgresql-client-17
 
     - name: Prepend PostgreSQL 17 client to PATH

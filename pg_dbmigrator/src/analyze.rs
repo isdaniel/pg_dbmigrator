@@ -21,6 +21,7 @@
 //! Both steps are enabled by default and can be individually disabled
 //! via [`MigrationConfig::skip_analyze`] / [`MigrationConfig::skip_source_vacuum`].
 
+use pg_walstream::quote_ident;
 use tokio_postgres::Client;
 use tracing::{debug, info, warn};
 
@@ -84,7 +85,7 @@ async fn run_per_table(
     client: &Client,
     schema: &str,
     verbose: bool,
-    build_sql: fn(&str, &str, bool) -> String,
+    build_sql: fn(&str, &str, bool) -> Result<String>,
     op_name: &str,
     list_sql: &str,
 ) {
@@ -96,7 +97,20 @@ async fn run_per_table(
         }
     };
     for table in &tables {
-        let sql = build_sql(schema, table, verbose);
+        // A quoting failure is per-table and non-fatal, same as an execution
+        // failure: ANALYZE/VACUUM is best-effort maintenance, not migration
+        // correctness. Skip the offending relation and keep going.
+        let sql = match build_sql(schema, table, verbose) {
+            Ok(sql) => sql,
+            Err(e) => {
+                // Debug-format the identifier: this arm only fires when it
+                // holds a NUL, and Display would write that raw byte into the
+                // log stream, letting a NUL-sensitive transport truncate the
+                // very line meant to alert the operator.
+                warn!(schema = %schema, table = ?table, error = %e, "{op_name} skipped (unusable identifier)");
+                continue;
+            }
+        };
         if let Err(e) = client.batch_execute(&sql).await {
             warn!(schema = %schema, table = %table, error = %e, "{op_name} failed (continuing)");
         } else {
@@ -168,11 +182,16 @@ pub fn build_analyze_sql(verbose: bool) -> String {
 }
 
 /// Build an `ANALYZE` statement for a single table.
-pub fn build_analyze_table_sql(schema: &str, table: &str, verbose: bool) -> String {
+///
+/// # Errors
+///
+/// Returns an error if `schema` or `table` contains a null byte, which would
+/// truncate the statement on the C-string wire protocol.
+pub fn build_analyze_table_sql(schema: &str, table: &str, verbose: bool) -> Result<String> {
     let verbose_kw = if verbose { " VERBOSE" } else { "" };
-    let schema_q = quote_ident_simple(schema);
-    let table_q = quote_ident_simple(table);
-    format!("ANALYZE{verbose_kw} {schema_q}.{table_q};")
+    let schema_q = quote_ident(schema)?;
+    let table_q = quote_ident(table)?;
+    Ok(format!("ANALYZE{verbose_kw} {schema_q}.{table_q};"))
 }
 
 /// Build a `VACUUM ANALYZE` statement for the entire database.
@@ -186,22 +205,20 @@ pub fn build_vacuum_analyze_sql(verbose: bool) -> String {
 }
 
 /// Build a `VACUUM ANALYZE` statement for a single table.
-pub fn build_vacuum_analyze_table_sql(schema: &str, table: &str, verbose: bool) -> String {
+///
+/// # Errors
+///
+/// Returns an error if `schema` or `table` contains a null byte, which would
+/// truncate the statement on the C-string wire protocol.
+pub fn build_vacuum_analyze_table_sql(schema: &str, table: &str, verbose: bool) -> Result<String> {
     let verbose_kw = if verbose {
         " (VERBOSE, ANALYZE)"
     } else {
         " ANALYZE"
     };
-    let schema_q = quote_ident_simple(schema);
-    let table_q = quote_ident_simple(table);
-    format!("VACUUM{verbose_kw} {schema_q}.{table_q};")
-}
-
-/// Minimal identifier quoting (wraps in double-quotes, doubles embedded `"`).
-/// For SQL safety in ANALYZE/VACUUM statements where pg_walstream may not be
-/// needed.
-pub fn quote_ident_simple(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
+    let schema_q = quote_ident(schema)?;
+    let table_q = quote_ident(table)?;
+    Ok(format!("VACUUM{verbose_kw} {schema_q}.{table_q};"))
 }
 
 /// Convenience wrapper used by the orchestrator: decide whether to run
@@ -248,19 +265,19 @@ mod tests {
 
     #[test]
     fn build_analyze_table_sql_basic() {
-        let sql = build_analyze_table_sql("public", "users", false);
+        let sql = build_analyze_table_sql("public", "users", false).unwrap();
         assert_eq!(sql, "ANALYZE \"public\".\"users\";");
     }
 
     #[test]
     fn build_analyze_table_sql_verbose() {
-        let sql = build_analyze_table_sql("public", "users", true);
+        let sql = build_analyze_table_sql("public", "users", true).unwrap();
         assert_eq!(sql, "ANALYZE VERBOSE \"public\".\"users\";");
     }
 
     #[test]
     fn build_analyze_table_sql_special_chars() {
-        let sql = build_analyze_table_sql("my\"schema", "my\"table", false);
+        let sql = build_analyze_table_sql("my\"schema", "my\"table", false).unwrap();
         assert_eq!(sql, "ANALYZE \"my\"\"schema\".\"my\"\"table\";");
     }
 
@@ -278,35 +295,47 @@ mod tests {
 
     #[test]
     fn build_vacuum_analyze_table_sql_basic() {
-        let sql = build_vacuum_analyze_table_sql("public", "users", false);
+        let sql = build_vacuum_analyze_table_sql("public", "users", false).unwrap();
         assert_eq!(sql, "VACUUM ANALYZE \"public\".\"users\";");
     }
 
     #[test]
     fn build_vacuum_analyze_table_sql_verbose() {
-        let sql = build_vacuum_analyze_table_sql("public", "users", true);
+        let sql = build_vacuum_analyze_table_sql("public", "users", true).unwrap();
         assert_eq!(sql, "VACUUM (VERBOSE, ANALYZE) \"public\".\"users\";");
     }
 
     #[test]
     fn build_vacuum_analyze_table_sql_special_chars() {
-        let sql = build_vacuum_analyze_table_sql("my\"schema", "my\"table", false);
+        let sql = build_vacuum_analyze_table_sql("my\"schema", "my\"table", false).unwrap();
         assert_eq!(sql, "VACUUM ANALYZE \"my\"\"schema\".\"my\"\"table\";");
     }
 
     #[test]
-    fn quote_ident_simple_basic() {
-        assert_eq!(quote_ident_simple("public"), "\"public\"");
+    fn build_analyze_table_sql_rejects_null_byte() {
+        // The whole point of routing through pg_walstream::quote_ident: a NUL
+        // truncates the C-string on the wire, which is an injection vector.
+        // quote_ident_simple silently passed it through.
+        let table_err = build_analyze_table_sql("public", "ev\0il", false).unwrap_err();
+        assert!(table_err.to_string().contains("null bytes"));
+        let schema_err = build_analyze_table_sql("pu\0blic", "users", false).unwrap_err();
+        assert!(schema_err.to_string().contains("null bytes"));
     }
 
     #[test]
-    fn quote_ident_simple_with_double_quote() {
-        assert_eq!(quote_ident_simple("ab\"cd"), "\"ab\"\"cd\"");
+    fn build_vacuum_analyze_table_sql_rejects_null_byte() {
+        let table_err = build_vacuum_analyze_table_sql("public", "ev\0il", false).unwrap_err();
+        assert!(table_err.to_string().contains("null bytes"));
+        let schema_err = build_vacuum_analyze_table_sql("pu\0blic", "users", false).unwrap_err();
+        assert!(schema_err.to_string().contains("null bytes"));
     }
 
     #[test]
-    fn quote_ident_simple_empty() {
-        assert_eq!(quote_ident_simple(""), "\"\"");
+    fn build_analyze_table_sql_quotes_empty_identifier() {
+        // Records pg_walstream::quote_ident's actual behaviour for the empty
+        // string, which quote_ident_simple used to define locally.
+        let sql = build_analyze_table_sql("", "", false).unwrap();
+        assert_eq!(sql, "ANALYZE \"\".\"\";");
     }
 
     #[test]

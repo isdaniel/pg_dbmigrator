@@ -4,7 +4,7 @@
 
 ## 1. Architecture
 
-**Modes**: `Offline` (pg_dump → pg_restore) | `Online` (slot+snapshot → dump → restore → CREATE SUBSCRIPTION → WAL apply → cutover)
+**Modes**: `Offline` (pg_dump → pg_restore) | `Online` (slot+snapshot → dump → restore → CREATE SUBSCRIPTION → WAL apply → cutover) | `Verify` (standalone read-only row-count compare)
 
 **Pipeline**: `Validate → SourceVacuum → PrepareSnapshot* → Dump → Restore → Analyze → StreamApply* → Lag* → CaughtUp* → Cutover* → SourceCleanup* → Complete` (offline also runs `Verify` after Analyze)
 (`*` = online-only; SourceVacuum/Analyze skippable via `--skip-source-vacuum`/`--skip-analyze`; `Verify` = offline auto-step + standalone `--mode verify`, controlled via `--verify <off|warn|strict>`; online does NOT auto-verify)
@@ -13,7 +13,7 @@
 
 1. Pre-flight: verify pg_dump/pg_restore on PATH, validate config, check target-role privileges + extension availability (source extensions must be installable on the target)
 2. `VACUUM ANALYZE` on source (skip with `--skip-source-vacuum`)
-3. `pg_dump` (directory format, parallel `--jobs`, `--compress=lz4:1`)
+3. `pg_dump` (directory format, parallel `--jobs`; no `--compress` unless `--dump-compress` is passed)
 4. `pg_restore` — split-section by default (pre-data → data → post-data for index-free COPY)
 5. `ANALYZE` on target (skip with `--skip-analyze`)
 6. Row-count verify (`--verify <off|warn|strict>`, default `warn`)
@@ -99,7 +99,7 @@ docker-compose.test.yml           # source :55432, target :55433
 - **Parallel pre-flight**: `ensure_target_database_exists` and `verify_source_logical_replication_ready` run concurrently via `tokio::join!` (they hit different servers).
 - **Batched sequence sync**: `apply_sequences_to_target()` builds a single PL/pgSQL `DO` block with per-sequence exception handling, reducing N round-trips to 1. Falls back to individual statements if the batch fails.
 - **Split-section restore**: pre-data → data → post-data for index-free COPY (30-60% faster index rebuild).
-- **LZ4 compression**: default `lz4:1` for dump archives (fast compress/decompress).
+- **LZ4 compression**: opt-in via `--dump-compress lz4:1` (fast compress/decompress). The CLI applies no compression flag by default — `lz4:1` is only the library-side default (`MigrationConfig::default()` / serde).
 - **Instant cutover wake**: `CutoverHandle::request()` (SIGINT) sets an `AtomicBool` *and* fires a `tokio::sync::Notify`; the apply loop's poll `select!` parks on `cutover_handle.notified()` alongside its sleep, so cutover is acted on within the in-flight lag sample instead of after a full `poll_interval` (up to `fast_poll_interval`, ~1s). The `is_requested()` check runs *before* the next lag-sample round-trip, so no wasted network round-trip on cutover.
 
 ---
