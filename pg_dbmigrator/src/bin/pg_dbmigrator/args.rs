@@ -190,10 +190,12 @@ pub struct Cli {
     pub no_split_sections: bool,
 
     /// `pg_dump` compression spec passed to `--compress`. Examples:
-    /// `gzip:6`, `zstd:3`, `lz4`, `none`. When unset, `pg_dump` picks its
-    /// own default (typically `gzip`). Use `zstd:3` for the best CPU/ratio
-    /// trade-off on modern hardware. Ignored when the directory format is
-    /// not used (parallel dump implies directory).
+    /// `gzip:6`, `zstd:3`, `lz4`, `none`. These `<algorithm>[:level]` forms
+    /// (including `none`) need `pg_dump` 16+; PG ≤ 15 clients accept only a
+    /// bare digit `0`-`9`, where `0` turns compression off. When unset,
+    /// `pg_dump` picks its own default (typically `gzip`). Use `zstd:3` for
+    /// the best CPU/ratio trade-off on modern hardware. Ignored when the
+    /// directory format is not used (parallel dump implies directory).
     #[arg(long)]
     pub dump_compress: Option<String>,
 
@@ -233,7 +235,8 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = VerifyModeArg::Warn)]
     pub verify: VerifyModeArg,
 
-    /// Verbose logging.
+    /// Run the source `VACUUM ANALYZE` and the target `ANALYZE` as
+    /// `VERBOSE`. Does not change this program's log level — use `RUST_LOG`.
     #[arg(long)]
     pub verbose: bool,
 

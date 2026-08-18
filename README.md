@@ -20,6 +20,7 @@ slot we created with `EXPORT_SNAPSHOT` before `pg_dump` ran.
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `offline` | Run `pg_dump` against the source, then `pg_restore` against the target. One-shot copy.                                                                                                                             |
 | `online`  | Create a logical replication slot with `EXPORT_SNAPSHOT`, take a snapshot-consistent `pg_dump`, `pg_restore` it, then start a streaming WAL apply from the slot's start LSN until the operator triggers cutover.   |
+| `verify`  | Read-only. Compare per-table row counts between source and target and exit non-zero on any mismatch. No dump, no restore, no replication. See [Verify](#verify).                                                    |
 
 ### Online migration phases
 
@@ -81,7 +82,7 @@ Tunable with environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PG_DBMIGRATOR_VERSION` | latest | pin a release, e.g. `v0.2.1` |
+| `PG_DBMIGRATOR_VERSION` | latest | pin a release, e.g. `v0.3.0` |
 | `PG_DBMIGRATOR_BIN_DIR` | `~/.local/bin` | where the binary goes |
 | `PG_DBMIGRATOR_SKIP_DEPS` | `0` | `1` = do not touch `pg_dump`/`pg_restore` |
 | `PG_DBMIGRATOR_SOURCE` | — | source URI, probed for its major version |
@@ -107,7 +108,7 @@ Grab a tarball and `checksums.txt` from the [releases page][releases], verify, a
 
 ```bash
 sha256sum -c checksums.txt
-tar -xzf pg_dbmigrator-v0.2.1-x86_64-unknown-linux-musl.tar.gz
+tar -xzf pg_dbmigrator-v0.3.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 Binaries are statically linked against musl, so one build runs on any glibc or musl distro.
@@ -226,6 +227,25 @@ pg_dbmigrator --mode verify \
 Honours `--schema` / `--table` / `--exclude-schema` / `--exclude-table` so the
 verified object set matches what you migrated.
 
+### Other flags
+
+| Flag | Mode | Purpose |
+|---|---|---|
+| `--json` | all | Emit machine-readable NDJSON progress events to stdout, one `ProgressEvent` per line. Human-readable logs stay on stderr. Pair with `RUST_LOG=warn,pg_dbmigrator=warn` for clean piping. |
+| `--verbose` | offline, online | Run the source `VACUUM ANALYZE` and the target `ANALYZE` as `VERBOSE`, so PostgreSQL reports per-table progress. It does **not** change the migrator's own log level — use `RUST_LOG` for that. |
+| `--dump-scope <all\|schema-only\|data-only>` | offline, online | What to dump. Default `all`. |
+| `--dump-path <PATH>` | offline, online | Pin the dump archive path. Defaults to a unique path inside `$TMPDIR`. Required with `--resume`. |
+| `--resume` | offline, online | Resume a previous run: read `<dump_path>.resume.json`, check the surrounding config still matches, and skip every stage already marked complete. Requires `--dump-path`. |
+| `--resume-file <PATH>` | offline, online | Override the resume token path. Defaults to `<dump_path>.resume.json`. |
+| `--split-sections` | offline, online | Restore pre-data, data and post-data as separate passes. Enabled by default; disable with `--no-split-sections`. |
+| `--no-table-access-method` | offline, online | Pass `--no-table-access-method` to `pg_dump` (PG 15+), omitting `USING <access_method>` from CREATE TABLE. Use when the target lacks the source's custom table AMs. |
+| `--force-clean` | online | Best-effort drop of a leftover subscription on the target and replication slot on the source from a previous crashed run, before starting. Use when a run died after `CREATE SUBSCRIPTION` and the next would fail with "already exists". |
+| `--subscription-source <URI>` | online | Source URI written into `CREATE SUBSCRIPTION ... CONNECTION`. Set when the target's apply worker reaches the source at a different address than the migrator does (Docker service name vs. host loopback). Defaults to `--source`. |
+| `--max-runtime-seconds <N>` | online | Stop the streaming apply phase after N seconds. |
+| `--cutover-fast-poll-ms <MS>` | online | Tighter poll cadence once `lag_bytes <= --lag-threshold-bytes`. Default 1000. |
+| `--protocol-version <N>` | online | pgoutput protocol version, validated to `1..=4` (default 2) but currently inert — neither `CREATE_REPLICATION_SLOT` nor `CREATE SUBSCRIPTION` carries a protocol version. |
+| `--print-client-major` | — | Connect to source and target, print the PostgreSQL client major version that fits both (the newer of the two), and exit without migrating. `install.sh` uses this to pick a `postgresql-client` package. |
+
 ## Publication / replication resource lifecycle
 
 The migrator fully manages the lifecycle of the replication resources it
@@ -288,7 +308,7 @@ only when you have a specific reason.
 | Default | Flag to override | Effect |
 |---|---|---|
 | Split-section restore | `--no-split-sections` | Bulk COPY without index maintenance, then rebuild indexes in parallel. 30-60% faster on index-heavy schemas. |
-| `lz4:1` dump compression | `--dump-compress <spec>` | Negligible CPU, 3-5x smaller archive. Use `zstd:3` for better ratio, `none` to disable. |
+| `pg_dump`'s own default compression (no `--compress` passed) | `--dump-compress <spec>` | The CLI passes no `--compress`, so `pg_dump` uses its format's own default. Set `lz4:1` for negligible CPU and a 3-5x smaller archive, or `zstd:3` for the best ratio. Needs `pg_dump` 16+; older clients take a bare digit `0`-`9`. Library users get `lz4:1` by default, from both `MigrationConfig::default()` and serde deserialization. |
 | `--no-sync` on dump | `--keep-sync` | Skip fsync on transient dump files. |
 | `--no-comments` | _(not exposed)_ | Omit COMMENT ON statements from dump. |
 | `--no-security-labels` | _(not exposed)_ | Omit SE-Linux security labels from dump. |
@@ -305,8 +325,10 @@ See [BENCHMARK.md](BENCHMARK.md) for migration performance results across 10 GB 
 
 ## Known limitations
 
-* The streaming apply loop binds replicated values as text and lets the
-  server cast them. Custom column-level transforms are not supported.
+* Apply runs through PostgreSQL's own logical replication apply worker
+  (`CREATE SUBSCRIPTION`), not an in-process decoder, so type fidelity
+  matches native logical replication. The flip side is that no
+  per-column transform can be applied during replication.
 * DDL changes are not migrated automatically — refresh the publication
   and restart the migration if the schema changes during the run.
 * Extensions whose internal state cannot be re-created on the target

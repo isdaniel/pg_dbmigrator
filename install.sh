@@ -10,7 +10,7 @@
 # Configuration is via environment variables only. Under `curl | sh` the script IS
 # stdin, so argv and prompts do not survive the pipe -- env vars do.
 #
-#   PG_DBMIGRATOR_VERSION    git tag to install, e.g. v0.2.1        (default: latest)
+#   PG_DBMIGRATOR_VERSION    git tag to install, e.g. v0.3.0        (default: latest)
 #   PG_DBMIGRATOR_BIN_DIR    where the binary goes                  (default: ~/.local/bin)
 #   PG_DBMIGRATOR_BASE_URL   override release download base         (mirrors, air-gapped, CI)
 #   PG_DBMIGRATOR_SKIP_DEPS  1 = do not touch pg_dump/pg_restore    (default: 0)
