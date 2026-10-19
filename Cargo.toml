@@ -20,18 +20,18 @@ categories = ["database", "command-line-utilities"]
 
 [workspace.dependencies]
 # Core async runtime + helpers
-tokio = { version = "1.53.1", features = ["full"] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio = { version = "1.53.3", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4"] }
 futures = "0.3.34"
 
 # Logging / errors / serialization
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 anyhow = "1.0.104"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 async-trait = "0.1.92"
 url = "2.5.8"
 bytes = "1.12.1"
@@ -45,11 +45,11 @@ pg_walstream = { version = "0.9.0", features = ["rustls-tls"] }
 
 # TLS for tokio-postgres
 tokio-postgres-rustls = "0.14"
-rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
-rustls-native-certs = "0.8.4"
+rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8.5"
 
 # Unix signal helpers (process-group SIGTERM/SIGKILL on cancel).
-libc = "0.2.189"
+libc = "0.2.191"
 
 # Test utilities
 tempfile = "3.27"
